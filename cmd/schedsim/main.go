@@ -49,16 +49,21 @@ func run() error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "POLICY\tSAMPLE\tSCENARIO\tPLACED\tFAILED\tDECISIONS/S\tNODES USED\tLOWER BOUND\tEFFICIENCY\tCPU UTIL\tMEM UTIL")
+	fmt.Fprintln(tw, "POLICY\tSAMPLE\tSCENARIO\tPLACED\tFAILED\tDECISIONS/S\tNODES USED\tLOWER BOUND\tPACKING EFF\tEMPTY CPU")
 	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%d\t%d\t%.0f\t%d\t%d\t%.3f\t%.3f\t%.3f\n",
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%d\t%d\t%.0f\t%d\t%d\t%.3f\t%.3f\n",
 			r.Policy, r.SampleSize, r.Scenario, r.Placements, r.Failed, r.DecisionsPerSec,
-			r.NodesUsed, r.LowerBound, r.PackingEfficiency, r.CPUUtilUsed, r.MemUtilUsed)
+			r.NodesUsed, r.LowerBound, r.PackingEfficiency, r.EmptyCPUFraction)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
 	}
 
+	notes := []string{
+		"packing_efficiency is requested/capacity of the binding resource on nodes that hold at least one sandbox",
+		fmt.Sprintf("the request mix is CPU-bound on this fleet (about %.1f GiB per requested CPU against %d GiB per node CPU)",
+			sim.MixMemPerCPU(), sim.NodeMemPerCPU),
+	}
 	if *out == "" {
 		return nil
 	}
@@ -68,8 +73,9 @@ func run() error {
 		GOOS    string       `json:"goos"`
 		GOARCH  string       `json:"goarch"`
 		CPUs    int          `json:"cpus"`
+		Notes   []string     `json:"notes"`
 		Results []sim.Result `json:"results"`
-	}{cfg, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), results}
+	}{cfg, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), notes, results}
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

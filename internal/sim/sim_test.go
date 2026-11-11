@@ -84,17 +84,39 @@ func TestRunDeterministic(t *testing.T) {
 
 func TestBinPackBeatsSpread(t *testing.T) {
 	cfg := smallConfig()
-	def := Run(cfg, sched.DefaultPolicy(sched.DefaultWeights))
-	spr := Run(cfg, sched.SpreadPolicy())
-	for i := range def {
-		if def[i].NodesUsed >= spr[i].NodesUsed {
-			t.Fatalf("%s: default used %d nodes, spread %d", def[i].Scenario, def[i].NodesUsed, spr[i].NodesUsed)
+	def := Run(cfg, sched.DefaultPolicy(sched.DefaultWeights))[1]
+	spr := Run(cfg, sched.SpreadPolicy())[1]
+	if def.Scenario != "churn" || spr.Scenario != "churn" {
+		t.Fatal("expected churn results")
+	}
+	if def.PackingEfficiency <= spr.PackingEfficiency {
+		t.Fatalf("efficiency default %v <= spread %v", def.PackingEfficiency, spr.PackingEfficiency)
+	}
+	if def.EmptyCPUFraction <= spr.EmptyCPUFraction {
+		t.Fatalf("empty fraction default %v <= spread %v", def.EmptyCPUFraction, spr.EmptyCPUFraction)
+	}
+	for _, r := range []Result{def, spr} {
+		if r.PackingEfficiency <= 0 || r.PackingEfficiency > 1 {
+			t.Fatalf("%s efficiency %v", r.Policy, r.PackingEfficiency)
 		}
-		for _, r := range []Result{def[i], spr[i]} {
-			if r.PackingEfficiency <= 0 || r.PackingEfficiency > 1 {
-				t.Fatalf("%s %s efficiency %v", r.Policy, r.Scenario, r.PackingEfficiency)
-			}
-		}
+	}
+}
+
+func TestEmptyCPUFraction(t *testing.T) {
+	var nodes []*sched.NodeInfo
+	for i := 0; i < 4; i++ {
+		nodes = append(nodes, &sched.NodeInfo{Capacity: sched.Resources{CPUMillis: 8000, MemoryBytes: 32 * gib}})
+	}
+	nodes[0].Sandboxes = 1
+	nodes[0].Allocated = sched.Resources{CPUMillis: 4000, MemoryBytes: 4 * gib}
+	s := &state{nodes: nodes, live: []liveSandbox{{node: 0, res: nodes[0].Allocated}}}
+	var r Result
+	s.finish(&r, 0)
+	if r.EmptyCPUFraction != 0.75 {
+		t.Fatalf("empty fraction = %v", r.EmptyCPUFraction)
+	}
+	if r.PackingEfficiency != 0.5 || r.NodesUsed != 1 {
+		t.Fatalf("efficiency %v used %d", r.PackingEfficiency, r.NodesUsed)
 	}
 }
 

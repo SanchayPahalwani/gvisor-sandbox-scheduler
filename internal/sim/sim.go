@@ -29,18 +29,24 @@ func DefaultConfig() Config {
 
 // Result is one policy in one scenario.
 type Result struct {
-	Policy            string  `json:"policy"`
-	SampleSize        int     `json:"sample_size"`
-	Scenario          string  `json:"scenario"` // "fill" or "churn"
-	Placements        int     `json:"placements"`
-	Failed            int     `json:"failed"`
-	Seconds           float64 `json:"seconds"` // time spent inside Place only
-	DecisionsPerSec   float64 `json:"decisions_per_sec"`
-	NodesUsed         int     `json:"nodes_used"`
-	LowerBound        int     `json:"lower_bound"`
-	PackingEfficiency float64 `json:"packing_efficiency"` // LowerBound / NodesUsed
+	Policy          string  `json:"policy"`
+	SampleSize      int     `json:"sample_size"`
+	Scenario        string  `json:"scenario"` // "fill" or "churn"
+	Placements      int     `json:"placements"`
+	Failed          int     `json:"failed"`
+	Seconds         float64 `json:"seconds"` // time spent inside Place only
+	DecisionsPerSec float64 `json:"decisions_per_sec"`
+	NodesUsed       int     `json:"nodes_used"`
+	LowerBound      int     `json:"lower_bound"`
+	// PackingEfficiency is the utilisation of the binding resource on nodes in
+	// use: max(CPUUtilUsed, MemUtilUsed), each requested / capacity summed
+	// over nodes that hold at least one sandbox.
+	PackingEfficiency float64 `json:"packing_efficiency"`
 	CPUUtilUsed       float64 `json:"cpu_util_used_nodes"`
 	MemUtilUsed       float64 `json:"mem_util_used_nodes"`
+	// EmptyCPUFraction is the CPU capacity of nodes holding no sandbox over
+	// fleet CPU capacity: the share of the fleet that could be switched off.
+	EmptyCPUFraction float64 `json:"empty_cpu_fraction"`
 }
 
 // Fleet builds the synthetic nodes: 20% 8 CPU/32 GiB, 50% 16 CPU/64 GiB,
@@ -67,7 +73,7 @@ func Fleet(cfg Config) []*sched.NodeInfo {
 			ID:           fmt.Sprintf("n%04d", i),
 			Group:        fmt.Sprintf("g%d", i%groups),
 			Ready:        true,
-			Capacity:     sched.Resources{CPUMillis: cpus[i] * 1000, MemoryBytes: cpus[i] * 4 * gib},
+			Capacity:     sched.Resources{CPUMillis: cpus[i] * 1000, MemoryBytes: cpus[i] * NodeMemPerCPU * gib},
 			MaxSandboxes: 1000,
 			WarmReady:    1,
 			Health:       1,
@@ -76,7 +82,11 @@ func Fleet(cfg Config) []*sched.NodeInfo {
 	return nodes
 }
 
-// LowerBound is the fewest nodes, largest first, whose capacity covers both
+// LowerBound assumes the largest nodes are used first, so on a mixed fleet it
+// is a floor on node count and not a fair yardstick for a utilisation-based
+// policy.
+//
+// It is the fewest nodes, largest first, whose capacity covers both
 // totals. Nodes are tried largest-by-CPU first and largest-by-memory first and
 // the smaller count wins. It returns len(nodes) when the fleet cannot cover the
 // demand.
@@ -115,6 +125,19 @@ var sizes = []struct {
 	{sched.Resources{CPUMillis: 1000, MemoryBytes: gib}, 20},
 	{sched.Resources{CPUMillis: 2000, MemoryBytes: 4 * gib}, 10},
 }
+
+// MixMemPerCPU is the mean memory in GiB per requested CPU of the request mix.
+func MixMemPerCPU() float64 {
+	var cpu, mem float64
+	for _, z := range sizes {
+		cpu += float64(z.weight) * float64(z.res.CPUMillis) / 1000
+		mem += float64(z.weight) * float64(z.res.MemoryBytes) / float64(gib)
+	}
+	return mem / cpu
+}
+
+// NodeMemPerCPU is the memory in GiB per CPU of every synthetic node.
+const NodeMemPerCPU = 4
 
 func drawSize(r *rand.Rand) sched.Resources {
 	v := r.Intn(100)
@@ -219,13 +242,15 @@ func (s *state) finish(out *Result, elapsed time.Duration) {
 	if out.Seconds > 0 {
 		out.DecisionsPerSec = float64(out.Placements+out.Failed) / out.Seconds
 	}
-	var reqCPU, reqMem, capCPU, capMem, allocCPU, allocMem int64
+	var reqCPU, reqMem, capCPU, capMem, allocCPU, allocMem, emptyCPU, fleetCPU int64
 	for _, sb := range s.live {
 		reqCPU += sb.res.CPUMillis
 		reqMem += sb.res.MemoryBytes
 	}
 	for _, n := range s.nodes {
+		fleetCPU += n.Capacity.CPUMillis
 		if n.Sandboxes == 0 {
+			emptyCPU += n.Capacity.CPUMillis
 			continue
 		}
 		out.NodesUsed++
@@ -236,8 +261,11 @@ func (s *state) finish(out *Result, elapsed time.Duration) {
 	}
 	out.LowerBound = LowerBound(s.nodes, reqCPU, reqMem)
 	if out.NodesUsed > 0 {
-		out.PackingEfficiency = float64(out.LowerBound) / float64(out.NodesUsed)
 		out.CPUUtilUsed = float64(allocCPU) / float64(capCPU)
 		out.MemUtilUsed = float64(allocMem) / float64(capMem)
+		out.PackingEfficiency = max(out.CPUUtilUsed, out.MemUtilUsed)
+	}
+	if fleetCPU > 0 {
+		out.EmptyCPUFraction = float64(emptyCPU) / float64(fleetCPU)
 	}
 }
