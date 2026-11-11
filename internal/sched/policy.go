@@ -14,12 +14,13 @@ type Policy struct {
 	Scorers    []Weighted
 	SampleSize int
 
-	mu      sync.Mutex
-	offset  int
-	cur     []float64
-	slots   [3][]float64
-	cand    [3]candidate
-	rejects [8]int
+	firstFit bool // no scorers: earliest scanned feasible node wins
+	mu       sync.Mutex
+	offset   int
+	cur      []float64
+	slots    [3][]float64
+	cand     [3]candidate
+	rejects  [8]int
 }
 
 type candidate struct {
@@ -114,7 +115,7 @@ scan:
 }
 
 // insert places the node whose scores are in p.cur into the top-3 list.
-// With no scorers every total ties and the earliest scanned node wins.
+// For first-fit every total ties and the earliest scanned node wins.
 func (p *Policy) insert(nTop int, n *NodeInfo, total float64) int {
 	pos := nTop
 	for pos > 0 && p.better(total, n, &p.cand[pos-1]) {
@@ -145,7 +146,7 @@ func (p *Policy) better(total float64, n *NodeInfo, o *candidate) bool {
 	if total != o.total {
 		return total > o.total
 	}
-	if len(p.Scorers) == 0 {
+	if p.firstFit {
 		return false
 	}
 	return n.ID < o.n.ID
@@ -162,7 +163,7 @@ type Weights struct{ BinPack, WarmPool, GroupAffinity, NodeHealth float64 }
 var DefaultWeights = Weights{1, 1, 0.5, 1}
 
 // DefaultPolicy packs, prefers warm sandboxes, group affinity and healthy
-// nodes. A scorer with weight 0 is left out.
+// nodes. A scorer with weight 0 stays in the list and contributes 0.
 func DefaultPolicy(w Weights) *Policy {
 	p := &Policy{Name: "default", Filters: baseFilters()}
 	for _, s := range []Weighted{
@@ -171,9 +172,7 @@ func DefaultPolicy(w Weights) *Policy {
 		{GroupAffinity(), w.GroupAffinity},
 		{NodeHealth(), w.NodeHealth},
 	} {
-		if s.Weight != 0 {
-			p.Scorers = append(p.Scorers, s)
-		}
+		p.Scorers = append(p.Scorers, s)
 	}
 	return p
 }
@@ -186,7 +185,7 @@ func SpreadPolicy() *Policy {
 
 // FirstFitPolicy picks the first feasible node in input order.
 func FirstFitPolicy() *Policy {
-	return &Policy{Name: "firstfit", Filters: baseFilters()}
+	return &Policy{Name: "firstfit", Filters: baseFilters(), firstFit: true}
 }
 
 // RandomPolicy picks a pseudo-random feasible node, reproducible per seed.

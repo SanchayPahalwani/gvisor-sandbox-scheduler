@@ -2,6 +2,7 @@ package sched
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"testing"
@@ -137,7 +138,10 @@ func TestDecisionTop(t *testing.T) {
 		n.Allocated = Resources{int64(i) * 500, int64(i) * gib}
 		nodes = append(nodes, n)
 	}
-	d := place(t, DefaultPolicy(DefaultWeights), req(100, gib/4), nodes...)
+	r := req(100, gib/4)
+	r.AffinityKey = "k"
+	r.AffinityByGroup = map[string]int{"a": 1, "b": 1} // nodes are in a: raw 50, weighted 25
+	d := place(t, DefaultPolicy(DefaultWeights), r, nodes...)
 	if d.Total != 5 || d.Feasible != 5 || len(d.Top) != 3 {
 		t.Fatalf("got %+v", d)
 	}
@@ -148,6 +152,13 @@ func TestDecisionTop(t *testing.T) {
 		if len(ns.Plugins) != 4 {
 			t.Fatalf("plugins: %v", ns.Plugins)
 		}
+		for _, name := range []string{"BinPack", "WarmPool", "GroupAffinity", "NodeHealth"} {
+			if _, ok := ns.Plugins[name]; !ok {
+				t.Fatalf("missing plugin %s in %v", name, ns.Plugins)
+			}
+		}
+		near(t, ns.Plugins["GroupAffinity"], 25)
+		near(t, ns.Plugins["NodeHealth"], 100)
 		sum := 0.0
 		for _, v := range ns.Plugins {
 			sum += v
@@ -157,7 +168,7 @@ func TestDecisionTop(t *testing.T) {
 			t.Fatal("not sorted")
 		}
 	}
-	d = place(t, DefaultPolicy(DefaultWeights), req(100, gib/4), nodes[:2]...)
+	d = place(t, DefaultPolicy(DefaultWeights), r, nodes[:2]...)
 	if len(d.Top) != 2 {
 		t.Fatalf("top = %d", len(d.Top))
 	}
@@ -185,6 +196,9 @@ func TestSampling(t *testing.T) {
 	if len(firsts) < 2 {
 		t.Fatal("offset did not rotate")
 	}
+	if len(seen) < 10 {
+		t.Fatalf("only %d distinct nodes in Top across calls", len(seen))
+	}
 	// Every node is scanned once in 10 calls: use first-fit so the winner is
 	// the first node of each window and the windows tile the list.
 	ff := FirstFitPolicy()
@@ -207,9 +221,6 @@ func TestWeightsZeroDisablesPlugin(t *testing.T) {
 	w := DefaultWeights
 	w.WarmPool = 0
 	p := DefaultPolicy(w)
-	if len(p.Scorers) != 3 {
-		t.Fatalf("scorers = %d", len(p.Scorers))
-	}
 	warm, full := node("warm", "a"), node("full", "a")
 	warm.WarmReady = 2
 	full.Allocated = Resources{3600, 7 * gib}
@@ -244,5 +255,27 @@ func TestFirstFitSpreadRandom(t *testing.T) {
 	x, y := run(), run()
 	if !reflect.DeepEqual(x, y) {
 		t.Fatal("random policy not reproducible")
+	}
+}
+
+func TestPlaceHugeRequestDoesNotOverflow(t *testing.T) {
+	idle, busy := node("idle", "a"), node("busy", "a")
+	busy.Allocated = Resources{1000, gib}
+	for _, r := range []*Request{req(math.MaxInt64, gib), req(100, math.MaxInt64)} {
+		_, err := DefaultPolicy(DefaultWeights).Place(r, []*NodeInfo{idle, busy})
+		var nf *NoFitError
+		if !errors.As(err, &nf) || nf.Rejected["Capacity"] != 2 {
+			t.Fatalf("request %+v: err = %v", r.Resources, err)
+		}
+	}
+}
+
+func TestDefaultPolicyZeroWeightsTieBreaksByID(t *testing.T) {
+	d := place(t, DefaultPolicy(Weights{}), req(100, gib), node("n2", "a"), node("n1", "a"))
+	if d.NodeID != "n1" {
+		t.Fatalf("got %s", d.NodeID)
+	}
+	if len(d.Top[0].Plugins) != 4 {
+		t.Fatalf("plugins: %v", d.Top[0].Plugins)
 	}
 }

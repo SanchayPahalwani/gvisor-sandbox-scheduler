@@ -23,8 +23,9 @@ type capacityFilter struct{}
 
 func (capacityFilter) Name() string { return "Capacity" }
 func (capacityFilter) Filter(req *Request, n *NodeInfo) bool {
-	return n.Allocated.CPUMillis+req.Resources.CPUMillis <= n.Capacity.CPUMillis &&
-		n.Allocated.MemoryBytes+req.Resources.MemoryBytes <= n.Capacity.MemoryBytes &&
+	// Compare against the free amount; adding would overflow for huge requests.
+	return req.Resources.CPUMillis <= n.Capacity.CPUMillis-n.Allocated.CPUMillis &&
+		req.Resources.MemoryBytes <= n.Capacity.MemoryBytes-n.Allocated.MemoryBytes &&
 		n.Sandboxes < n.MaxSandboxes
 }
 
