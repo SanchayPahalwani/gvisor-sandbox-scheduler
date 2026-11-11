@@ -3,13 +3,21 @@ package runsc
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
 
 // Fake is an in-memory Runtime for unit tests. Set its fields before use;
-// Calls and Containers are safe to read while it is in use.
+// Calls and Containers are safe to read while it is in use. The zero value
+// is usable.
+//
+// It follows the CLI where a manager could notice: a done ctx fails every
+// method before it acts, Exec in a container that is not running returns
+// ErrNotRunning, a stopped container's PID is -1, and KillProcess fails for
+// a pid that is not a live Exec of that container.
 type Fake struct {
 	ExecFunc   func(ref Ref, spec ExecSpec) (int, error) // default: exit 0
 	Fail       map[string]error                          // method name -> error to return once
@@ -18,9 +26,14 @@ type Fake struct {
 
 	mu         sync.Mutex
 	calls      []string
-	containers map[string]string // id -> status
-	pids       map[string]int    // id -> pid while running
+	containers map[string]*fakeContainer
 	nextPID    int
+}
+
+type fakeContainer struct {
+	status string
+	pid    int
+	execs  map[int]bool // live in-sandbox pids handed out by Exec
 }
 
 var _ Runtime = (*Fake)(nil)
@@ -31,8 +44,7 @@ func NewFake() *Fake {
 		Fail:       map[string]error{},
 		Delay:      map[string]time.Duration{},
 		VersionStr: "release-fake",
-		containers: map[string]string{},
-		pids:       map[string]int{},
+		containers: map[string]*fakeContainer{},
 	}
 }
 
@@ -48,13 +60,14 @@ func (f *Fake) Containers() map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[string]string, len(f.containers))
-	for id, st := range f.containers {
-		out[id] = st
+	for id, c := range f.containers {
+		out[id] = c.status
 	}
 	return out
 }
 
-// enter records the call, applies Delay and returns a one-shot Fail error.
+// enter records the call, fails on a done ctx, applies Delay and returns a
+// one-shot Fail error.
 func (f *Fake) enter(ctx context.Context, method string, ref *Ref) error {
 	f.mu.Lock()
 	call := method
@@ -65,6 +78,9 @@ func (f *Fake) enter(ctx context.Context, method string, ref *Ref) error {
 	delay := f.Delay[method]
 	f.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if delay > 0 {
 		t := time.NewTimer(delay)
 		select {
@@ -81,25 +97,42 @@ func (f *Fake) enter(ctx context.Context, method string, ref *Ref) error {
 		delete(f.Fail, method)
 		return err
 	}
+	if f.containers == nil {
+		f.containers = map[string]*fakeContainer{}
+	}
 	return nil
 }
 
-// transition moves ref from status from to status to under the lock.
+// pid hands out a new fake pid. f.mu must be held.
+func (f *Fake) pid() int {
+	f.nextPID++
+	return 1000 + f.nextPID
+}
+
+// get returns the container for ref. f.mu must be held.
+func (f *Fake) get(method string, ref Ref) (*fakeContainer, error) {
+	c, ok := f.containers[ref.ID]
+	if !ok {
+		return nil, fmt.Errorf("fake %s %s: %w", method, ref.ID, ErrNotFound)
+	}
+	return c, nil
+}
+
+// transition moves ref from status from to status to.
 func (f *Fake) transition(method string, ref Ref, from, to string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st, ok := f.containers[ref.ID]
-	if !ok {
-		return fmt.Errorf("fake %s %s: %w", method, ref.ID, ErrNotFound)
+	c, err := f.get(method, ref)
+	if err != nil {
+		return err
 	}
-	if st != from {
-		return fmt.Errorf("fake %s %s: container is %s, want %s", method, ref.ID, st, from)
+	if c.status != from {
+		return fmt.Errorf("fake %s %s: container is %s, want %s", method, ref.ID, c.status, from)
 	}
-	f.containers[ref.ID] = to
-	delete(f.pids, ref.ID)
-	if to == "running" {
-		f.nextPID++
-		f.pids[ref.ID] = 1000 + f.nextPID
+	c.status = to
+	if to == "stopped" {
+		c.pid = -1
+		c.execs = map[int]bool{}
 	}
 	return nil
 }
@@ -113,7 +146,7 @@ func (f *Fake) Create(ctx context.Context, ref Ref, bundleDir string, logPath st
 	if _, ok := f.containers[ref.ID]; ok {
 		return fmt.Errorf("fake Create %s: container already exists", ref.ID)
 	}
-	f.containers[ref.ID] = "created"
+	f.containers[ref.ID] = &fakeContainer{status: "created", pid: f.pid(), execs: map[int]bool{}}
 	return nil
 }
 
@@ -138,12 +171,35 @@ func (f *Fake) Checkpoint(ctx context.Context, ref Ref, imagePath string) error 
 	return f.transition("Checkpoint", ref, "running", "stopped")
 }
 
+// Exec allocates an in-sandbox pid, writes it to InternalPIDFile when set,
+// runs ExecFunc and releases the pid when it returns.
 func (f *Fake) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	if err := f.enter(ctx, "Exec", &ref); err != nil {
 		return -1, err
 	}
-	if err := f.requireRunning("Exec", ref); err != nil {
+	f.mu.Lock()
+	c, err := f.get("Exec", ref)
+	if err == nil && c.status != "running" {
+		err = fmt.Errorf("fake Exec %s: container is %s: %w", ref.ID, c.status, ErrNotRunning)
+	}
+	var pid int
+	if err == nil {
+		pid = f.pid()
+		c.execs[pid] = true
+	}
+	f.mu.Unlock()
+	if err != nil {
 		return -1, err
+	}
+	defer func() {
+		f.mu.Lock()
+		delete(c.execs, pid)
+		f.mu.Unlock()
+	}()
+	if spec.InternalPIDFile != "" {
+		if err := os.WriteFile(spec.InternalPIDFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+			return -1, fmt.Errorf("fake Exec %s: %w", ref.ID, err)
+		}
 	}
 	if f.ExecFunc == nil {
 		return 0, nil
@@ -151,23 +207,25 @@ func (f *Fake) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	return f.ExecFunc(ref, spec)
 }
 
+// KillProcess fails unless internalPID is a live Exec of a running
+// container; the pid is dead afterwards (ExecFunc keeps running).
 func (f *Fake) KillProcess(ctx context.Context, ref Ref, internalPID int) error {
 	if err := f.enter(ctx, "KillProcess", &ref); err != nil {
 		return err
 	}
-	return f.requireRunning("KillProcess", ref)
-}
-
-func (f *Fake) requireRunning(method string, ref Ref) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st, ok := f.containers[ref.ID]
-	if !ok {
-		return fmt.Errorf("fake %s %s: %w", method, ref.ID, ErrNotFound)
+	c, err := f.get("KillProcess", ref)
+	if err != nil {
+		return err
 	}
-	if st != "running" {
-		return fmt.Errorf("fake %s %s: container is %s", method, ref.ID, st)
+	if c.status != "running" {
+		return fmt.Errorf("fake KillProcess %s: container is %s", ref.ID, c.status)
 	}
+	if !c.execs[internalPID] {
+		return fmt.Errorf("fake KillProcess %s: no such process with PID %d", ref.ID, internalPID)
+	}
+	delete(c.execs, internalPID)
 	return nil
 }
 
@@ -178,7 +236,6 @@ func (f *Fake) Delete(ctx context.Context, ref Ref) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.containers, ref.ID)
-	delete(f.pids, ref.ID)
 	return nil
 }
 
@@ -188,11 +245,11 @@ func (f *Fake) State(ctx context.Context, ref Ref) (State, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st, ok := f.containers[ref.ID]
-	if !ok {
-		return State{}, fmt.Errorf("fake State %s: %w", ref.ID, ErrNotFound)
+	c, err := f.get("State", ref)
+	if err != nil {
+		return State{}, err
 	}
-	return State{ID: ref.ID, Status: st, PID: f.pids[ref.ID]}, nil
+	return State{ID: ref.ID, Status: c.status, PID: c.pid}, nil
 }
 
 func (f *Fake) List(ctx context.Context) ([]string, error) {
@@ -222,7 +279,6 @@ func (f *Fake) RemoveRoot(ctx context.Context) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.containers = map[string]string{}
-	f.pids = map[string]int{}
+	f.containers = map[string]*fakeContainer{}
 	return nil
 }

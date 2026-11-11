@@ -3,7 +3,10 @@ package runsc
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -45,8 +48,8 @@ func TestFakeLifecycle(t *testing.T) {
 	if err != nil || code != 0 {
 		t.Errorf("Exec = %d, %v", code, err)
 	}
-	if err := f.KillProcess(ctx, ref, 5); err != nil {
-		t.Errorf("KillProcess: %v", err)
+	if err := f.KillProcess(ctx, ref, 5); err == nil {
+		t.Error("KillProcess of a pid no Exec handed out: want error")
 	}
 	if err := f.Checkpoint(ctx, ref, "/img"); err != nil {
 		t.Fatal(err)
@@ -169,5 +172,139 @@ func TestFakeDelayHonoursContext(t *testing.T) {
 	}
 	if _, ok := f.Containers()["a"]; ok {
 		t.Error("container created despite cancelled delay")
+	}
+}
+
+func TestFakeCancelledContext(t *testing.T) {
+	f := NewFake()
+	bg := context.Background()
+	a := Ref{ID: "a", Network: NetworkNone}
+	if err := f.Create(bg, a, "/b", "/log"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(bg, a); err != nil {
+		t.Fatal(err)
+	}
+	before := f.Containers()
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	nb := Ref{ID: "b", Network: NetworkNone}
+	errs := map[string]error{
+		"Create":      f.Create(ctx, nb, "/b", "/log"),
+		"Start":       f.Start(ctx, a),
+		"Restore":     f.Restore(ctx, a, "/b", "/i"),
+		"Checkpoint":  f.Checkpoint(ctx, a, "/i"),
+		"KillProcess": f.KillProcess(ctx, a, 1),
+		"Delete":      f.Delete(ctx, a),
+		"RemoveRoot":  f.RemoveRoot(ctx),
+	}
+	_, errs["Exec"] = f.Exec(ctx, a, ExecSpec{Args: []string{"true"}})
+	_, errs["State"] = f.State(ctx, a)
+	_, errs["List"] = f.List(ctx)
+	_, errs["Version"] = f.Version(ctx)
+	for name, err := range errs {
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("%s with cancelled ctx = %v, want context.Canceled", name, err)
+		}
+	}
+	if got := f.Containers(); !reflect.DeepEqual(got, before) {
+		t.Errorf("containers changed: %v -> %v", before, got)
+	}
+}
+
+func TestFakeZeroValue(t *testing.T) {
+	var f Fake
+	ctx := context.Background()
+	a := Ref{ID: "a", Network: NetworkNone}
+	if err := f.Create(ctx, a, "/b", "/log"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if code, err := f.Exec(ctx, a, ExecSpec{Args: []string{"true"}}); code != 0 || err != nil {
+		t.Errorf("Exec = %d, %v", code, err)
+	}
+	if err := f.Delete(ctx, a); err != nil {
+		t.Error(err)
+	}
+	_ = f.RemoveRoot(ctx)
+}
+
+func TestFakeStatePIDs(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	a := Ref{ID: "a", Network: NetworkNone}
+	_ = f.Create(ctx, a, "/b", "/log")
+	_ = f.Start(ctx, a)
+	st1, _ := f.State(ctx, a)
+	st2, _ := f.State(ctx, a)
+	if st1.PID <= 0 || st1.PID != st2.PID {
+		t.Errorf("running PIDs %d, %d; want one stable positive pid", st1.PID, st2.PID)
+	}
+	_ = f.Checkpoint(ctx, a, "/i")
+	if st, _ := f.State(ctx, a); st.PID != -1 {
+		t.Errorf("stopped PID = %d, want -1", st.PID)
+	}
+	if _, err := f.Exec(ctx, a, ExecSpec{Args: []string{"true"}}); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("Exec in stopped container = %v, want ErrNotRunning", err)
+	}
+}
+
+func TestFakeExecPIDs(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	a := Ref{ID: "a", Network: NetworkNone}
+	_ = f.Create(ctx, a, "/b", "/log")
+	_ = f.Start(ctx, a)
+
+	if err := f.KillProcess(ctx, a, 12345); err == nil {
+		t.Error("KillProcess of a pid never handed out: want error")
+	}
+
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	started := make(chan int)
+	release := make(chan struct{})
+	f.ExecFunc = func(ref Ref, spec ExecSpec) (int, error) {
+		raw, err := os.ReadFile(spec.InternalPIDFile)
+		if err != nil {
+			t.Errorf("pid file not written before ExecFunc: %v", err)
+		}
+		pid, _ := strconv.Atoi(string(raw))
+		started <- pid
+		<-release
+		return 0, nil
+	}
+	done := make(chan error)
+	go func() {
+		_, err := f.Exec(ctx, a, ExecSpec{Args: []string{"sleep"}, InternalPIDFile: pidFile})
+		done <- err
+	}()
+	pid := <-started
+	if pid <= 0 {
+		t.Fatalf("pid file held %d", pid)
+	}
+	if err := f.KillProcess(ctx, a, pid); err != nil {
+		t.Errorf("KillProcess(live pid) = %v", err)
+	}
+	if err := f.KillProcess(ctx, a, pid); err == nil {
+		t.Error("second KillProcess of the same pid: want error")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Errorf("Exec = %v", err)
+	}
+
+	// A pid is released when ExecFunc returns.
+	f.ExecFunc = func(ref Ref, spec ExecSpec) (int, error) {
+		raw, _ := os.ReadFile(spec.InternalPIDFile)
+		pid, _ = strconv.Atoi(string(raw))
+		return 0, nil
+	}
+	if _, err := f.Exec(ctx, a, ExecSpec{Args: []string{"true"}, InternalPIDFile: pidFile}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.KillProcess(ctx, a, pid); err == nil {
+		t.Error("KillProcess of an exited exec's pid: want error")
 	}
 }

@@ -170,6 +170,46 @@ func TestCLILifecycle(t *testing.T) {
 		t.Errorf("pid file holds %q", raw)
 	}
 
+	var missErr bytes.Buffer
+	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"/no/such/binary"}, Stderr: &missErr}); err == nil ||
+		!strings.Contains(err.Error(), "/no/such/binary") || missErr.Len() != 0 {
+		t.Errorf("Exec of a missing binary = %d, %v; stderr forwarded %q", code, err, missErr.String())
+	}
+	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"sh", "-c", "exit 128"}}); err != nil || code != 128 {
+		t.Errorf("Exec exit 128 = %d, %v; want 128, nil", code, err)
+	}
+
+	// A deadline kills the runsc client only; the process is killed by pid.
+	sleepPID := filepath.Join(state, "sleep.pid")
+	dctx, dcancel := context.WithTimeout(ctx, time.Second)
+	began := time.Now()
+	code, err = c.Exec(dctx, ref, ExecSpec{Args: []string{"sleep", "30"}, InternalPIDFile: sleepPID})
+	dcancel()
+	if !errors.Is(err, context.DeadlineExceeded) || code != -1 {
+		t.Errorf("Exec sleep with 1 s deadline = %d, %v; want -1, deadline exceeded", code, err)
+	}
+	if d := time.Since(began); d > 5*time.Second {
+		t.Errorf("Exec returned %v after the deadline", d)
+	}
+	raw, err = os.ReadFile(sleepPID)
+	if err != nil {
+		t.Fatalf("sleep pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("sleep pid file holds %q", raw)
+	}
+	if err := c.KillProcess(ctx, ref, pid); err != nil {
+		t.Errorf("KillProcess(%d): %v", pid, err)
+	}
+	if err := c.KillProcess(ctx, ref, pid); err == nil {
+		t.Errorf("second KillProcess(%d): want error", pid)
+	}
+	out.Reset()
+	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"echo", "after"}, Stdout: &out}); err != nil || code != 0 || out.String() != "after\n" {
+		t.Errorf("Exec after the kill = %d, %v, %q", code, err, out.String())
+	}
+
 	ids, err := c.List(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +261,9 @@ func TestCLICheckpointRestore(t *testing.T) {
 	}
 	if st, err := c.State(ctx, a); err != nil || st.Status != "stopped" {
 		t.Errorf("State after Checkpoint = %+v, %v; want stopped", st, err)
+	}
+	if _, err := c.Exec(ctx, a, ExecSpec{Args: []string{"true"}}); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("Exec after Checkpoint err = %v, want ErrNotRunning", err)
 	}
 	if err := c.Delete(ctx, a); err != nil {
 		t.Fatalf("Delete A: %v", err)

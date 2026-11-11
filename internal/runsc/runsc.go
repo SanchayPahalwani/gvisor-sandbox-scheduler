@@ -26,10 +26,14 @@ type Ref struct {
 
 // ExecSpec describes one process to run inside a sandbox.
 type ExecSpec struct {
-	Args            []string
-	Env             []string // "K=V"
-	Cwd             string   // default "/work"
-	Stdin           io.Reader
+	Args []string
+	Env  []string // "K=V"
+	Cwd  string   // default "/work"
+	// Stdin is copied to the process; nil means /dev/null. A non-nil reader
+	// must reach EOF, or Exec does not return after the process exits.
+	Stdin io.Reader
+	// Stdout and Stderr receive the process's output; nil discards it. They
+	// may be the same writer: writes to it are then serialised.
 	Stdout, Stderr  io.Writer
 	InternalPIDFile string // if set, runsc writes the in-sandbox pid there
 }
@@ -47,6 +51,10 @@ type State struct {
 // ErrNotFound is returned when the named container does not exist under the root.
 var ErrNotFound = errors.New("runsc: no such container")
 
+// ErrNotRunning is returned by Exec when the container exists but cannot run
+// a process: it was checkpointed, or its init process exited.
+var ErrNotRunning = errors.New("runsc: container is not running")
+
 // Runtime is the set of runsc operations the node agent uses.
 type Runtime interface {
 	// Create creates the container; its stdout and stderr go to logPath.
@@ -57,7 +65,12 @@ type Runtime interface {
 	// Checkpoint saves the container to imagePath; the container is stopped afterwards.
 	Checkpoint(ctx context.Context, ref Ref, imagePath string) error
 	// Exec runs a process and waits for it. A nonzero exit is returned as the
-	// exit code with a nil error. Cancelling ctx kills the runsc client.
+	// exit code with a nil error; an error means the process did not run (or
+	// its exit was not seen). Cancelling ctx kills the `runsc exec` client
+	// only: the process inside the sandbox keeps running until the caller
+	// kills it with KillProcess, using the pid from InternalPIDFile. A
+	// cancelled Exec may take up to 2 s to return while the sandbox still
+	// holds the output pipes.
 	Exec(ctx context.Context, ref Ref, spec ExecSpec) (exitCode int, err error)
 	// KillProcess sends SIGKILL to one in-sandbox process.
 	KillProcess(ctx context.Context, ref Ref, internalPID int) error
@@ -69,6 +82,7 @@ type Runtime interface {
 	List(ctx context.Context) ([]string, error)
 	// Version returns the runsc release, e.g. "release-20261102.0".
 	Version(ctx context.Context) (string, error)
-	// RemoveRoot unmounts <root>/null-netns if mounted and removes the root directory.
+	// RemoveRoot unmounts <root>/null-netns if mounted and removes the root
+	// directory. Call it only after every container under the root was deleted.
 	RemoveRoot(ctx context.Context) error
 }

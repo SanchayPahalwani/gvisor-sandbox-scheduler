@@ -10,17 +10,27 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // stderrTail is how much of runsc's stderr an error message carries.
 const stderrTail = 2048
 
-// execWaitDelay bounds how long Exec waits for the stdout and stderr pipes
-// after the process exits (a background child may hold them open).
-const execWaitDelay = 2 * time.Second
+// waitDelay bounds how long a command waits for its stdout and stderr pipes
+// after it exits (a process it started may hold them open).
+const waitDelay = 2 * time.Second
+
+// checkpointStopWait bounds how long Checkpoint waits for the container to
+// leave state "running" after `runsc checkpoint` returns.
+const checkpointStopWait = 5 * time.Second
+
+// maxHeldDiag bounds how much stderr Exec holds back while it could still be
+// a runsc diagnostic (runsc's usage text is about 2.5 KiB).
+const maxHeldDiag = 16 << 10
 
 // CLI implements Runtime by running the runsc binary.
 type CLI struct {
@@ -38,8 +48,22 @@ func NewCLI(binary, root string) *CLI {
 	return &CLI{Binary: binary, Root: root}
 }
 
+// checkRef rejects a Ref that would make runsc act on the wrong thing: an
+// empty ID (runsc matches IDs by prefix) or an unknown network mode.
+func checkRef(ref Ref) error {
+	if ref.ID == "" {
+		return errors.New("runsc: empty container id")
+	}
+	switch ref.Network {
+	case "", NetworkNone, NetworkSandbox:
+		return nil
+	}
+	return fmt.Errorf("runsc: network %q is not %q or %q", ref.Network, NetworkNone, NetworkSandbox)
+}
+
 // args builds the full argument list: the top-level flags that must be the
 // same on every command for a sandbox, then the subcommand and its arguments.
+// An empty network means none.
 func (c *CLI) args(ref Ref, sub string, rest ...string) []string {
 	network := ref.Network
 	if network == "" {
@@ -96,6 +120,9 @@ func (c *CLI) versionArgs() []string { return []string{"--version"} }
 // Create runs `runsc create`. The child's stdout and stderr (and so the
 // container's) are logPath opened for append; stdin is /dev/null.
 func (c *CLI) Create(ctx context.Context, ref Ref, bundleDir string, logPath string) error {
+	if err := checkRef(ref); err != nil {
+		return err
+	}
 	log, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("runsc create: open log: %w", err)
@@ -115,65 +142,119 @@ func (c *CLI) Create(ctx context.Context, ref Ref, bundleDir string, logPath str
 }
 
 func (c *CLI) Start(ctx context.Context, ref Ref) error {
+	if err := checkRef(ref); err != nil {
+		return err
+	}
 	return c.run(ctx, "start", c.startArgs(ref), nil)
 }
 
 func (c *CLI) Restore(ctx context.Context, ref Ref, bundleDir, imagePath string) error {
+	if err := checkRef(ref); err != nil {
+		return err
+	}
 	return c.run(ctx, "restore", c.restoreArgs(ref, bundleDir, imagePath), nil)
 }
 
 func (c *CLI) Checkpoint(ctx context.Context, ref Ref, imagePath string) error {
-	return c.run(ctx, "checkpoint", c.checkpointArgs(ref, imagePath), nil)
+	if err := checkRef(ref); err != nil {
+		return err
+	}
+	if err := c.run(ctx, "checkpoint", c.checkpointArgs(ref, imagePath), nil); err != nil {
+		return err
+	}
+	// runsc checkpoint returns while the sandbox process is still exiting,
+	// and `runsc state` says "running" until it is gone.
+	deadline := time.Now().Add(checkpointStopWait)
+	for {
+		st, err := c.State(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("runsc checkpoint: %w", err)
+		}
+		if st.Status != "running" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("runsc checkpoint %s: still running %v after the checkpoint", ref.ID, checkpointStopWait)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("runsc checkpoint: %w", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // Exec runs `runsc exec` and waits for it. The exit code of the process is
 // returned with a nil error whenever the process ran.
+//
+// runsc writes its own diagnostics to the same stderr as the process and
+// exits 128 when it could not run the process. A process that really exits
+// 128 leaves runsc's stderr empty, so stderr that starts like a runsc
+// diagnostic is held back until it either stops looking like one (and is
+// forwarded) or runsc exits; on exit 128 it becomes the error and is not
+// forwarded to spec.Stderr.
 func (c *CLI) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
-	var errTail tailWriter
+	if err := checkRef(ref); err != nil {
+		return -1, err
+	}
+	if len(spec.Args) == 0 {
+		return -1, errors.New("runsc exec: empty Args")
+	}
+	stdout, stderr := newSinks(spec.Stdout, spec.Stderr)
+	diag := &diagWriter{}
+	if stderr != nil {
+		diag.w = stderr
+	}
 	cmd := exec.CommandContext(ctx, c.Binary, c.execArgs(ref, spec)...)
-	cmd.WaitDelay = execWaitDelay
+	cmd.WaitDelay = waitDelay
 	cmd.Stdin = spec.Stdin
-	cmd.Stdout = spec.Stdout
-	if spec.Stderr != nil {
-		cmd.Stderr = io.MultiWriter(spec.Stderr, &errTail)
-	} else {
-		cmd.Stderr = &errTail
+	if stdout != nil {
+		cmd.Stdout = stdout
 	}
-	err := cmd.Run()
-	if ctxErr := ctx.Err(); err != nil && ctxErr != nil {
-		return -1, fmt.Errorf("runsc exec: %w", ctxErr)
-	}
-	var exitErr *exec.ExitError
-	switch {
-	case err == nil:
-		return 0, nil
-	case errors.As(err, &exitErr):
-		code := exitErr.ExitCode()
-		if code < 0 {
-			return -1, cmdError("exec", err, errTail.String())
+	cmd.Stderr = diag
+	runErr := cmd.Run()
+
+	if ps := cmd.ProcessState; ps != nil && ps.Exited() {
+		code := ps.ExitCode()
+		if code == 128 && diag.isDiag() {
+			return -1, cmdError("exec", runErr, diag.text())
 		}
-		// runsc itself exits 128 when it cannot reach the container.
-		if code == 128 && isNotFound(errTail.String()) {
-			return -1, cmdError("exec", err, errTail.String())
+		diag.flush()
+		var extra error
+		var exitErr *exec.ExitError
+		if runErr != nil && !errors.As(runErr, &exitErr) && !errors.Is(runErr, exec.ErrWaitDelay) {
+			extra = runErr // e.g. copying Stdin failed
+		}
+		if err := errors.Join(stdout.error(), stderr.error(), extra); err != nil {
+			return code, fmt.Errorf("runsc exec: output: %w", err)
 		}
 		return code, nil
-	case errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil:
-		// The process exited; something it started still holds the pipes.
-		return cmd.ProcessState.ExitCode(), nil
-	default:
-		return -1, cmdError("exec", err, errTail.String())
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return -1, fmt.Errorf("runsc exec: %w", ctxErr)
+	}
+	return -1, cmdError("exec", runErr, diag.text())
 }
 
 func (c *CLI) KillProcess(ctx context.Context, ref Ref, internalPID int) error {
+	if err := checkRef(ref); err != nil {
+		return err
+	}
 	return c.run(ctx, "kill", c.killPIDArgs(ref, internalPID), nil)
 }
 
 // Delete sends SIGKILL to the container and force-deletes it. A container
-// that does not exist is not an error.
+// that does not exist is not an error. It asks State first because runsc
+// matches IDs by prefix: deleting a gone "a" would otherwise delete "ab".
 func (c *CLI) Delete(ctx context.Context, ref Ref) error {
-	// The kill fails for a container that is stopped or gone; delete --force
-	// is what must succeed.
+	if err := checkRef(ref); err != nil {
+		return err
+	}
+	if _, err := c.State(ctx, ref); errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	// The kill fails for a container that is stopped; delete --force is what
+	// must succeed.
 	_ = c.run(ctx, "kill", c.killArgs(ref), nil)
 	if err := c.run(ctx, "delete", c.deleteArgs(ref), nil); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
@@ -181,7 +262,12 @@ func (c *CLI) Delete(ctx context.Context, ref Ref) error {
 	return nil
 }
 
+// State returns ErrNotFound if no container has exactly ref.ID (runsc would
+// otherwise report a container whose ID starts with it).
 func (c *CLI) State(ctx context.Context, ref Ref) (State, error) {
+	if err := checkRef(ref); err != nil {
+		return State{}, err
+	}
 	var out bytes.Buffer
 	if err := c.run(ctx, "state", c.stateArgs(ref), &out); err != nil {
 		return State{}, err
@@ -189,6 +275,9 @@ func (c *CLI) State(ctx context.Context, ref Ref) (State, error) {
 	st, err := parseState(out.Bytes())
 	if err != nil {
 		return State{}, fmt.Errorf("runsc state: %w", err)
+	}
+	if st.ID != ref.ID {
+		return State{}, fmt.Errorf("runsc state %s: matched container %q: %w", ref.ID, st.ID, ErrNotFound)
 	}
 	return st, nil
 }
@@ -215,6 +304,7 @@ func (c *CLI) Version(ctx context.Context) (string, error) {
 
 // RemoveRoot unmounts the null-netns bind mount runsc leaves in the root
 // directory, then removes the directory. A missing root is not an error.
+// Call it only after every container under the root was deleted.
 func (c *CLI) RemoveRoot(ctx context.Context) error {
 	if c.Root == "" || filepath.Clean(c.Root) == "/" {
 		return fmt.Errorf("runsc: refusing to remove root %q", c.Root)
@@ -233,30 +323,34 @@ func (c *CLI) RemoveRoot(ctx context.Context) error {
 	return nil
 }
 
-// run executes runsc with stderr captured in a temporary file. A file rather
-// than a pipe, so a process runsc leaves behind cannot keep Wait blocked.
+// run executes runsc with the tail of its stderr kept in memory.
 func (c *CLI) run(ctx context.Context, sub string, args []string, stdout io.Writer) error {
-	errFile, err := os.CreateTemp("", "gss-runsc-stderr-")
-	if err != nil {
-		return fmt.Errorf("runsc %s: %w", sub, err)
-	}
-	defer os.Remove(errFile.Name())
-	defer errFile.Close()
+	var errTail tailWriter
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd.WaitDelay = waitDelay
 	cmd.Stdout = stdout
-	cmd.Stderr = errFile
-	if err := cmd.Run(); err != nil {
-		return cmdError(sub, err, readTail(errFile.Name(), 0))
+	cmd.Stderr = &errTail
+	err := cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		// runsc succeeded; a process it started still holds the pipes.
+		return nil
+	}
+	if err != nil {
+		return cmdError(sub, err, errTail.String())
 	}
 	return nil
 }
 
-// cmdError wraps a failed runsc command with its subcommand and stderr tail.
+// cmdError wraps a failed runsc command with its subcommand and stderr tail,
+// and with ErrNotFound or ErrNotRunning when stderr says so.
 func cmdError(sub string, err error, stderr string) error {
-	if isNotFound(stderr) {
+	stderr = tail([]byte(stderr))
+	switch {
+	case isNotFound(stderr):
 		return fmt.Errorf("runsc %s: %w: %w: %s", sub, ErrNotFound, err, stderr)
-	}
-	if stderr == "" {
+	case isNotRunning(stderr):
+		return fmt.Errorf("runsc %s: %w: %w: %s", sub, ErrNotRunning, err, stderr)
+	case stderr == "":
 		return fmt.Errorf("runsc %s: %w", sub, err)
 	}
 	return fmt.Errorf("runsc %s: %w: %s", sub, err, stderr)
@@ -266,6 +360,132 @@ func cmdError(sub string, err error, stderr string) error {
 // ("FetchSpec failed: loading container: file does not exist").
 func isNotFound(stderr string) bool {
 	return strings.Contains(stderr, "loading container") && strings.Contains(stderr, "file does not exist")
+}
+
+// isNotRunning reports whether runsc's stderr says the container cannot run
+// a process: "cannot execute in container ... in state stopped" (its init
+// exited, or it was checkpointed) or "connecting to control server ...:
+// connection refused" (the sandbox process is gone, seen right after a
+// checkpoint).
+func isNotRunning(stderr string) bool {
+	return strings.Contains(stderr, "in state stopped") ||
+		(strings.Contains(stderr, "connecting to control server") && strings.Contains(stderr, "connection refused"))
+}
+
+// execDiagPrefixes are how runsc's own messages from `runsc exec` begin.
+var execDiagPrefixes = []string{
+	"executing processes for container:", // could not start the process (failed to load ..., cwd, state)
+	"exec [command options]",             // usage text: bad arguments
+	"FetchSpec failed:",                  // could not load the container
+}
+
+// isExecDiag reports whether stderr is a runsc diagnostic rather than output
+// of a process.
+func isExecDiag(stderr string) bool {
+	for _, p := range execDiagPrefixes {
+		if strings.HasPrefix(stderr, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// couldBeExecDiag reports whether b is, or may grow into, a runsc diagnostic.
+func couldBeExecDiag(b []byte) bool {
+	for _, p := range execDiagPrefixes {
+		if len(b) <= len(p) && strings.HasPrefix(p, string(b)) || bytes.HasPrefix(b, []byte(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// diagWriter is Exec's stderr: it forwards to w, but holds back output for
+// as long as it could be a runsc diagnostic. Only the exec stderr goroutine
+// writes to it; the other methods are called after the command finished.
+type diagWriter struct {
+	w       io.Writer // nil discards
+	held    []byte
+	passing bool
+}
+
+func (d *diagWriter) Write(p []byte) (int, error) {
+	if d.passing {
+		d.forward(p)
+		return len(p), nil
+	}
+	d.held = append(d.held, p...)
+	if len(d.held) <= maxHeldDiag && couldBeExecDiag(d.held) {
+		return len(p), nil
+	}
+	d.flush()
+	return len(p), nil
+}
+
+func (d *diagWriter) forward(p []byte) {
+	if d.w != nil && len(p) > 0 {
+		d.w.Write(p) // errors are recorded by the sink
+	}
+}
+
+// flush forwards what is held and passes everything through from then on.
+func (d *diagWriter) flush() {
+	d.passing = true
+	d.forward(d.held)
+	d.held = nil
+}
+
+func (d *diagWriter) isDiag() bool { return !d.passing && isExecDiag(string(d.held)) }
+func (d *diagWriter) text() string { return tail(d.held) }
+
+// sink wraps a caller's writer: it serialises writes with a mutex (shared
+// when Stdout and Stderr are the same writer), records the first write error
+// and then discards, so the process never blocks on a failed writer.
+type sink struct {
+	mu  *sync.Mutex
+	w   io.Writer
+	err error
+}
+
+func (s *sink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err == nil {
+		if _, err := s.w.Write(p); err != nil {
+			s.err = err
+		}
+	}
+	return len(p), nil
+}
+
+func (s *sink) error() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// newSinks wraps the caller's writers; a nil writer gives a nil sink.
+func newSinks(stdout, stderr io.Writer) (*sink, *sink) {
+	var out, errS *sink
+	if stdout != nil {
+		out = &sink{mu: &sync.Mutex{}, w: stdout}
+	}
+	if stderr != nil {
+		errS = &sink{mu: &sync.Mutex{}, w: stderr}
+		if out != nil && sameWriter(stdout, stderr) {
+			errS.mu = out.mu
+		}
+	}
+	return out, errS
+}
+
+// sameWriter reports whether a and b are the same comparable value.
+func sameWriter(a, b io.Writer) bool {
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	return ta == tb && ta.Comparable() && a == b
 }
 
 func parseState(b []byte) (State, error) {
