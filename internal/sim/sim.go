@@ -36,8 +36,11 @@ type Result struct {
 	Failed          int     `json:"failed"`
 	Seconds         float64 `json:"seconds"` // time spent inside Place only
 	DecisionsPerSec float64 `json:"decisions_per_sec"`
-	NodesUsed       int     `json:"nodes_used"`
-	LowerBound      int     `json:"lower_bound"`
+	NodesUsed       int     `json:"nodes_used"` // nodes holding at least one sandbox
+	// LowerBound is a floor on node count that assumes the largest nodes are
+	// used first; on a mixed fleet it is not a fair yardstick for a
+	// utilisation-based policy.
+	LowerBound int `json:"lower_bound"`
 	// PackingEfficiency is the utilisation of the binding resource on nodes in
 	// use: max(CPUUtilUsed, MemUtilUsed), each requested / capacity summed
 	// over nodes that hold at least one sandbox.
@@ -175,6 +178,9 @@ type state struct {
 
 // Run runs the fill scenario and then the churn scenario against a fresh
 // fleet and returns one Result for each. Pass a Policy that no other run uses.
+// Every policy sees the same request sequence only while no placement fails
+// (Failed == 0), because a failed fill request is not counted and the churn
+// draw depends on the live set.
 func Run(cfg Config, p *sched.Policy) []Result {
 	s := run(cfg, p)
 	return []Result{s.fill, s.churn}

@@ -57,8 +57,8 @@ func TestLowerBound(t *testing.T) {
 		{Capacity: sched.Resources{CPUMillis: 5000, MemoryBytes: 5 * gib}},
 		{Capacity: sched.Resources{CPUMillis: 5000, MemoryBytes: 5 * gib}},
 	}
-	if got := LowerBound(mixed, 10000, 10*gib); got > 2 {
-		t.Fatalf("mixed orderings -> %d, want <= 2", got)
+	if got := LowerBound(mixed, 10000, 10*gib); got != 1 {
+		t.Fatalf("mixed orderings -> %d, want 1", got)
 	}
 	if got := LowerBound(nodes, 1000, 130*gib); got != 2 {
 		t.Fatalf("memory-bound -> %d, want 2", got)
