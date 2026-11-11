@@ -11,7 +11,7 @@ FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
 LINUX_TARGETS := build test-integration rootfs
 
-.PHONY: vm vm-stop vm-delete proto test lint $(LINUX_TARGETS)
+.PHONY: vm vm-stop vm-delete proto test lint sim $(LINUX_TARGETS)
 
 ifeq ($(UNAME),Darwin)
 $(LINUX_TARGETS):
@@ -68,3 +68,7 @@ test:
 lint:
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 	go vet ./...
+
+# Runs anywhere; not a Linux target.
+sim:
+	go run ./cmd/schedsim --out results/schedsim.json
