@@ -150,6 +150,12 @@ func TestWriteValidates(t *testing.T) {
 		{"RootFS", func(o *Options) { o.RootFS = "rootfs" }},
 		{"NetNSPath", func(o *Options) { o.NetNSPath = "netns/x" }},
 		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "not-an-ip", Name: "a.example"}} }},
+		{"Hosts", func(o *Options) {
+			o.Hosts = []HostEntry{{IP: "fe80::1%x\n6.6.6.6 injected.example", Name: "a.example"}}
+		}},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "2001:db8::1", Name: "a.example"}} }},
+		{"CPUMillis", func(o *Options) { o.CPUMillis = 1024001 }},
+		{"MemoryBytes", func(o *Options) { o.MemoryBytes = 1<<42 + 1 }},
 		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: "a b"}} }},
 		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: "a\nb"}} }},
 		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: ""}} }},
@@ -171,7 +177,7 @@ func TestWriteValidates(t *testing.T) {
 	o := goldenOptions()
 	o.Dir = filepath.Join(t.TempDir(), "sb")
 	o.NetNSPath = "/var/run/netns/x"
-	o.Hosts = []HostEntry{{IP: "::1", Name: "api-1.example"}}
+	o.Hosts = []HostEntry{{IP: "10.0.0.2", Name: "api-1.example"}}
 	if err := Write(o); err != nil {
 		t.Errorf("valid options rejected: %v", err)
 	}

@@ -44,7 +44,7 @@ func tmpfs(dest string) specs.Mount {
 		Options: []string{"nosuid", "nodev", "mode=1777", "size=67108864"}}
 }
 
-// Spec builds the runtime spec. The process section depends only on o.Prime:
+// Spec builds the runtime spec. It does not validate o; use Write. The process section depends only on o.Prime:
 // restore refuses a bundle whose args differ from the checkpoint's.
 func Spec(o Options) *specs.Spec {
 	quota := o.CPUMillis * 100
@@ -107,11 +107,11 @@ func validName(s string) bool { return idRE.MatchString(s) && s != "." && s != "
 // Validate rejects options that would fail open (no limits), put the cgroup
 // outside /gss/<node>, or write a malformed hosts file.
 func (o Options) Validate() error {
-	if o.CPUMillis <= 0 {
-		return fmt.Errorf("bundle: CPUMillis must be positive, got %d", o.CPUMillis)
+	if o.CPUMillis <= 0 || o.CPUMillis > 1024000 {
+		return fmt.Errorf("bundle: CPUMillis must be in 1..1024000, got %d", o.CPUMillis)
 	}
-	if o.MemoryBytes <= 0 {
-		return fmt.Errorf("bundle: MemoryBytes must be positive, got %d", o.MemoryBytes)
+	if o.MemoryBytes <= 0 || o.MemoryBytes > 1<<42 {
+		return fmt.Errorf("bundle: MemoryBytes must be in 1..2^42, got %d", o.MemoryBytes)
 	}
 	if !validName(o.ID) {
 		return fmt.Errorf("bundle: ID %q is not a valid name", o.ID)
@@ -129,8 +129,8 @@ func (o Options) Validate() error {
 		return fmt.Errorf("bundle: NetNSPath %q must be empty or an absolute path", o.NetNSPath)
 	}
 	for _, h := range o.Hosts {
-		if _, err := netip.ParseAddr(h.IP); err != nil {
-			return fmt.Errorf("bundle: Hosts entry IP %q: %w", h.IP, err)
+		if addr, err := netip.ParseAddr(h.IP); err != nil || !addr.Is4() {
+			return fmt.Errorf("bundle: Hosts entry IP %q must be an IPv4 address", h.IP)
 		}
 		if len(h.Name) > 253 || !hostnameRE.MatchString(h.Name) {
 			return fmt.Errorf("bundle: Hosts entry Name %q is not a valid hostname", h.Name)
@@ -153,7 +153,7 @@ func Write(o Options) error {
 	var hosts strings.Builder
 	hosts.WriteString("127.0.0.1 localhost\n")
 	for _, h := range o.Hosts {
-		hosts.WriteString(h.IP + " " + h.Name + "\n")
+		hosts.WriteString(netip.MustParseAddr(h.IP).String() + " " + h.Name + "\n")
 	}
 	if err := os.WriteFile(filepath.Join(o.Dir, "hosts"), []byte(hosts.String()), 0o644); err != nil {
 		return fmt.Errorf("bundle: %w", err)

@@ -29,9 +29,21 @@ def err(f):
         return e.errno
     return 0
 
-def write(path, mode="w", n=1):
+def write(path, mode="w"):
     with open(path, mode) as f:
-        f.write("x" * n)
+        f.write("x")
+
+def fill(path):
+    chunk = b"x" * (1 << 20)
+    n = 0
+    try:
+        with open(path, "wb") as f:
+            while True:
+                f.write(chunk)
+                f.flush()
+                n += 1
+    except OSError as e:
+        return e.errno, n
 
 def status(key):
     for line in open("/proc/self/status"):
@@ -57,7 +69,8 @@ print("hosts-content", open("/etc/hosts").read() == "127.0.0.1 localhost\n10.1.2
 print("dev-fails", err(lambda: write("/dev/x")) != 0)
 print("caps-zero", all(int(status(k), 16) == 0 for k in ("CapEff", "CapPrm", "CapBnd")))
 print("nonewprivs", status("NoNewPrivs") == "1")
-print("work-enospc", err(lambda: write("/work/big", "w", 65 << 20)) == errno.ENOSPC)
+e, mib = fill("/work/big")
+print("work-enospc", e == errno.ENOSPC and mib >= 60)
 print("no-net-unreachable", err(conn) == errno.ENETUNREACH)
 `
 
