@@ -6,10 +6,10 @@ UNAME := $(shell uname -s)
 PKG ?= ./...
 RUN ?= .
 # Variables forwarded into the VM invocation. Append new ones here.
-FORWARD_VARS := PKG RUN
+FORWARD_VARS := PKG RUN FORCE
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
-LINUX_TARGETS := build test-integration
+LINUX_TARGETS := build test-integration rootfs
 
 .PHONY: vm vm-stop vm-delete proto test lint $(LINUX_TARGETS)
 
@@ -43,7 +43,10 @@ else
 endif
 
 test-integration:
-	sudo env PATH=$$PATH GOCACHE=/var/cache/gss/go-build GOMODCACHE=/var/cache/gss/go-mod go test -tags integration -count=1 -p 1 -timeout 20m $(PKG) -run '$(RUN)'
+	sudo env PATH=$$PATH GOCACHE=/var/cache/gss/go-build GOMODCACHE=/var/cache/gss/go-mod go test -tags integration -count=1 -p 1 -timeout 20m $(value PKG) -run '$(value RUN)'
+
+rootfs:
+	scripts/build-rootfs.sh
 
 vm vm-stop vm-delete:
 	@echo "not needed on Linux"
