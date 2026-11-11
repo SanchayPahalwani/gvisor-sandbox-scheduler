@@ -25,8 +25,10 @@ CGO_ENABLED=0 "$GO" build -trimpath -buildvcs=false -o bin/pyfork ./cmd/pyfork
 
 ctx=$(mktemp -d "$repo/bin/rootfs-context.XXXXXX")
 container=""
+new=""
 cleanup() {
 	if [[ -n "$container" ]]; then "$CLI" rm -f "$container" >/dev/null 2>&1 || true; fi
+	if [[ -n "$new" ]]; then sudo rm -rf "$new"; fi # a partial export
 	rm -rf "$ctx"
 }
 trap cleanup EXIT
@@ -34,7 +36,7 @@ trap cleanup EXIT
 cp images/python/Dockerfile images/python/zygote.py bin/pyfork "$ctx/"
 id=$(cd "$ctx" && cat Dockerfile zygote.py pyfork | sha256sum | cut -d' ' -f1)
 
-if [[ "${FORCE:-0}" != 1 && -d "$dest" ]] && [[ "$(sudo cat "$idfile" 2>/dev/null || true)" == "$id" ]]; then
+if [[ "${FORCE:-0}" != 1 ]] && sudo test -d "$dest" && [[ "$(sudo cat "$idfile" 2>/dev/null || true)" == "$id" ]]; then
 	echo "rootfs $dest is up to date ($id)"
 	exit 0
 fi
@@ -51,13 +53,15 @@ container=$("$CLI" create "$image")
 sudo chmod 0755 "$new"
 
 # Swap in the new tree: rename the old one aside, rename the new one into place.
+# mv -T never moves a directory into an existing one.
 old=""
-if [[ -e "$dest" ]]; then
+if sudo test -e "$dest"; then
 	old="$root/.python.old.$$"
-	sudo mv "$dest" "$old"
+	sudo mv -T "$dest" "$old"
 fi
-sudo mv "$new" "$dest"
+sudo mv -T "$new" "$dest"
+new=""
 echo "$id" | sudo tee "$idfile.tmp" >/dev/null
-sudo mv "$idfile.tmp" "$idfile"
+sudo mv -T "$idfile.tmp" "$idfile"
 if [[ -n "$old" ]]; then sudo rm -rf "$old"; fi
 echo "rootfs $dest built ($id)"

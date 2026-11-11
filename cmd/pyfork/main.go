@@ -16,8 +16,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -27,19 +29,39 @@ const (
 	exitInternal  = 125
 	defaultSocket = "/tmp/gss-zygote.sock"
 	maxHeaderLen  = 1 << 20
-	maxCodeLen    = 64 << 20
+	maxCodeLen    = 16 << 20
+	maxTimeoutS   = 86400
 	retryInterval = 5 * time.Millisecond
 )
 
 func main() {
-	sock := os.Getenv("GSS_ZYGOTE_SOCK")
-	if sock == "" {
-		sock = defaultSocket
+	socket, connectTimeout, err := parseFlags(os.Args[1:], os.Getenv("GSS_ZYGOTE_SOCK"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pyfork: %v\n", err)
+		os.Exit(exitInternal)
 	}
-	socket := flag.String("socket", sock, "zygote Unix socket path")
-	connectTimeout := flag.Duration("connect-timeout", 30*time.Second, "how long to keep retrying the connect")
-	flag.Parse()
-	os.Exit(run(os.Stdin, os.Stdout, os.Stderr, *socket, *connectTimeout))
+	os.Exit(run(os.Stdin, os.Stdout, os.Stderr, socket, connectTimeout))
+}
+
+// parseFlags parses the command line; envSocket is $GSS_ZYGOTE_SOCK.
+func parseFlags(args []string, envSocket string) (socket string, connectTimeout time.Duration, err error) {
+	if envSocket == "" {
+		envSocket = defaultSocket
+	}
+	fs := flag.NewFlagSet("pyfork", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&socket, "socket", envSocket, "zygote Unix socket path")
+	fs.DurationVar(&connectTimeout, "connect-timeout", 30*time.Second, "how long to keep retrying the connect")
+	if err := fs.Parse(args); err != nil {
+		return "", 0, err
+	}
+	if fs.NArg() > 0 {
+		return "", 0, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if connectTimeout < 0 {
+		return "", 0, fmt.Errorf("negative --connect-timeout %v", connectTimeout)
+	}
+	return socket, connectTimeout, nil
 }
 
 func run(stdin, stdout, stderr *os.File, socket string, connectTimeout time.Duration) int {
@@ -133,9 +155,17 @@ func readRequest(stdin io.Reader) (request, error) {
 	case h.CodeLen == nil:
 		return request{}, errors.New("bad header: code_len is missing")
 	case *h.CodeLen < 0 || *h.CodeLen > maxCodeLen:
-		return request{}, fmt.Errorf("bad header: code_len %d is outside 0..%d", *h.CodeLen, maxCodeLen)
-	case h.TimeoutS < 0:
-		return request{}, fmt.Errorf("bad header: timeout_s %v is negative", h.TimeoutS)
+		return request{}, fmt.Errorf("bad header: code_len %d is outside 0..%d (16 MiB)", *h.CodeLen, maxCodeLen)
+	case h.TimeoutS < 0 || h.TimeoutS > maxTimeoutS || math.IsNaN(h.TimeoutS):
+		return request{}, fmt.Errorf("bad header: timeout_s %v is outside 0..%d", h.TimeoutS, maxTimeoutS)
+	}
+	for k, v := range h.Env {
+		if k == "" || strings.ContainsAny(k, "=\x00") {
+			return request{}, fmt.Errorf("bad header: env name %q is empty or contains '=' or NUL", k)
+		}
+		if strings.ContainsRune(v, 0) {
+			return request{}, fmt.Errorf("bad header: env value of %q contains NUL", k)
+		}
 	}
 	code := make([]byte, *h.CodeLen)
 	if _, err := io.ReadFull(stdin, code); err != nil {

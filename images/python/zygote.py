@@ -9,14 +9,19 @@ connection. Nothing here uses threads, so fork is safe.
 Protocol (client -> zygote): one sendmsg with a 4-byte big-endian payload length
 and SCM_RIGHTS carrying fds 0, 1, 2; then the JSON payload
 {"code": str, "timeout_s": number, "env": {str: str}}.
-Reply: a 4-byte big-endian signed exit code (negative = killed by that signal),
-then the connection is closed.
+Reply: a 4-byte big-endian signed exit code (negative = killed by that signal;
+125 = the worker could not be set up), then the connection is closed. A request
+that cannot be parsed gets a "zygote: ..." line on the client's stderr and no
+exit code.
 """
 
 import array
+import atexit
+import gc
 import importlib
 import json
 import linecache
+import math
 import os
 import select
 import signal
@@ -25,10 +30,13 @@ import struct
 import sys
 import time
 import traceback
+import types
 
 SOCKET_DEFAULT = "/tmp/gss-zygote.sock"
 SANDBOX_FILENAME = "<sandbox>"
 MAX_PAYLOAD = 64 << 20
+MAX_TIMEOUT_S = 86400
+EXIT_SETUP = 125  # the worker could not be set up; the code did not run
 INT_SIZE = array.array("i").itemsize
 
 
@@ -47,7 +55,7 @@ def recv_exact(conn, n):
 
 
 def recv_request(conn):
-    """Returns (fds, code, timeout_s, env) or raises ProtocolError/OSError."""
+    """Returns (fds, payload bytes); raises ProtocolError or OSError."""
     fds = []
     head = b""
     try:
@@ -69,32 +77,44 @@ def recv_request(conn):
         (length,) = struct.unpack(">I", head)
         if length > MAX_PAYLOAD:
             raise ProtocolError("payload of %d bytes is too large" % length)
-        req = json.loads(recv_exact(conn, length))
-        code = req["code"]
-        timeout_s = req.get("timeout_s") or 0
-        env = req.get("env") or {}
-        if not isinstance(code, str):
-            raise ProtocolError("code is not a string")
-        if not isinstance(timeout_s, (int, float)) or timeout_s < 0:
-            raise ProtocolError("bad timeout_s")
-        if not isinstance(env, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
-        ):
-            raise ProtocolError("env is not a map of strings")
-    except (ValueError, KeyError, TypeError) as e:
-        for fd in fds:
-            os.close(fd)
-        raise ProtocolError("bad request: %s" % e)
+        return fds, recv_exact(conn, length)
     except BaseException:
         for fd in fds:
             os.close(fd)
         raise
-    return fds, code, float(timeout_s), env
+
+
+def parse_request(payload):
+    """Returns (code, timeout_s, env) or raises ProtocolError."""
+    try:
+        req = json.loads(payload)
+    except ValueError as e:
+        raise ProtocolError("bad request: %s" % e)
+    if not isinstance(req, dict):
+        raise ProtocolError("bad request: not a JSON object")
+    code = req.get("code")
+    timeout_s = req.get("timeout_s") or 0
+    env = req.get("env") or {}
+    if not isinstance(code, str):
+        raise ProtocolError("bad request: code is not a string")
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or math.isnan(timeout_s)
+        or not 0 <= timeout_s <= MAX_TIMEOUT_S
+    ):
+        raise ProtocolError(
+            "bad request: timeout_s %r is outside 0..%d" % (timeout_s, MAX_TIMEOUT_S)
+        )
+    if not isinstance(env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+    ):
+        raise ProtocolError("bad request: env is not a map of strings")
+    return code, float(timeout_s), env
 
 
 def run_worker(fds, code, env):
     """Runs in the worker process; never returns."""
-    status = 1
     try:
         os.setpgid(0, 0)
         for target, fd in enumerate(fds):
@@ -113,50 +133,120 @@ def run_worker(fds, code, env):
             2, "w", buffering=1, encoding="utf-8", errors="backslashreplace",
             closefd=False,
         )
+        # Look like `python3 -c`: a fresh __main__ module, argv, and cwd first on the path.
+        main_module = types.ModuleType("__main__")
+        sys.modules["__main__"] = main_module
+        sys.argv = ["-c"]
+        sys.path[0] = ""
         # Lets tracebacks show the user's source lines.
         linecache.cache[SANDBOX_FILENAME] = (
             len(code), None, code.splitlines(True), SANDBOX_FILENAME,
         )
+    except BaseException as e:
+        # fd 2 is the client's stderr once dup2 has run, the zygote's before that.
         try:
-            exec(compile(code, SANDBOX_FILENAME, "exec"), {"__name__": "__main__"})
-            status = 0
-        except SystemExit as e:
-            if e.code is None:
-                status = 0
-            elif isinstance(e.code, int):
-                status = e.code
-            else:
-                print(e.code, file=sys.stderr)
-                status = 1
-        except BaseException as e:
-            tb = e.__traceback__
-            while tb is not None and tb.tb_frame.f_code.co_filename != SANDBOX_FILENAME:
-                tb = tb.tb_next
-            traceback.print_exception(type(e), e, tb)
-            status = 1
-    finally:
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except BaseException:
-                pass
-        os._exit(status & 0xFF)
+            os.write(2, ("zygote: worker setup: %s\n" % e).encode("utf-8", "replace"))
+        finally:
+            os._exit(EXIT_SETUP)
+
+    status = run_code(code, main_module.__dict__)
+    del main_module
+    status = shut_down(status)
+    os._exit(status & 0xFF)
 
 
-def kill_group(pgid):
+def run_code(code, namespace):
+    """Runs the user's code and returns its exit status."""
     try:
-        os.killpg(pgid, signal.SIGKILL)
-    except OSError:
+        exec(compile(code, SANDBOX_FILENAME, "exec"), namespace)
+        return 0
+    except SystemExit as e:
+        return exit_status(e)
+    except BaseException as e:
+        print_user_exception(e)
+        return 1
+
+
+def exit_status(e):
+    if e.code is None:
+        return 0
+    if isinstance(e.code, int):
+        return e.code
+    try:
+        print(e.code, file=sys.stderr)
+    except BaseException:
         pass
+    return 1
+
+
+def print_user_exception(e):
+    tb = e.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_filename != SANDBOX_FILENAME:
+        tb = tb.tb_next
+    try:
+        traceback.print_exception(type(e), e, tb)
+    except BaseException:
+        pass
+
+
+def shut_down(status):
+    """Does what interpreter exit does for `python3 -c`, as far as practical: wait
+    for non-daemon threads, run atexit handlers, drop __main__'s globals so
+    objects are finalized (open files flushed), then flush stdio."""
+    if "threading" in sys.modules:
+        try:
+            sys.modules["threading"]._shutdown()
+        except SystemExit as e:
+            status = exit_status(e)
+        except BaseException as e:
+            print_user_exception(e)
+    try:
+        atexit._run_exitfuncs()
+    except BaseException:
+        pass
+    try:
+        main_module = sys.modules.pop("__main__", None)
+        if main_module is not None:
+            main_module.__dict__.clear()
+        del main_module
+        gc.collect()
+    except BaseException:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except BaseException:
+            pass
+    return status
+
+
+def kill_worker(pid):
+    """Kills the worker's process group and the worker itself, in case it left
+    the group. The pid cannot be reused before the supervisor reaps it."""
+    for kill in (os.killpg, os.kill):
+        try:
+            kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def supervise(conn):
     """Runs in the supervisor process; never returns."""
+    pid = None
     try:
         try:
-            fds, code, timeout_s, env = recv_request(conn)
+            fds, payload = recv_request(conn)
         except (ProtocolError, OSError) as e:
             print("zygote: %s" % e, file=sys.stderr, flush=True)
+            os._exit(1)
+        try:
+            code, timeout_s, env = parse_request(payload)
+        except ProtocolError as e:
+            # Tell the client on its own stderr, then close without an exit code.
+            try:
+                os.write(fds[2], ("zygote: %s\n" % e).encode("utf-8", "replace"))
+            except OSError:
+                pass
             os._exit(1)
 
         wake_r, wake_w = os.pipe()
@@ -185,14 +275,14 @@ def supervise(conn):
         while True:
             wpid, status = os.waitpid(pid, os.WNOHANG)
             if wpid == pid:
-                kill_group(pid)  # leftovers the worker started
+                # Background processes the code started are left alone.
                 send_code(conn, os.waitstatus_to_exitcode(status))
                 os._exit(0)
             remaining = None
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    kill_group(pid)
+                    kill_worker(pid)
                     _, status = os.waitpid(pid, 0)
                     send_code(conn, os.waitstatus_to_exitcode(status))
                     os._exit(0)
@@ -209,11 +299,13 @@ def supervise(conn):
                 except OSError:
                     gone = True
                 if gone:
-                    kill_group(pid)
+                    kill_worker(pid)
                     os.waitpid(pid, 0)
                     os._exit(0)
     except BaseException:
         try:
+            if pid:
+                kill_worker(pid)
             traceback.print_exc()
             sys.stderr.flush()
         finally:
