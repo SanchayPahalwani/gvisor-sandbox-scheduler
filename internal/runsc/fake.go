@@ -17,11 +17,15 @@ import (
 // It follows the CLI where a manager could notice: a done ctx fails every
 // method before it acts, Exec in a container that is not running returns
 // ErrNotRunning, a stopped container's PID is -1, and KillProcess fails for
-// a pid that is not a live Exec of that container.
+// a pid that is not a live Exec of that container. An Exec that returns
+// because its ctx ended leaves its pid alive, as the process inside a real
+// sandbox keeps running; KillProcess or Delete releases it.
 type Fake struct {
-	ExecFunc   func(ref Ref, spec ExecSpec) (int, error) // default: exit 0
-	Fail       map[string]error                          // method name -> error to return once
-	Delay      map[string]time.Duration                  // method name -> sleep before acting
+	// ExecFunc runs one Exec; default: exit 0. ctx is the Exec's ctx, so a
+	// test can block until it ends.
+	ExecFunc   func(ctx context.Context, ref Ref, spec ExecSpec) (int, error)
+	Fail       map[string]error         // method name -> error to return once
+	Delay      map[string]time.Duration // method name -> sleep before acting
 	VersionStr string
 
 	mu         sync.Mutex
@@ -172,7 +176,9 @@ func (f *Fake) Checkpoint(ctx context.Context, ref Ref, imagePath string) error 
 }
 
 // Exec allocates an in-sandbox pid, writes it to InternalPIDFile when set,
-// runs ExecFunc and releases the pid when it returns.
+// and runs ExecFunc. The pid is released when ExecFunc returns, unless the
+// Exec's ctx has ended by then: Exec then returns the ctx error and the pid
+// stays alive until KillProcess or Delete.
 func (f *Fake) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	if err := f.enter(ctx, "Exec", &ref); err != nil {
 		return -1, err
@@ -191,20 +197,26 @@ func (f *Fake) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	defer func() {
+	release := func() {
 		f.mu.Lock()
 		delete(c.execs, pid)
 		f.mu.Unlock()
-	}()
+	}
 	if spec.InternalPIDFile != "" {
 		if err := os.WriteFile(spec.InternalPIDFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+			release()
 			return -1, fmt.Errorf("fake Exec %s: %w", ref.ID, err)
 		}
 	}
-	if f.ExecFunc == nil {
-		return 0, nil
+	code, err := 0, error(nil)
+	if f.ExecFunc != nil {
+		code, err = f.ExecFunc(ctx, ref, spec)
 	}
-	return f.ExecFunc(ref, spec)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return -1, fmt.Errorf("fake Exec %s: %w", ref.ID, ctxErr)
+	}
+	release()
+	return code, err
 }
 
 // KillProcess fails unless internalPID is a live Exec of a running

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +28,12 @@ const waitDelay = 2 * time.Second
 const checkpointStopWait = 5 * time.Second
 
 // maxHeldDiag bounds how much stderr Exec holds back while it could still be
-// a runsc diagnostic (runsc's usage text is about 2.5 KiB).
+// a runsc diagnostic (runsc's usage text is about 2.5 KiB), plus four times
+// the size of the request, which runsc quotes.
 const maxHeldDiag = 16 << 10
+
+// execStateTimeout bounds the State call Exec makes after an exit 128.
+const execStateTimeout = 5 * time.Second
 
 // CLI implements Runtime by running the runsc binary.
 type CLI struct {
@@ -136,7 +139,7 @@ func (c *CLI) Create(ctx context.Context, ref Ref, bundleDir string, logPath str
 	cmd.Stdout = log
 	cmd.Stderr = log
 	if err := cmd.Run(); err != nil {
-		return cmdError("create", err, readTail(logPath, offset))
+		return runError(ctx, "create", err, readTail(logPath, offset))
 	}
 	return nil
 }
@@ -185,14 +188,16 @@ func (c *CLI) Checkpoint(ctx context.Context, ref Ref, imagePath string) error {
 }
 
 // Exec runs `runsc exec` and waits for it. The exit code of the process is
-// returned with a nil error whenever the process ran.
+// returned with a nil error whenever the process ran and its exit was seen.
 //
-// runsc writes its own diagnostics to the same stderr as the process and
-// exits 128 when it could not run the process. A process that really exits
-// 128 leaves runsc's stderr empty, so stderr that starts like a runsc
-// diagnostic is held back until it either stops looking like one (and is
-// forwarded) or runsc exits; on exit 128 it becomes the error and is not
-// forwarded to spec.Stderr.
+// runsc exits 128 when it fails, and writes its diagnostics to the same
+// stderr as the process. So on exit 128 Exec asks State: a container that is
+// gone or not running means the exit was not seen (ErrNotRunning). For a
+// running container, stderr that starts like a runsc diagnostic (the process
+// never ran) or ends with a runsc failure line is an error. A diagnostic at
+// the start is held back while it may still be one, and is then not
+// forwarded to spec.Stderr; a process that really exits 128 leaves runsc's
+// stderr empty.
 func (c *CLI) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	if err := checkRef(ref); err != nil {
 		return -1, err
@@ -201,7 +206,7 @@ func (c *CLI) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 		return -1, errors.New("runsc exec: empty Args")
 	}
 	stdout, stderr := newSinks(spec.Stdout, spec.Stderr)
-	diag := &diagWriter{}
+	diag := &diagWriter{maxHeld: maxHeldFor(spec)}
 	if stderr != nil {
 		diag.w = stderr
 	}
@@ -214,26 +219,99 @@ func (c *CLI) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 	cmd.Stderr = diag
 	runErr := cmd.Run()
 
-	if ps := cmd.ProcessState; ps != nil && ps.Exited() {
-		code := ps.ExitCode()
-		if code == 128 && diag.isDiag() {
-			return -1, cmdError("exec", runErr, diag.text())
-		}
+	ps := cmd.ProcessState
+	if ps == nil || !ps.Exited() {
 		diag.flush()
-		var extra error
-		var exitErr *exec.ExitError
-		if runErr != nil && !errors.As(runErr, &exitErr) && !errors.Is(runErr, exec.ErrWaitDelay) {
-			extra = runErr // e.g. copying Stdin failed
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return -1, fmt.Errorf("runsc exec: %w", ctxErr)
 		}
-		if err := errors.Join(stdout.error(), stderr.error(), extra); err != nil {
-			return code, fmt.Errorf("runsc exec: output: %w", err)
+		return -1, cmdError("exec", runErr, diag.last.String())
+	}
+	code := ps.ExitCode()
+	if code == 128 {
+		if err := c.execFailure(ref, runErr, diag); err != nil {
+			return -1, err
 		}
-		return code, nil
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return -1, fmt.Errorf("runsc exec: %w", ctxErr)
+	diag.flush()
+	var extra error
+	var exitErr *exec.ExitError
+	if runErr != nil && !errors.As(runErr, &exitErr) && !errors.Is(runErr, exec.ErrWaitDelay) &&
+		!errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
+		extra = runErr // e.g. copying Stdin failed
 	}
-	return -1, cmdError("exec", runErr, diag.text())
+	if err := errors.Join(stdout.error(), stderr.error(), extra); err != nil {
+		return code, fmt.Errorf("runsc exec: output: %w", err)
+	}
+	return code, nil
+}
+
+// execFailure decides whether a `runsc exec` exit 128 was runsc failing
+// rather than the process exiting 128. It returns nil for a real exit.
+func (c *CLI) execFailure(ref Ref, runErr error, diag *diagWriter) error {
+	last := diag.last.String()
+	// The caller's ctx may be done; the question still needs an answer.
+	sctx, cancel := context.WithTimeout(context.Background(), execStateTimeout)
+	defer cancel()
+	st, err := c.State(sctx, ref)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return fmt.Errorf("runsc exec %s: exit not seen: %w: %w: %s", ref.ID, ErrNotRunning, ErrNotFound, last)
+	case err == nil && st.Status != "running":
+		return fmt.Errorf("runsc exec %s: exit not seen, container is %s: %w: %s", ref.ID, st.Status, ErrNotRunning, last)
+	}
+	if diag.isDiag() {
+		return diagError(runErr, string(diag.held))
+	}
+	if line := lastLine(last); strings.HasPrefix(line, "writing internal pid file:") || strings.HasPrefix(line, "waiting on pid ") {
+		return fmt.Errorf("runsc exec: %w: %s", runErr, line)
+	}
+	return nil
+}
+
+// diagError turns a runsc exec diagnostic into an error. The sentinels come
+// only from runsc's own words, not from the argv it quotes.
+func diagError(runErr error, diag string) error {
+	own := runscPart(diag)
+	diag = tail([]byte(diag))
+	switch {
+	case isNotFound(own):
+		return fmt.Errorf("runsc exec: %w: %w: %s", ErrNotFound, runErr, diag)
+	case strings.Contains(own, "in state stopped"):
+		return fmt.Errorf("runsc exec: %w: %w: %s", ErrNotRunning, runErr, diag)
+	}
+	return fmt.Errorf("runsc exec: %w: %s", runErr, diag)
+}
+
+// maxHeldFor sizes the diagnostic hold: runsc quotes the whole argv (and
+// may quote cwd and env) in its message.
+func maxHeldFor(spec ExecSpec) int {
+	n := len(spec.Cwd)
+	for _, a := range spec.Args {
+		n += len(a)
+	}
+	for _, e := range spec.Env {
+		n += len(e)
+	}
+	return maxHeldDiag + 4*n
+}
+
+// runscPart returns the part of a runsc exec diagnostic before the quoted
+// argv ("executing command \"...").
+func runscPart(s string) string {
+	if i := strings.Index(s, `executing command "`); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// lastLine returns the last non-empty line of s.
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\n")
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
 
 func (c *CLI) KillProcess(ctx context.Context, ref Ref, internalPID int) error {
@@ -336,9 +414,17 @@ func (c *CLI) run(ctx context.Context, sub string, args []string, stdout io.Writ
 		return nil
 	}
 	if err != nil {
-		return cmdError(sub, err, errTail.String())
+		return runError(ctx, sub, err, errTail.String())
 	}
 	return nil
+}
+
+// runError is cmdError, wrapping the ctx error when ctx ended the command.
+func runError(ctx context.Context, sub string, err error, stderr string) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("runsc %s: %w: %w", sub, ctxErr, cmdError(sub, err, stderr))
+	}
+	return cmdError(sub, err, stderr)
 }
 
 // cmdError wraps a failed runsc command with its subcommand and stderr tail,
@@ -401,21 +487,25 @@ func couldBeExecDiag(b []byte) bool {
 }
 
 // diagWriter is Exec's stderr: it forwards to w, but holds back output for
-// as long as it could be a runsc diagnostic. Only the exec stderr goroutine
-// writes to it; the other methods are called after the command finished.
+// as long as it could be a runsc diagnostic, and keeps the last stderrTail
+// bytes of everything in last. Only the exec stderr goroutine writes to it;
+// the other methods are called after the command finished.
 type diagWriter struct {
 	w       io.Writer // nil discards
+	maxHeld int
 	held    []byte
 	passing bool
+	last    tailWriter
 }
 
 func (d *diagWriter) Write(p []byte) (int, error) {
+	d.last.Write(p)
 	if d.passing {
 		d.forward(p)
 		return len(p), nil
 	}
 	d.held = append(d.held, p...)
-	if len(d.held) <= maxHeldDiag && couldBeExecDiag(d.held) {
+	if len(d.held) <= d.maxHeld && couldBeExecDiag(d.held) {
 		return len(p), nil
 	}
 	d.flush()
@@ -436,7 +526,6 @@ func (d *diagWriter) flush() {
 }
 
 func (d *diagWriter) isDiag() bool { return !d.passing && isExecDiag(string(d.held)) }
-func (d *diagWriter) text() string { return tail(d.held) }
 
 // sink wraps a caller's writer: it serialises writes with a mutex (shared
 // when Stdout and Stderr are the same writer), records the first write error
@@ -482,10 +571,16 @@ func newSinks(stdout, stderr io.Writer) (*sink, *sink) {
 	return out, errS
 }
 
-// sameWriter reports whether a and b are the same comparable value.
-func sameWriter(a, b io.Writer) bool {
-	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
-	return ta == tb && ta.Comparable() && a == b
+// sameWriter reports whether a and b are the same value. Comparing can panic
+// for a comparable type that holds an uncomparable one (a struct with an
+// interface field holding a slice type); that counts as different.
+func sameWriter(a, b io.Writer) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
 }
 
 func parseState(b []byte) (State, error) {

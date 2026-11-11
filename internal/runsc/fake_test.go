@@ -122,7 +122,7 @@ func TestFakeRecordsCalls(t *testing.T) {
 	f.VersionStr = "release-20261102.0"
 	a := Ref{ID: "a", Network: NetworkNone}
 	var gotSpec ExecSpec
-	f.ExecFunc = func(ref Ref, spec ExecSpec) (int, error) {
+	f.ExecFunc = func(_ context.Context, ref Ref, spec ExecSpec) (int, error) {
 		gotSpec = spec
 		return 3, nil
 	}
@@ -265,7 +265,7 @@ func TestFakeExecPIDs(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	started := make(chan int)
 	release := make(chan struct{})
-	f.ExecFunc = func(ref Ref, spec ExecSpec) (int, error) {
+	f.ExecFunc = func(_ context.Context, ref Ref, spec ExecSpec) (int, error) {
 		raw, err := os.ReadFile(spec.InternalPIDFile)
 		if err != nil {
 			t.Errorf("pid file not written before ExecFunc: %v", err)
@@ -296,7 +296,7 @@ func TestFakeExecPIDs(t *testing.T) {
 	}
 
 	// A pid is released when ExecFunc returns.
-	f.ExecFunc = func(ref Ref, spec ExecSpec) (int, error) {
+	f.ExecFunc = func(_ context.Context, ref Ref, spec ExecSpec) (int, error) {
 		raw, _ := os.ReadFile(spec.InternalPIDFile)
 		pid, _ = strconv.Atoi(string(raw))
 		return 0, nil
@@ -306,5 +306,51 @@ func TestFakeExecPIDs(t *testing.T) {
 	}
 	if err := f.KillProcess(ctx, a, pid); err == nil {
 		t.Error("KillProcess of an exited exec's pid: want error")
+	}
+}
+
+func TestFakeExecCancelKeepsPID(t *testing.T) {
+	f := NewFake()
+	bg := context.Background()
+	a := Ref{ID: "a", Network: NetworkNone}
+	_ = f.Create(bg, a, "/b", "/log")
+	_ = f.Start(bg, a)
+	f.ExecFunc = func(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
+		<-ctx.Done()
+		return -1, ctx.Err()
+	}
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+	defer cancel()
+	code, err := f.Exec(ctx, a, ExecSpec{Args: []string{"sleep"}, InternalPIDFile: pidFile})
+	if code != -1 || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Exec = %d, %v; want -1, deadline exceeded", code, err)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(raw))
+	if err != nil || pid <= 0 {
+		t.Fatalf("pid file holds %q", raw)
+	}
+	if err := f.KillProcess(bg, a, pid); err != nil {
+		t.Errorf("KillProcess(%d) after a cancelled Exec = %v", pid, err)
+	}
+	if err := f.KillProcess(bg, a, pid); err == nil {
+		t.Errorf("second KillProcess(%d): want error", pid)
+	}
+
+	// Delete releases a pid left by a cancelled Exec.
+	ctx2, cancel2 := context.WithTimeout(bg, 10*time.Millisecond)
+	defer cancel2()
+	_, _ = f.Exec(ctx2, a, ExecSpec{Args: []string{"sleep"}, InternalPIDFile: pidFile})
+	raw, _ = os.ReadFile(pidFile)
+	pid2, _ := strconv.Atoi(string(raw))
+	_ = f.Delete(bg, a)
+	_ = f.Create(bg, a, "/b", "/log")
+	_ = f.Start(bg, a)
+	if err := f.KillProcess(bg, a, pid2); err == nil {
+		t.Errorf("KillProcess(%d) after Delete and re-create: want error", pid2)
 	}
 }

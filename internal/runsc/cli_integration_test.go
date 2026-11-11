@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -175,6 +177,16 @@ func TestCLILifecycle(t *testing.T) {
 		!strings.Contains(err.Error(), "/no/such/binary") || missErr.Len() != 0 {
 		t.Errorf("Exec of a missing binary = %d, %v; stderr forwarded %q", code, err, missErr.String())
 	}
+	missErr.Reset()
+	bigArg := strings.Repeat("z", 20<<10)
+	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"/no/such/binary", bigArg}, Stderr: &missErr}); err == nil ||
+		!strings.Contains(err.Error(), "/no/such/binary") || missErr.Len() != 0 {
+		t.Errorf("Exec of a missing binary with a 20 KiB argument = %d, %v; %d bytes forwarded to Stderr",
+			code, err != nil, missErr.Len())
+	}
+	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"true"}, InternalPIDFile: "/nonexistent-gss-dir/x.pid"}); err == nil || code != -1 {
+		t.Errorf("Exec with an unwritable InternalPIDFile = %d, %v; want -1 and an error", code, err)
+	}
 	if code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"sh", "-c", "exit 128"}}); err != nil || code != 128 {
 		t.Errorf("Exec exit 128 = %d, %v; want 128, nil", code, err)
 	}
@@ -301,5 +313,80 @@ func TestCLICheckpointRestore(t *testing.T) {
 	out, code := pyfork(t, ctx, c, b, "print(6*7)")
 	if code != 0 || out != "42\n" {
 		t.Errorf("pyfork in B = %q, exit %d; want \"42\\n\", 0", out, code)
+	}
+}
+
+// signalWriter closes ready the first time the output contains marker.
+type signalWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	marker string
+	ready  chan struct{}
+	done   bool
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if !w.done && strings.Contains(w.buf.String(), w.marker) {
+		w.done = true
+		close(w.ready)
+	}
+	return len(p), nil
+}
+
+func TestCLIExecSandboxDies(t *testing.T) {
+	c, state := testCLI(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	bundle := testBundle(t, c.Binary, state, "bundle")
+
+	kills := map[string]func(ref Ref) error{
+		"sigkill": func(ref Ref) error {
+			st, err := c.State(ctx, ref)
+			if err != nil {
+				return err
+			}
+			return syscall.Kill(st.PID, syscall.SIGKILL)
+		},
+		"delete": func(ref Ref) error { return c.Delete(ctx, ref) },
+	}
+	for name, kill := range kills {
+		t.Run(name, func(t *testing.T) {
+			ref := Ref{ID: fmt.Sprintf("dies-%s-%d", name, os.Getpid()), Network: NetworkNone}
+			startContainer(t, ctx, c, ref, bundle, filepath.Join(state, name+".log"))
+			errOut := &signalWriter{marker: "started", ready: make(chan struct{})}
+			type result struct {
+				code int
+				err  error
+			}
+			res := make(chan result, 1)
+			go func() {
+				code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"sh", "-c", "echo started >&2; sleep 30"}, Stderr: errOut})
+				res <- result{code, err}
+			}()
+			select {
+			case <-errOut.ready:
+			case <-time.After(30 * time.Second):
+				t.Fatal("exec did not start")
+			}
+			if err := kill(ref); err != nil {
+				t.Fatalf("kill: %v", err)
+			}
+			select {
+			case r := <-res:
+				// Delete first kills every process in the container, so
+				// runsc exec may see the process die of SIGKILL (137)
+				// before the sandbox goes: that exit was seen.
+				killedFirst := name == "delete" && r.code == 137 && r.err == nil
+				if !killedFirst && (r.code != -1 || !errors.Is(r.err, ErrNotRunning)) {
+					t.Errorf("Exec = %d, %v; want -1, ErrNotRunning", r.code, r.err)
+				}
+				t.Logf("Exec = %d, %v", r.code, r.err)
+			case <-time.After(20 * time.Second):
+				t.Fatal("Exec did not return after the sandbox died")
+			}
+		})
 	}
 }

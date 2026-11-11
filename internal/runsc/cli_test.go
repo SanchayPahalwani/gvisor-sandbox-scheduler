@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -148,7 +149,10 @@ func TestClassifyExecDiag(t *testing.T) {
 		diag   bool
 	}{
 		{`executing processes for container: cannot execute in container "a" in state stopped`, ErrNotRunning, true},
-		{`executing processes for container: executing command "true" in sandbox: connecting to control server at PID 18316: connection refused`, ErrNotRunning, true},
+		// After the quoted argv: State decides, not the text.
+		{`executing processes for container: executing command "true" in sandbox: connecting to control server at PID 18316: connection refused`, nil, true},
+		{`executing processes for container: executing command "echo in state stopped" in sandbox: failed to load echo in state stopped: no such file or directory`, nil, true},
+		{`executing processes for container: executing command "cat loading container: file does not exist" in sandbox: failed to load x`, nil, true},
 		{`executing processes for container: executing command "/no/such/binary" in sandbox: failed to load /no/such/binary: no such file or directory`, nil, true},
 		{`executing processes for container: executing command "true" in sandbox: failed to find initial working directory "/nope": no such file or directory`, nil, true},
 		{"exec [command options] <container-id> <command> [command options] || --process process.json <container-id>\n...\nparsing process spec: both a container-id and command are required", nil, true},
@@ -163,12 +167,12 @@ func TestClassifyExecDiag(t *testing.T) {
 		if !tt.diag {
 			continue
 		}
-		err := cmdError("exec", errors.New("exit status 128"), tt.stderr)
+		err := diagError(errors.New("exit status 128"), tt.stderr)
 		if tt.want != nil && !errors.Is(err, tt.want) {
-			t.Errorf("cmdError(%q) = %v, want %v", tt.stderr, err, tt.want)
+			t.Errorf("diagError(%q) = %v, want %v", tt.stderr, err, tt.want)
 		}
 		if tt.want == nil && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotRunning)) {
-			t.Errorf("cmdError(%q) = %v, want no sentinel", tt.stderr, err)
+			t.Errorf("diagError(%q) = %v, want no sentinel", tt.stderr, err)
 		}
 	}
 }
@@ -212,6 +216,8 @@ case "$sub" in
 state)
 	case "$last" in
 	ab) echo '{"id":"abc","status":"running","pid":7}';;
+	deadsb) echo 'FetchSpec failed: loading container: file does not exist' >&2; exit 128;;
+	stoppedsb) echo '{"id":"stoppedsb","status":"stopped","pid":-1}';;
 	ckpt)
 		# "running" for the first two calls after the checkpoint, then "stopped".
 		n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"
@@ -221,6 +227,7 @@ state)
 	esac
 	exit 0;;
 start)
+	if [ "$last" = slow ]; then exec sleep 30; fi
 	echo 'start went wrong' >&2; exit 1;;
 checkpoint)
 	exit 0;;
@@ -230,7 +237,18 @@ delete)
 kill)
 	exit 0;;
 esac
+mode=""
+for a in "$@"; do case $a in MODE=*) mode=${a#MODE=};; esac; done
+if [ "$mode" = bigdiag ]; then
+	# runsc quotes the whole argv in its message.
+	echo "executing processes for container: executing command \"nobin $last\" in sandbox: failed to load nobin: no such file or directory" >&2
+	exit 128
+fi
 case "$last" in
+diesmid) echo started >&2; echo 'waiting on pid 4: waiting on PID 4 in sandbox "x": urpc method "containerManager.WaitPID" failed: EOF' >&2; exit 128;;
+pidfilefail) echo hello >&2; echo 'writing internal pid file: open /x/y: no such file or directory' >&2; exit 128;;
+bgclean) sleep 3 & exit 0;;
+heldkill) printf 'FetchSpec' >&2; exec sleep 30;;
 exit3) echo out; echo err >&2; exit 3;;
 exit128) echo user-out; echo user-err >&2; exit 128;;
 quiet128) exit 128;;
@@ -360,5 +378,114 @@ func TestCheckpointWaitsForStopped(t *testing.T) {
 	st, err := c.State(ctx, ref)
 	if err != nil || st.Status != "stopped" || st.PID != -1 {
 		t.Errorf("State after Checkpoint = %+v, %v; want stopped, -1", st, err)
+	}
+}
+
+func TestExec128AsksState(t *testing.T) {
+	c := fakeRunsc(t)
+	ctx := context.Background()
+	exec1 := func(id, cmd string) (int, string, error) {
+		var errOut bytes.Buffer
+		code, err := c.Exec(ctx, Ref{ID: id, Network: NetworkNone}, ExecSpec{Args: []string{cmd}, Stderr: &errOut})
+		return code, errOut.String(), err
+	}
+	// The sandbox died during the Exec: State says gone.
+	if code, _, err := exec1("deadsb", "diesmid"); code != -1 || !errors.Is(err, ErrNotRunning) || !errors.Is(err, ErrNotFound) ||
+		!strings.Contains(err.Error(), "WaitPID") {
+		t.Errorf("died, gone: %d, %v", code, err)
+	}
+	// State says stopped, stderr is empty: still not a real exit 128.
+	if code, _, err := exec1("stoppedsb", "quiet128"); code != -1 || !errors.Is(err, ErrNotRunning) || errors.Is(err, ErrNotFound) {
+		t.Errorf("quiet, stopped: %d, %v", code, err)
+	}
+	// Still running, but runsc's last line says it failed.
+	if code, _, err := exec1("sb1", "pidfilefail"); code != -1 || err == nil || !strings.Contains(err.Error(), "writing internal pid file") {
+		t.Errorf("pid file failure: %d, %v", code, err)
+	}
+	if code, _, err := exec1("sb1", "diesmid"); code != -1 || err == nil || errors.Is(err, ErrNotRunning) {
+		t.Errorf("waiting-on-pid failure, running: %d, %v", code, err)
+	}
+	// Still running, plain exit 128.
+	if code, _, err := exec1("sb1", "quiet128"); code != 128 || err != nil {
+		t.Errorf("quiet, running: %d, %v", code, err)
+	}
+}
+
+func TestExecHoldScalesWithArgs(t *testing.T) {
+	c := fakeRunsc(t)
+	big := strings.Repeat("y", 20<<10)
+	var errOut bytes.Buffer
+	code, err := c.Exec(context.Background(), Ref{ID: "sb1", Network: NetworkNone}, ExecSpec{
+		Args: []string{"nobin", big}, Env: []string{"MODE=bigdiag"}, Stderr: &errOut,
+	})
+	if code != -1 || err == nil || !strings.Contains(err.Error(), "failed to load nobin") {
+		t.Errorf("Exec = %d, %v", code, err)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("%d bytes of runsc's diagnostic forwarded to Stderr", errOut.Len())
+	}
+}
+
+func TestExecCancelFlushesHeld(t *testing.T) {
+	c := fakeRunsc(t)
+	// Long enough for the script to have written before the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var errOut bytes.Buffer
+	code, err := c.Exec(ctx, Ref{ID: "sb1", Network: NetworkNone}, ExecSpec{Args: []string{"heldkill"}, Stderr: &errOut})
+	if code != -1 || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Exec = %d, %v", code, err)
+	}
+	if errOut.String() != "FetchSpec" {
+		t.Errorf("held stderr not flushed: %q (err %v)", errOut.String(), err)
+	}
+}
+
+func TestExecCleanExitRacingCancel(t *testing.T) {
+	c := fakeRunsc(t)
+	// The process exits 0 at once; a child holds stdout past the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var out bytes.Buffer
+	code, err := c.Exec(ctx, Ref{ID: "sb1", Network: NetworkNone}, ExecSpec{Args: []string{"bgclean"}, Stdout: &out})
+	if code != 0 || err != nil {
+		t.Errorf("Exec = %d, %v; want 0, nil", code, err)
+	}
+}
+
+func TestRunWrapsContext(t *testing.T) {
+	c := fakeRunsc(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Start(ctx, Ref{ID: "slow", Network: NetworkNone})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Start = %v, want deadline exceeded", err)
+	}
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	if _, err := c.State(cctx, Ref{ID: "sb1", Network: NetworkNone}); !errors.Is(err, context.Canceled) {
+		t.Errorf("State with cancelled ctx = %v, want context.Canceled", err)
+	}
+}
+
+type sliceWriter []byte
+
+func (sliceWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type wrapWriter struct{ io.Writer }
+
+func TestSameWriterUncomparable(t *testing.T) {
+	a, b := wrapWriter{sliceWriter{}}, wrapWriter{sliceWriter{}}
+	if sameWriter(a, b) {
+		t.Error("uncomparable writers reported as the same")
+	}
+	var buf bytes.Buffer
+	if !sameWriter(&buf, &buf) || sameWriter(&buf, &bytes.Buffer{}) {
+		t.Error("pointer comparison wrong")
+	}
+	c := fakeRunsc(t)
+	if code, err := c.Exec(context.Background(), Ref{ID: "sb1", Network: NetworkNone},
+		ExecSpec{Args: []string{"exit3"}, Stdout: a, Stderr: b}); code != 3 || err != nil {
+		t.Errorf("Exec with uncomparable writers = %d, %v", code, err)
 	}
 }
