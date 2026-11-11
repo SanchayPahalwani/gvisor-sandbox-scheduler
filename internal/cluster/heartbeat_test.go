@@ -217,23 +217,72 @@ func TestTombstoneExpiry(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRestoresLost(t *testing.T) {
+func TestHeartbeatLostIsDestroyedNotRestored(t *testing.T) {
 	s, c := newState()
 	s.Register(nodeInfo("n1", "a", 4000))
 	place(t, s, "sb-1", "n1", spec())
 	c.advance(3100 * time.Millisecond)
-	s.Tick() // n1 dead, sb-1 LOST, not yet rescheduled
+	if r := s.Tick(); !reflect.DeepEqual(r.Lost, []string{"sb-1"}) {
+		t.Fatalf("Lost = %v", r.Lost)
+	}
 	r := s.Heartbeat(report("n1", reported("sb-1", 1)))
-	if len(r.Destroy) != 0 {
+	if !reflect.DeepEqual(r.Destroy, []string{"sb-1"}) {
 		t.Fatalf("Destroy = %v", r.Destroy)
 	}
-	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_READY || sb.Incarnation != 1 {
+	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_LOST || sb.Incarnation != 1 {
 		t.Fatalf("sandbox: %v", sb)
 	}
-	if n := node(t, s, "n1"); n.Allocated.CpuMillis != 500 || n.Sandboxes != 1 {
+	if n := node(t, s, "n1"); n.Allocated.CpuMillis != 0 || n.Allocated.MemoryBytes != 0 || n.Sandboxes != 0 {
 		t.Fatalf("node: %v", n)
 	}
-	if got := s.NeedsPlacement(); len(got) != 0 {
+	if got := s.NeedsPlacement(); !reflect.DeepEqual(got, []string{"sb-1"}) {
 		t.Fatalf("NeedsPlacement = %v", got)
+	}
+}
+
+func TestStartingLostThenReported(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Add("sb-1", spec())
+	inc, _, err := s.Reserve("sb-1", "n1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.advance(3100 * time.Millisecond)
+	if r := s.Tick(); !reflect.DeepEqual(r.Lost, []string{"sb-1"}) {
+		t.Fatalf("Lost = %v", r.Lost)
+	}
+	r := s.Heartbeat(report("n1", reported("sb-1", inc)))
+	if !reflect.DeepEqual(r.Destroy, []string{"sb-1"}) {
+		t.Fatalf("Destroy = %v", r.Destroy)
+	}
+	if s.Commit("sb-1", inc, gssv1.StartMode_START_MODE_COLD, time.Second) {
+		t.Fatal("Commit after LOST returned true")
+	}
+	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_LOST {
+		t.Fatalf("state %v", sb.State)
+	}
+	if n := node(t, s, "n1"); n.Allocated.CpuMillis != 0 || n.Sandboxes != 0 {
+		t.Fatalf("node: %v", n)
+	}
+}
+
+func TestWarmCountOverwrittenByHeartbeat(t *testing.T) {
+	s, _ := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Heartbeat(&gssv1.HeartbeatRequest{NodeId: "n1", WarmReady: 2})
+	s.Add("sb-1", spec())
+	inc, _, err := s.Reserve("sb-1", "n1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Commit("sb-1", inc, gssv1.StartMode_START_MODE_WARM, time.Millisecond)
+	if w := node(t, s, "n1").WarmReady; w != 1 {
+		t.Fatalf("after warm commit: %d", w)
+	}
+	s.Heartbeat(&gssv1.HeartbeatRequest{NodeId: "n1", WarmReady: 2,
+		Sandboxes: []*gssv1.NodeSandbox{reported("sb-1", inc)}})
+	if w := node(t, s, "n1").WarmReady; w != 2 {
+		t.Fatalf("after heartbeat: %d", w)
 	}
 }

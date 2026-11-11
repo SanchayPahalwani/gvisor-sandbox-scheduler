@@ -396,15 +396,21 @@ func (s *State) Unreserve(id string, incarnation int32, msg string) {
 	s.notify()
 }
 
-// Fail moves a live sandbox to FAILED with msg.
-func (s *State) Fail(id, msg string) {
+// Fail moves a PENDING or LOST sandbox to FAILED with msg and tombstones it.
+// In any other state, or for an unknown ID, it changes nothing and returns
+// false, so a stale caller cannot fail a sandbox that was placed meanwhile.
+func (s *State) Fail(id, msg string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.sandboxes[id]
-	if e == nil || !live(e.sb.State) {
-		return
+	if e == nil {
+		return false
+	}
+	if st := e.sb.State; st != gssv1.SandboxState_SANDBOX_STATE_PENDING && st != gssv1.SandboxState_SANDBOX_STATE_LOST {
+		return false
 	}
 	s.finish(e, gssv1.SandboxState_SANDBOX_STATE_FAILED, msg)
+	return true
 }
 
 // Destroy moves a sandbox to DESTROYED and tombstones it. nodeID is where it

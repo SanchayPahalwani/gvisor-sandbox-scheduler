@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"math"
+	"math/rand"
 	"reflect"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -548,5 +551,232 @@ func TestNilSpecIsZeroResources(t *testing.T) {
 	s.Destroy("sb-1")
 	if n := node(t, s, "n1"); n.Allocated.CpuMillis != 0 {
 		t.Fatalf("node: %v", n)
+	}
+}
+
+func TestFailOnlyFromPendingOrLost(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Register(nodeInfo("n2", "a", 4000))
+
+	s.Add("pending", spec())
+	if !s.Fail("pending", "no fit") {
+		t.Fatal("PENDING: Fail false")
+	}
+	if sb := get(t, s, "pending"); sb.State != gssv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("PENDING: state %v", sb.State)
+	}
+
+	s.Add("starting", spec())
+	if _, _, err := s.Reserve("starting", "n2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if s.Fail("starting", "stale") {
+		t.Fatal("STARTING: Fail true")
+	}
+	if sb := get(t, s, "starting"); sb.State != gssv1.SandboxState_SANDBOX_STATE_STARTING {
+		t.Fatalf("STARTING: state %v", sb.State)
+	}
+	if n := node(t, s, "n2"); n.Allocated.CpuMillis != 500 || n.Sandboxes != 1 {
+		t.Fatalf("STARTING: allocation changed: %v", n)
+	}
+
+	place(t, s, "ready", "n2", spec())
+	if s.Fail("ready", "stale") {
+		t.Fatal("READY: Fail true")
+	}
+	if sb := get(t, s, "ready"); sb.State != gssv1.SandboxState_SANDBOX_STATE_READY {
+		t.Fatalf("READY: state %v", sb.State)
+	}
+
+	place(t, s, "lost", "n1", spec())
+	c.advance(3100 * time.Millisecond)
+	s.Heartbeat(report("n2", reported("starting", 1), reported("ready", 1)))
+	s.Tick()
+	if !s.Fail("lost", "no fit") {
+		t.Fatal("LOST: Fail false")
+	}
+	if sb := get(t, s, "lost"); sb.State != gssv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("LOST: state %v", sb.State)
+	}
+	if s.Fail("unknown", "x") || s.Fail("lost", "again") {
+		t.Fatal("unknown or FAILED: Fail true")
+	}
+}
+
+func TestNodeTimeoutStarting(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Add("sb-1", spec())
+	if _, _, err := s.Reserve("sb-1", "n1", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(3100 * time.Millisecond)
+	if r := s.Tick(); !reflect.DeepEqual(r.Lost, []string{"sb-1"}) {
+		t.Fatalf("Lost = %v", r.Lost)
+	}
+	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_LOST {
+		t.Fatalf("state %v", sb.State)
+	}
+	if n := node(t, s, "n1"); n.Allocated.CpuMillis != 0 || n.Allocated.MemoryBytes != 0 || n.Sandboxes != 0 {
+		t.Fatalf("node: %v", n)
+	}
+}
+
+func TestTTLExpiryAllStates(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Register(nodeInfo("n2", "a", 4000))
+	s.Add("pending", specTTL(time.Minute))
+	s.Add("starting", specTTL(time.Minute))
+	startInc, _, err := s.Reserve("starting", "n2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	place(t, s, "lost", "n1", specTTL(time.Minute))
+	c.advance(3100 * time.Millisecond)
+	s.Heartbeat(report("n2"))
+	if r := s.Tick(); !reflect.DeepEqual(r.Lost, []string{"lost"}) {
+		t.Fatalf("Lost = %v", r.Lost)
+	}
+	c.advance(time.Minute)
+	s.Heartbeat(report("n2"))
+	r := s.Tick()
+	want := []Expired{{ID: "lost", NodeID: "n1"}, {ID: "pending"}, {ID: "starting", NodeID: "n2"}}
+	if !reflect.DeepEqual(r.Expired, want) {
+		t.Fatalf("Expired = %+v", r.Expired)
+	}
+	for _, id := range []string{"pending", "starting", "lost"} {
+		if sb := get(t, s, id); sb.State != gssv1.SandboxState_SANDBOX_STATE_DESTROYED || sb.Message != "ttl expired" {
+			t.Fatalf("%s: %v", id, sb)
+		}
+	}
+	if s.Commit("starting", startInc, gssv1.StartMode_START_MODE_COLD, time.Second) {
+		t.Fatal("Commit after expiry returned true")
+	}
+	s.Tick()
+	for _, id := range []string{"n1", "n2"} {
+		if n := node(t, s, id); n.Allocated.CpuMillis != 0 || n.Allocated.MemoryBytes != 0 || n.Sandboxes != 0 {
+			t.Fatalf("%s: %v", id, n)
+		}
+	}
+	// Released exactly once: a sandbox placed afterwards is counted in full.
+	place(t, s, "after", "n2", spec())
+	if n := node(t, s, "n2"); n.Allocated.CpuMillis != 500 || n.Sandboxes != 1 {
+		t.Fatalf("n2 after new placement: %v", n)
+	}
+}
+
+// lockedClock is a fake clock safe for concurrent use.
+type lockedClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *lockedClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *lockedClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// checkAllocation asserts that each node's allocation equals the sum over
+// its STARTING and READY sandboxes.
+func checkAllocation(t *testing.T, s *State) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	type sum struct {
+		cpu, mem int64
+		count    int
+	}
+	want := map[string]sum{}
+	for _, e := range s.sandboxes {
+		st := e.sb.State
+		if st == gssv1.SandboxState_SANDBOX_STATE_STARTING || st == gssv1.SandboxState_SANDBOX_STATE_READY {
+			r := resourcesOf(e.sb.Spec)
+			w := want[e.sb.NodeId]
+			w.cpu += r.CPUMillis
+			w.mem += r.MemoryBytes
+			w.count++
+			want[e.sb.NodeId] = w
+		}
+	}
+	for id, n := range s.nodes {
+		w := want[id]
+		if n.allocated.CPUMillis != w.cpu || n.allocated.MemoryBytes != w.mem || n.count != w.count {
+			t.Fatalf("node %s: allocated %+v count %d, sandboxes sum %+v", id, n.allocated, n.count, w)
+		}
+	}
+}
+
+func TestConcurrentInvariant(t *testing.T) {
+	c := &lockedClock{t: time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)}
+	s := New(DefaultConfig(), c.now)
+	nodes := []string{"n1", "n2"}
+	for _, id := range nodes {
+		s.Register(nodeInfo(id, "a", 4000))
+	}
+	const workers, ops = 8, 500
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w)))
+			id := func() string { return "sb-" + strconv.Itoa(rng.Intn(40)) }
+			for i := 0; i < ops; i++ {
+				nodeID := nodes[rng.Intn(len(nodes))]
+				switch rng.Intn(8) {
+				case 0:
+					s.Add(id(), spec())
+				case 1, 2:
+					sbID := id()
+					inc, _, err := s.Reserve(sbID, nodeID, nil)
+					if err != nil {
+						continue
+					}
+					switch rng.Intn(3) {
+					case 0:
+						s.Unreserve(sbID, inc, "refused")
+					default:
+						s.Commit(sbID, inc, gssv1.StartMode_START_MODE_WARM, time.Millisecond)
+					}
+				case 3:
+					s.Destroy(id())
+				case 4:
+					var rep []*gssv1.NodeSandbox
+					for _, sb := range s.List() {
+						if sb.NodeId == nodeID && rng.Intn(2) == 0 {
+							rep = append(rep, &gssv1.NodeSandbox{Id: sb.Id, Spec: sb.Spec, Incarnation: sb.Incarnation})
+						}
+					}
+					rep = append(rep, &gssv1.NodeSandbox{Id: "adopt-" + strconv.Itoa(rng.Intn(10)), Spec: spec(), Incarnation: 1})
+					s.Heartbeat(&gssv1.HeartbeatRequest{NodeId: nodeID, Sandboxes: rep, WarmReady: 1})
+				case 5:
+					s.Tick()
+				case 6:
+					s.Fail(id(), "gave up")
+				case 7:
+					c.advance(time.Duration(rng.Intn(500)) * time.Millisecond)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	checkAllocation(t, s)
+	for _, sb := range s.List() {
+		s.Destroy(sb.Id)
+	}
+	checkAllocation(t, s)
+	for _, n := range s.Nodes() {
+		if n.Allocated.CpuMillis != 0 || n.Allocated.MemoryBytes != 0 || n.Sandboxes != 0 {
+			t.Fatalf("after destroying all: %v", n)
+		}
 	}
 }

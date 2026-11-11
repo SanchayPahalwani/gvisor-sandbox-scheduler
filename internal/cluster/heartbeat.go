@@ -51,7 +51,7 @@ func (s *State) Heartbeat(req *gssv1.HeartbeatRequest) HeartbeatResult {
 			s.adopt(ns, nodeID, n, now)
 			continue
 		}
-		if !s.reportedHere(e, nodeID, ns.GetIncarnation(), n) {
+		if !s.reportedHere(e, nodeID, ns.GetIncarnation()) {
 			r.Destroy = append(r.Destroy, id)
 		}
 	}
@@ -92,24 +92,20 @@ func (s *State) adopt(ns *gssv1.NodeSandbox, nodeID string, n *nodeEntry, now ti
 	s.notify()
 }
 
-// reportedHere handles a report of a known sandbox. It returns false when
-// the node must destroy its copy: the state has the sandbox on another node,
-// at another incarnation, or not live. A LOST sandbox reported by the node it
-// was lost on, at the same incarnation, is READY there again. Call with s.mu
-// held.
-func (s *State) reportedHere(e *sandboxEntry, nodeID string, incarnation int32, n *nodeEntry) bool {
+// reportedHere handles a report of a known sandbox. It returns true, and
+// resets the miss counter, only when the state has the sandbox STARTING or
+// READY on this node at the reported incarnation. Otherwise the node must
+// destroy its copy: the sandbox is on another node, at another incarnation,
+// or LOST, PENDING, FAILED or DESTROYED. A LOST sandbox is never restored
+// here; it is rescheduled as a fresh incarnation (spec D19, D23), and
+// destroying the old copy frees the node for it. Call with s.mu held.
+func (s *State) reportedHere(e *sandboxEntry, nodeID string, incarnation int32) bool {
 	if e.sb.NodeId != nodeID || e.sb.Incarnation != incarnation {
 		return false
 	}
 	switch e.sb.State {
 	case gssv1.SandboxState_SANDBOX_STATE_READY, gssv1.SandboxState_SANDBOX_STATE_STARTING:
 		e.misses = 0
-		return true
-	case gssv1.SandboxState_SANDBOX_STATE_LOST:
-		s.allocate(e, nodeID, n)
-		e.sb.State = gssv1.SandboxState_SANDBOX_STATE_READY
-		e.misses = 0
-		s.notify()
 		return true
 	}
 	return false
