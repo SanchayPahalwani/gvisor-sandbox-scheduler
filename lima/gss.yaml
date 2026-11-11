@@ -1,0 +1,71 @@
+# Lima VM for this repo: one arm64 Ubuntu guest that hosts every "node".
+# Start it with `make vm` (see the Makefile); that passes the repo path as a
+# writable mount. Nothing here needs nested virtualization: gVisor's systrap
+# platform runs without KVM.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 6GiB
+disk: 20GiB
+mountType: virtiofs
+
+# Rootless containerd + nerdctl (shipped by Lima) builds the Python rootfs
+# image and runs the Grafana container. It does not touch system nftables.
+containerd:
+  system: false
+  user: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    if [ ! -e /usr/local/bin/runsc ] || [ ! -e /usr/local/go/bin/go ]; then
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl wget zstd make git jq nftables iproute2 python3
+    fi
+
+    # Go toolchain from go.dev (official tarball), pinned.
+    GO_VERSION=1.27.4
+    if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
+      curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" -o /tmp/go.tgz
+      rm -rf /usr/local/go
+      tar -C /usr/local -xzf /tmp/go.tgz
+      rm -f /tmp/go.tgz
+    fi
+    cat > /etc/profile.d/gss-go.sh <<'PROFILE'
+    export PATH=$PATH:/usr/local/go/bin
+    PROFILE
+    sed -i 's/^    //' /etc/profile.d/gss-go.sh
+
+    # gVisor from its official release bucket, checksum verified.
+    # GVISOR_RELEASE is a dated release (pinned so results are reproducible) or "latest".
+    GVISOR_RELEASE=20261102
+    if [ ! -e /usr/local/bin/runsc ]; then
+      ARCH=$(uname -m)
+      URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/${ARCH}"
+      cd /tmp
+      wget -q "${URL}/gvisor.tar.zstd" "${URL}/gvisor.tar.zstd.sha512"
+      sha512sum -c gvisor.tar.zstd.sha512
+      tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+      rm -f gvisor.tar.zstd gvisor.tar.zstd.sha512
+    fi
+    /usr/local/bin/runsc --version
+
+probes:
+- description: "runsc and go are installed"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 300s bash -c "until test -x /usr/local/bin/runsc && test -x /usr/local/go/bin/go; do sleep 3; done"; then
+      echo >&2 "runsc or go is not installed yet"
+      exit 1
+    fi
+  hint: "See /var/log/cloud-init-output.log in the guest"
