@@ -6,8 +6,10 @@ package bundle
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -95,9 +97,57 @@ func Spec(o Options) *specs.Spec {
 	}
 }
 
-// Write creates o.Dir (mode 0700) and writes config.json and hosts into it.
+var (
+	idRE       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
+	hostnameRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+)
+
+func validName(s string) bool { return idRE.MatchString(s) && s != "." && s != ".." }
+
+// Validate rejects options that would fail open (no limits), put the cgroup
+// outside /gss/<node>, or write a malformed hosts file.
+func (o Options) Validate() error {
+	if o.CPUMillis <= 0 {
+		return fmt.Errorf("bundle: CPUMillis must be positive, got %d", o.CPUMillis)
+	}
+	if o.MemoryBytes <= 0 {
+		return fmt.Errorf("bundle: MemoryBytes must be positive, got %d", o.MemoryBytes)
+	}
+	if !validName(o.ID) {
+		return fmt.Errorf("bundle: ID %q is not a valid name", o.ID)
+	}
+	if !validName(o.NodeID) {
+		return fmt.Errorf("bundle: NodeID %q is not a valid name", o.NodeID)
+	}
+	if !filepath.IsAbs(o.Dir) {
+		return fmt.Errorf("bundle: Dir %q must be an absolute path", o.Dir)
+	}
+	if !filepath.IsAbs(o.RootFS) {
+		return fmt.Errorf("bundle: RootFS %q must be an absolute path", o.RootFS)
+	}
+	if o.NetNSPath != "" && !filepath.IsAbs(o.NetNSPath) {
+		return fmt.Errorf("bundle: NetNSPath %q must be empty or an absolute path", o.NetNSPath)
+	}
+	for _, h := range o.Hosts {
+		if _, err := netip.ParseAddr(h.IP); err != nil {
+			return fmt.Errorf("bundle: Hosts entry IP %q: %w", h.IP, err)
+		}
+		if len(h.Name) > 253 || !hostnameRE.MatchString(h.Name) {
+			return fmt.Errorf("bundle: Hosts entry Name %q is not a valid hostname", h.Name)
+		}
+	}
+	return nil
+}
+
+// Write validates o, creates o.Dir (mode 0700) and writes config.json and hosts into it.
 func Write(o Options) error {
+	if err := o.Validate(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
+		return fmt.Errorf("bundle: %w", err)
+	}
+	if err := os.Chmod(o.Dir, 0o700); err != nil {
 		return fmt.Errorf("bundle: %w", err)
 	}
 	var hosts strings.Builder

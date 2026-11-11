@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -124,5 +125,72 @@ func TestWrite(t *testing.T) {
 func TestCgroupPath(t *testing.T) {
 	if got := CgroupPath("n1", "sb1"); got != "/gss/n1/sb1" {
 		t.Errorf("CgroupPath = %q", got)
+	}
+}
+
+func TestWriteValidates(t *testing.T) {
+	long := strings.Repeat("a", 64)
+	for _, c := range []struct {
+		field  string
+		mutate func(*Options)
+	}{
+		{"CPUMillis", func(o *Options) { o.CPUMillis = 0 }},
+		{"CPUMillis", func(o *Options) { o.CPUMillis = -5 }},
+		{"MemoryBytes", func(o *Options) { o.MemoryBytes = 0 }},
+		{"MemoryBytes", func(o *Options) { o.MemoryBytes = -1 }},
+		{"ID", func(o *Options) { o.ID = "" }},
+		{"ID", func(o *Options) { o.ID = "a/b" }},
+		{"ID", func(o *Options) { o.ID = ".." }},
+		{"ID", func(o *Options) { o.ID = "." }},
+		{"ID", func(o *Options) { o.ID = long }},
+		{"NodeID", func(o *Options) { o.NodeID = "../x" }},
+		{"NodeID", func(o *Options) { o.NodeID = "" }},
+		{"NodeID", func(o *Options) { o.NodeID = ".." }},
+		{"Dir", func(o *Options) { o.Dir = "relative/dir" }},
+		{"RootFS", func(o *Options) { o.RootFS = "rootfs" }},
+		{"NetNSPath", func(o *Options) { o.NetNSPath = "netns/x" }},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "not-an-ip", Name: "a.example"}} }},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: "a b"}} }},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: "a\nb"}} }},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: ""}} }},
+		{"Hosts", func(o *Options) { o.Hosts = []HostEntry{{IP: "10.0.0.1", Name: strings.Repeat("a", 254)}} }},
+	} {
+		o := goldenOptions()
+		o.Dir = filepath.Join(t.TempDir(), "sb")
+		c.mutate(&o)
+		err := Write(o)
+		if err == nil || !strings.Contains(err.Error(), c.field) {
+			t.Errorf("%s: err = %v, want an error naming the field", c.field, err)
+		}
+		if o.Dir != "" && filepath.IsAbs(o.Dir) {
+			if _, statErr := os.Stat(o.Dir); statErr == nil {
+				t.Errorf("%s: directory was created", c.field)
+			}
+		}
+	}
+	o := goldenOptions()
+	o.Dir = filepath.Join(t.TempDir(), "sb")
+	o.NetNSPath = "/var/run/netns/x"
+	o.Hosts = []HostEntry{{IP: "::1", Name: "api-1.example"}}
+	if err := Write(o); err != nil {
+		t.Errorf("valid options rejected: %v", err)
+	}
+}
+
+func TestWriteTightensExistingDir(t *testing.T) {
+	o := goldenOptions()
+	o.Dir = filepath.Join(t.TempDir(), "sb")
+	if err := os.Mkdir(o.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(o.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(o); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := os.Stat(o.Dir)
+	if st.Mode().Perm() != 0o700 {
+		t.Errorf("dir mode = %v, want 0700", st.Mode().Perm())
 	}
 }

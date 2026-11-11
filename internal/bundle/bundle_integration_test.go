@@ -5,7 +5,9 @@ package bundle_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,30 +20,45 @@ import (
 )
 
 const probe = `
-import os, socket
+import errno, os, socket
 
-def raises(f):
+def err(f):
     try:
         f()
-    except OSError:
-        return True
-    return False
+    except OSError as e:
+        return e.errno
+    return 0
 
-def write(path, mode="w"):
+def write(path, mode="w", n=1):
     with open(path, mode) as f:
-        f.write("x")
+        f.write("x" * n)
+
+def status(key):
+    for line in open("/proc/self/status"):
+        if line.startswith(key + ":"):
+            return line.split()[1]
+
+def conn():
+    s = socket.socket()
+    s.settimeout(2)
+    s.connect(("1.1.1.1", 53))
 
 print("uid1000", os.getuid() == 1000)
 print("cwd", os.getcwd() == "/work")
 write("/work/a"); write("/tmp/b")
 print("tmpfs-writes", True)
-print("usr-ro", raises(lambda: write("/usr/x")))
-print("hosts-ro", raises(lambda: write("/etc/hosts", "a")))
-def conn():
-    s = socket.socket()
-    s.settimeout(2)
-    s.connect(("1.1.1.1", 53))
-print("no-net", raises(conn))
+print("var-tmp-erofs", err(lambda: write("/var/tmp/x")) == errno.EROFS)
+print("home-erofs", err(lambda: write("/home/sandbox/x")) == errno.EROFS)
+print("usr-fails", err(lambda: write("/usr/x")) != 0)
+print("hosts-fails", err(lambda: write("/etc/hosts", "a")) != 0)
+mi = [l.split() for l in open("/proc/self/mountinfo") if l.split()[4] == "/etc/hosts"]
+print("hosts-mount-ro", len(mi) == 1 and "ro" in mi[0][5].split(","))
+print("hosts-content", open("/etc/hosts").read() == "127.0.0.1 localhost\n10.1.2.3 api.example\n")
+print("dev-fails", err(lambda: write("/dev/x")) != 0)
+print("caps-zero", all(int(status(k), 16) == 0 for k in ("CapEff", "CapPrm", "CapBnd")))
+print("nonewprivs", status("NoNewPrivs") == "1")
+print("work-enospc", err(lambda: write("/work/big", "w", 65 << 20)) == errno.ENOSPC)
+print("no-net-unreachable", err(conn) == errno.ENETUNREACH)
 `
 
 func TestBundleInSandbox(t *testing.T) {
@@ -69,13 +86,17 @@ func TestBundleInSandbox(t *testing.T) {
 	cg := filepath.Join("/sys/fs/cgroup", bundle.CgroupPath(node, id))
 	t.Cleanup(func() {
 		// The container is deleted first (registered below, runs before this).
-		os.Remove(cg)
-		os.Remove(filepath.Dir(cg))
+		for _, d := range []string{cg, filepath.Dir(cg)} {
+			if err := os.Remove(d); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("cleanup cgroup %s: %v", d, err)
+			}
+		}
 	})
 
 	o := bundle.Options{
 		ID: id, Dir: filepath.Join(state, "bundles", id), RootFS: rootfs, NodeID: node,
 		CPUMillis: 500, MemoryBytes: 256 << 20, Prime: "json",
+		Hosts: []bundle.HostEntry{{IP: "10.1.2.3", Name: "api.example"}},
 	}
 	if err := bundle.Write(o); err != nil {
 		t.Fatal(err)
@@ -105,7 +126,8 @@ func TestBundleInSandbox(t *testing.T) {
 	if err != nil || exit != 0 {
 		t.Fatalf("pyfork exit %d, err %v, stdout %q, stderr %q", exit, err, stdout.String(), stderr.String())
 	}
-	want := "uid1000 True\ncwd True\ntmpfs-writes True\nusr-ro True\nhosts-ro True\nno-net True\n"
+	want := "uid1000 True\ncwd True\ntmpfs-writes True\nvar-tmp-erofs True\nhome-erofs True\nusr-fails True\nhosts-fails True\n" +
+		"hosts-mount-ro True\nhosts-content True\ndev-fails True\ncaps-zero True\nnonewprivs True\nwork-enospc True\nno-net-unreachable True\n"
 	if stdout.String() != want {
 		t.Errorf("probe output:\n%s\nwant:\n%s\nstderr: %s", stdout.String(), want, stderr.String())
 	}
