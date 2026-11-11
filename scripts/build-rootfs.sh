@@ -34,7 +34,8 @@ cleanup() {
 trap cleanup EXIT
 
 cp images/python/Dockerfile images/python/zygote.py bin/pyfork "$ctx/"
-id=$(cd "$ctx" && cat Dockerfile zygote.py pyfork | sha256sum | cut -d' ' -f1)
+# This script is hashed too: it shapes the tree (see the fixups below).
+id=$(cat "$ctx/Dockerfile" "$ctx/zygote.py" "$ctx/pyfork" scripts/build-rootfs.sh | sha256sum | cut -d' ' -f1)
 
 if [[ "${FORCE:-0}" != 1 ]] && sudo test -d "$dest" && [[ "$(sudo cat "$idfile" 2>/dev/null || true)" == "$id" ]]; then
 	echo "rootfs $dest is up to date ($id)"
@@ -51,6 +52,17 @@ new=$(sudo mktemp -d "$root/.python.new.XXXXXX")
 container=$("$CLI" create "$image")
 "$CLI" export "$container" | sudo tar -x -C "$new"
 sudo chmod 0755 "$new"
+
+# Mount points the sandboxes need must exist in the shared tree, so that starting
+# a sandbox never has to create them (gVisor would create a missing bind-mount
+# target inside the rootfs). The export leaves /etc/hosts as an empty placeholder.
+sudo rm -rf "$new/etc/hosts"
+printf '127.0.0.1 localhost\n' | sudo tee "$new/etc/hosts" >/dev/null
+sudo chown root:root "$new/etc/hosts"
+sudo chmod 0644 "$new/etc/hosts"
+sudo mkdir -p "$new/work"
+sudo chown root:root "$new/work"
+sudo chmod 0755 "$new/work"
 
 # Swap in the new tree: rename the old one aside, rename the new one into place.
 # mv -T never moves a directory into an existing one.
