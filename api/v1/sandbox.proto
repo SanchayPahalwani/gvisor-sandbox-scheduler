@@ -1,0 +1,86 @@
+syntax = "proto3";
+package gss.v1;
+option go_package = "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1;gssv1";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// SandboxService is the public API served by the scheduler.
+service SandboxService {
+  rpc CreateSandbox(CreateSandboxRequest) returns (Sandbox);
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc DestroySandbox(DestroySandboxRequest) returns (DestroySandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (Sandbox);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+// NodeService is served by each node agent and called by the scheduler.
+service NodeService {
+  rpc CreateSandbox(NodeCreateRequest) returns (NodeCreateResponse);
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc DestroySandbox(DestroySandboxRequest) returns (DestroySandboxResponse);
+}
+// ClusterService is served by the scheduler and called by node agents.
+service ClusterService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message Resources { int64 cpu_millis = 1; int64 memory_bytes = 2; }
+enum StartMode { START_MODE_AUTO = 0; START_MODE_COLD = 1; START_MODE_RESTORE = 2; START_MODE_WARM = 3; }
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0; SANDBOX_STATE_PENDING = 1; SANDBOX_STATE_STARTING = 2;
+  SANDBOX_STATE_READY = 3; SANDBOX_STATE_LOST = 4; SANDBOX_STATE_FAILED = 5; SANDBOX_STATE_DESTROYED = 6;
+}
+enum NodeState { NODE_STATE_UNSPECIFIED = 0; NODE_STATE_READY = 1; NODE_STATE_DEAD = 2; }
+
+// SandboxSpec is what the caller asks for. Zero values are replaced by ApplyDefaults.
+message SandboxSpec {
+  Resources resources = 1;
+  // Entries are host:port, ip:port or cidr:port.
+  repeated string egress_allow = 2;
+  string node_group = 3;
+  string affinity_key = 4;
+  google.protobuf.Duration ttl = 5;
+  StartMode start_mode = 6;
+}
+message NodeScore { string node_id = 1; double total = 2; map<string, double> plugins = 3; }
+message Placement { int32 nodes_total = 1; int32 nodes_feasible = 2; repeated NodeScore top = 3; }
+message Sandbox {
+  string id = 1; SandboxSpec spec = 2; SandboxState state = 3;
+  string node_id = 4; string node_group = 5; StartMode started_as = 6;
+  int32 incarnation = 7; google.protobuf.Duration start_latency = 8;
+  string message = 9; Placement placement = 10;
+  google.protobuf.Timestamp created_at = 11; google.protobuf.Timestamp expires_at = 12;
+}
+message CreateSandboxRequest { SandboxSpec spec = 1; }
+message DestroySandboxRequest { string sandbox_id = 1; }
+message DestroySandboxResponse {}
+message GetSandboxRequest { string sandbox_id = 1; }
+message ListSandboxesRequest {}
+message ListSandboxesResponse { repeated Sandbox sandboxes = 1; }
+message ListNodesRequest {}
+message ListNodesResponse { repeated Node nodes = 1; }
+
+message Argv { repeated string args = 1; }
+message ExecRequest {
+  string sandbox_id = 1;
+  oneof command { Argv argv = 2; string python_code = 3; }
+  map<string, string> env = 4;
+  bytes stdin = 5;
+  google.protobuf.Duration timeout = 6;
+}
+message ExitStatus { int32 code = 1; bool timed_out = 2; bool oom_killed = 3; }
+message ExecEvent { oneof event { bytes stdout = 1; bytes stderr = 2; ExitStatus exit = 3; } }
+
+message NodeInfo { string id = 1; string group = 2; string address = 3; Resources capacity = 4; int32 max_sandboxes = 5; }
+message Node {
+  NodeInfo info = 1; NodeState state = 2; Resources allocated = 3; int32 sandboxes = 4;
+  int32 warm_ready = 5; double health = 6; google.protobuf.Timestamp last_heartbeat = 7;
+}
+message NodeCreateRequest { string sandbox_id = 1; SandboxSpec spec = 2; int32 incarnation = 3; }
+message NodeCreateResponse { StartMode started_as = 1; google.protobuf.Duration ready_latency = 2; }
+message NodeSandbox { string id = 1; SandboxSpec spec = 2; int32 incarnation = 3; StartMode started_as = 4; }
+message RegisterRequest { NodeInfo node = 1; }
+message RegisterResponse { google.protobuf.Duration heartbeat_interval = 1; }
+message HeartbeatRequest { string node_id = 1; repeated NodeSandbox sandboxes = 2; int32 warm_ready = 3; }
+message HeartbeatResponse { repeated string destroy_sandbox_ids = 1; }
