@@ -51,6 +51,15 @@ func TestLowerBound(t *testing.T) {
 	if got := LowerBound(nodes, 0, 0); got != 0 {
 		t.Fatalf("zero demand -> %d", got)
 	}
+	mixed := []*sched.NodeInfo{
+		{Capacity: sched.Resources{CPUMillis: 10000, MemoryBytes: 1 * gib}},
+		{Capacity: sched.Resources{CPUMillis: 1000, MemoryBytes: 10 * gib}},
+		{Capacity: sched.Resources{CPUMillis: 5000, MemoryBytes: 5 * gib}},
+		{Capacity: sched.Resources{CPUMillis: 5000, MemoryBytes: 5 * gib}},
+	}
+	if got := LowerBound(mixed, 10000, 10*gib); got > 2 {
+		t.Fatalf("mixed orderings -> %d, want <= 2", got)
+	}
 	if got := LowerBound(nodes, 1000, 130*gib); got != 2 {
 		t.Fatalf("memory-bound -> %d, want 2", got)
 	}
@@ -65,20 +74,66 @@ func smallConfig() Config {
 
 func TestRunDeterministic(t *testing.T) {
 	cfg := smallConfig()
-	a := Run(cfg, sched.DefaultPolicy(sched.DefaultWeights))
-	b := Run(cfg, sched.DefaultPolicy(sched.DefaultWeights))
-	if len(a) != 2 || len(b) != 2 {
-		t.Fatalf("results = %d, %d", len(a), len(b))
+	mk := map[string]func() *sched.Policy{
+		"default": func() *sched.Policy { return sched.DefaultPolicy(sched.DefaultWeights) },
+		"sampled": func() *sched.Policy {
+			p := sched.DefaultPolicy(sched.DefaultWeights)
+			p.SampleSize = 100
+			return p
+		},
+		"random": func() *sched.Policy { return sched.RandomPolicy(cfg.Seed) },
 	}
-	for i := range a {
-		x, y := a[i], b[i]
-		x.Seconds, x.DecisionsPerSec, y.Seconds, y.DecisionsPerSec = 0, 0, 0, 0
-		if x != y {
-			t.Fatalf("run differs:\n%+v\n%+v", x, y)
+	for name, f := range mk {
+		a, b := Run(cfg, f()), Run(cfg, f())
+		if len(a) != 2 || len(b) != 2 {
+			t.Fatalf("%s: results = %d, %d", name, len(a), len(b))
+		}
+		for i := range a {
+			x, y := a[i], b[i]
+			x.Seconds, x.DecisionsPerSec, y.Seconds, y.DecisionsPerSec = 0, 0, 0, 0
+			if x != y {
+				t.Fatalf("%s run differs:\n%+v\n%+v", name, x, y)
+			}
+		}
+		if a[0].Scenario != "fill" || a[1].Scenario != "churn" {
+			t.Fatalf("scenarios %q %q", a[0].Scenario, a[1].Scenario)
 		}
 	}
-	if a[0].Scenario != "fill" || a[1].Scenario != "churn" {
-		t.Fatalf("scenarios %q %q", a[0].Scenario, a[1].Scenario)
+}
+
+func TestSameSequenceAcrossPolicies(t *testing.T) {
+	cfg := smallConfig()
+	sampled := sched.DefaultPolicy(sched.DefaultWeights)
+	sampled.SampleSize = 100
+	policies := []*sched.Policy{sched.DefaultPolicy(sched.DefaultWeights), sampled,
+		sched.SpreadPolicy(), sched.FirstFitPolicy(), sched.RandomPolicy(cfg.Seed)}
+	var first Result
+	for i, p := range policies {
+		f := Run(cfg, p)[0]
+		if f.Failed != 0 {
+			t.Fatalf("%s failed %d", f.Policy, f.Failed)
+		}
+		if i == 0 {
+			first = f
+			continue
+		}
+		if f.Placements != first.Placements || f.LowerBound != first.LowerBound || f.FillReached != first.FillReached {
+			t.Fatalf("%s differs: %+v vs %+v", f.Policy, f, first)
+		}
+	}
+}
+
+func TestFillReachesTargetLargeFleet(t *testing.T) {
+	if testing.Short() {
+		t.Skip("large fleet")
+	}
+	cfg := DefaultConfig()
+	cfg.Nodes, cfg.ChurnSteps = 12000, 0
+	p := sched.FirstFitPolicy()
+	p.SampleSize = 1 // keeps the test fast; the fill logic is policy-independent
+	f := Run(cfg, p)[0]
+	if f.FillReached < 0.70 || f.FillReached > 0.71 {
+		t.Fatalf("fill reached %.4f (failed %d)", f.FillReached, f.Failed)
 	}
 }
 

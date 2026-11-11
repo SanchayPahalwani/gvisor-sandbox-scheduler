@@ -43,9 +43,18 @@ func run() error {
 		sched.FirstFitPolicy(),
 		sched.RandomPolicy(cfg.Seed),
 	}
+	// One discarded pass so the first measured policy is not penalised by cold caches.
+	sim.Run(cfg, sched.DefaultPolicy(sched.DefaultWeights))
 	var results []sim.Result
 	for _, p := range policies {
 		results = append(results, sim.Run(cfg, p)...)
+	}
+
+	for _, r := range results {
+		if r.Scenario == "fill" && r.FillReached < cfg.FillFraction-0.01 {
+			return fmt.Errorf("policy %s (sample %d) stopped the fill at %.4f of fleet CPU, target %.2f: placements failed repeatedly",
+				r.Policy, r.SampleSize, r.FillReached, cfg.FillFraction)
+		}
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -61,6 +70,8 @@ func run() error {
 
 	notes := []string{
 		"packing_efficiency is requested/capacity of the binding resource on nodes that hold at least one sandbox",
+		"decisions_per_sec is from one measured pass per policy after one discarded warm-up pass; single goroutine; time inside Place only",
+		"node order is shuffled with the seed, so first-fit does not meet one node size first",
 		fmt.Sprintf("the request mix is CPU-bound on this fleet (about %.1f GiB per requested CPU against %d GiB per node CPU)",
 			sim.MixMemPerCPU(), sim.NodeMemPerCPU),
 	}

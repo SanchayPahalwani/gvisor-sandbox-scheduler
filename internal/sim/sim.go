@@ -47,6 +47,9 @@ type Result struct {
 	// EmptyCPUFraction is the CPU capacity of nodes holding no sandbox over
 	// fleet CPU capacity: the share of the fleet that could be switched off.
 	EmptyCPUFraction float64 `json:"empty_cpu_fraction"`
+	// FillReached is live requested CPU over fleet CPU at the end of the
+	// scenario.
+	FillReached float64 `json:"fill_reached"`
 }
 
 // Fleet builds the synthetic nodes: 20% 8 CPU/32 GiB, 50% 16 CPU/64 GiB,
@@ -86,34 +89,39 @@ func Fleet(cfg Config) []*sched.NodeInfo {
 // is a floor on node count and not a fair yardstick for a utilisation-based
 // policy.
 //
-// It is the fewest nodes, largest first, whose capacity covers both
-// totals. Nodes are tried largest-by-CPU first and largest-by-memory first and
-// the smaller count wins. It returns len(nodes) when the fleet cannot cover the
-// demand.
+// It is the larger of the nodes needed to cover the CPU total (largest CPU
+// first) and the nodes needed to cover the memory total (largest memory
+// first), so it is a true floor. It returns len(nodes) when the fleet cannot
+// cover the demand.
 func LowerBound(nodes []*sched.NodeInfo, cpu, mem int64) int {
 	if cpu <= 0 && mem <= 0 {
 		return 0
 	}
-	best := len(nodes)
-	for _, byMem := range []bool{false, true} {
-		order := append([]*sched.NodeInfo(nil), nodes...)
-		sort.SliceStable(order, func(i, j int) bool {
-			if byMem {
-				return order[i].Capacity.MemoryBytes > order[j].Capacity.MemoryBytes
-			}
-			return order[i].Capacity.CPUMillis > order[j].Capacity.CPUMillis
-		})
-		var c, m int64
-		for i, n := range order {
-			c += n.Capacity.CPUMillis
-			m += n.Capacity.MemoryBytes
-			if c >= cpu && m >= mem {
-				best = min(best, i+1)
-				break
-			}
+	return max(coverCount(nodes, cpu, false), coverCount(nodes, mem, true))
+}
+
+// coverCount is how many nodes, largest first in one resource, are needed to
+// cover the demand in that resource. It returns len(nodes) if they cannot.
+func coverCount(nodes []*sched.NodeInfo, demand int64, byMem bool) int {
+	if demand <= 0 {
+		return 0
+	}
+	val := func(n *sched.NodeInfo) int64 {
+		if byMem {
+			return n.Capacity.MemoryBytes
+		}
+		return n.Capacity.CPUMillis
+	}
+	order := append([]*sched.NodeInfo(nil), nodes...)
+	sort.SliceStable(order, func(i, j int) bool { return val(order[i]) > val(order[j]) })
+	var sum int64
+	for i, n := range order {
+		sum += val(n)
+		if sum >= demand {
+			return i + 1
 		}
 	}
-	return best
+	return len(nodes)
 }
 
 var sizes = []struct {
@@ -186,10 +194,14 @@ func run(cfg Config, p *sched.Policy) *state {
 	var requested int64
 	var elapsed time.Duration
 	res := Result{Policy: p.Name, SampleSize: p.SampleSize, Scenario: "fill"}
-	for attempts := 0; requested < target && attempts < 10*len(nodes)+100000; attempts++ {
+	const maxConsecutiveFailures = 1000
+	for failures := 0; requested < target && failures < maxConsecutiveFailures; {
 		req := drawSize(r)
 		if s.place(p, req, &res, &elapsed) {
 			requested += req.CPUMillis
+			failures = 0
+		} else {
+			failures++
 		}
 	}
 	s.fillCPU = requested
@@ -227,7 +239,10 @@ func (s *state) place(p *sched.Policy, res sched.Resources, out *Result, elapsed
 		out.Failed++
 		return false
 	}
-	idx := s.index[d.NodeID]
+	idx, ok := s.index[d.NodeID]
+	if !ok {
+		panic("sim: policy returned unknown node " + d.NodeID)
+	}
 	n := s.nodes[idx]
 	n.Allocated.CPUMillis += res.CPUMillis
 	n.Allocated.MemoryBytes += res.MemoryBytes
@@ -266,6 +281,7 @@ func (s *state) finish(out *Result, elapsed time.Duration) {
 		out.PackingEfficiency = max(out.CPUUtilUsed, out.MemUtilUsed)
 	}
 	if fleetCPU > 0 {
+		out.FillReached = float64(reqCPU) / float64(fleetCPU)
 		out.EmptyCPUFraction = float64(emptyCPU) / float64(fleetCPU)
 	}
 }
