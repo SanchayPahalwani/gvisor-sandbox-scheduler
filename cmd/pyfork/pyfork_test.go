@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,9 +20,15 @@ import (
 	"time"
 )
 
-// startZygote runs images/python/zygote.py on a socket in a fresh temp dir and
-// waits for its READY line. It returns the socket path.
+// startZygote runs images/python/zygote.py with GSS_PRIME=json on a socket in a
+// fresh temp dir and waits for its READY line. It returns the socket path.
 func startZygote(t *testing.T) string {
+	t.Helper()
+	return startZygotePrimed(t, "json")
+}
+
+// startZygotePrimed is startZygote with the given GSS_PRIME list.
+func startZygotePrimed(t *testing.T, prime string) string {
 	t.Helper()
 	py, err := exec.LookPath("python3")
 	if err != nil {
@@ -39,7 +46,7 @@ func startZygote(t *testing.T) string {
 	sock := filepath.Join(dir, "z.sock")
 
 	cmd := exec.Command(py, script)
-	cmd.Env = append(os.Environ(), "GSS_ZYGOTE_SOCK="+sock, "GSS_PRIME=json")
+	cmd.Env = append(os.Environ(), "GSS_ZYGOTE_SOCK="+sock, "GSS_PRIME="+prime)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -397,16 +404,16 @@ func TestWorkerSetupFailure(t *testing.T) {
 
 func TestZygoteBadTimeout(t *testing.T) {
 	sock := startZygote(t)
-	for _, timeout := range []string{"-1", "NaN", "86401"} {
+	for _, timeout := range []string{"-1", "NaN", "86401", "1" + strings.Repeat("0", 400)} {
 		c := sendRaw(t, sock, []byte(`{"code": "print('ran')", "timeout_s": `+timeout+`, "env": {}}`))
 		if code, ok := c.reply(t); ok {
-			t.Errorf("timeout_s %s: zygote replied %d; want no reply", timeout, code)
+			t.Errorf("timeout_s %.20s: zygote replied %d; want no reply", timeout, code)
 		}
 		if out := readAll(t, c.outR); out != "" {
-			t.Errorf("timeout_s %s: stdout %q; want empty", timeout, out)
+			t.Errorf("timeout_s %.20s: stdout %q; want empty", timeout, out)
 		}
 		if e := readAll(t, c.errR); !strings.HasPrefix(e, "zygote:") {
-			t.Errorf("timeout_s %s: stderr %q; want a zygote: line", timeout, e)
+			t.Errorf("timeout_s %.20s: stderr %q; want a zygote: line", timeout, e)
 		}
 	}
 }
@@ -563,5 +570,65 @@ func TestSyntaxError(t *testing.T) {
 	r := runCode(t, "x = (")
 	if r.code != 1 || !strings.Contains(r.stderr, "SyntaxError") || strings.Contains(r.stderr, "zygote.py") {
 		t.Fatalf("got code %d stderr %q; want 1 and a SyntaxError without zygote.py", r.code, r.stderr)
+	}
+}
+
+func TestUnclosedFileIsFlushedNoFunction(t *testing.T) {
+	sock := startZygote(t)
+	path := filepath.Join(t.TempDir(), "out.txt")
+	// No function in __main__ here: the file object is not part of a reference cycle.
+	code := "import os\nf = open(os.environ[\"GSS_P\"], \"w\")\nf.write(\"data\")\n"
+	r := runWith(t, sock, input(code, 0, map[string]string{"GSS_P": path}), 5*time.Second)
+	if r.code != 0 {
+		t.Fatalf("got code %d stderr %q; want 0", r.code, r.stderr)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "data" {
+		t.Fatalf("file holds %q (%v); want %q", b, err, "data")
+	}
+}
+
+func TestDelSeesGlobals(t *testing.T) {
+	r := runCode(t, "import os\nclass T:\n    def __del__(self):\n        print(os.getpid() > 0)\nt = T()\n")
+	if r.code != 0 || r.stdout != "True\n" || r.stderr != "" {
+		t.Fatalf("got code %d stdout %q stderr %q; want 0, %q, no stderr", r.code, r.stdout, r.stderr, "True\n")
+	}
+}
+
+func TestDaemonThreadNoNoise(t *testing.T) {
+	sock := startZygotePrimed(t, "json,decimal,statistics,csv,datetime,collections")
+	// A tiny switch interval lets the daemon thread run while the worker shuts down,
+	// as a large primed heap does in the real image (a long gc pass).
+	code := "import sys, threading, time\n" +
+		"sys.setswitchinterval(1e-6)\n" +
+		"def bg():\n" +
+		"    while True:\n" +
+		"        time.sleep(0)\n" +
+		"threading.Thread(target=bg, daemon=True).start()\n" +
+		"time.sleep(0.01)\n"
+	for i := range 10 {
+		r := runWith(t, sock, input(code, 0, nil), 5*time.Second)
+		if r.code != 0 || r.stderr != "" {
+			t.Fatalf("run %d: got code %d stderr %q; want 0 and no stderr", i, r.code, r.stderr)
+		}
+	}
+}
+
+func TestNoopExecIsFast(t *testing.T) {
+	sock := startZygotePrimed(t, "json,re,decimal,statistics,csv,datetime,collections,itertools,functools")
+	const n = 20
+	times := make([]time.Duration, n)
+	for i := range n {
+		start := time.Now()
+		r := runWith(t, sock, input("pass", 0, nil), 5*time.Second)
+		times[i] = time.Since(start)
+		if r.code != 0 {
+			t.Fatalf("run %d: got code %d stderr %q; want 0", i, r.code, r.stderr)
+		}
+	}
+	slices.Sort(times)
+	median := (times[n/2-1] + times[n/2]) / 2
+	t.Logf("no-op exec: median %v, min %v, max %v over %d runs", median, times[0], times[n-1], n)
+	if median >= 100*time.Millisecond {
+		t.Fatalf("median no-op exec %v; want < 100ms", median)
 	}
 }

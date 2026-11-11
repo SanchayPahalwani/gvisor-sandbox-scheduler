@@ -97,12 +97,17 @@ def parse_request(payload):
     env = req.get("env") or {}
     if not isinstance(code, str):
         raise ProtocolError("bad request: code is not a string")
-    if (
-        isinstance(timeout_s, bool)
-        or not isinstance(timeout_s, (int, float))
-        or math.isnan(timeout_s)
-        or not 0 <= timeout_s <= MAX_TIMEOUT_S
-    ):
+    try:
+        # An integer too large for a float makes math.isnan raise OverflowError.
+        bad_timeout = (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or math.isnan(timeout_s)
+            or not 0 <= timeout_s <= MAX_TIMEOUT_S
+        )
+    except OverflowError:
+        bad_timeout = True
+    if bad_timeout:
         raise ProtocolError(
             "bad request: timeout_s %r is outside 0..%d" % (timeout_s, MAX_TIMEOUT_S)
         )
@@ -191,8 +196,8 @@ def print_user_exception(e):
 
 def shut_down(status):
     """Does what interpreter exit does for `python3 -c`, as far as practical: wait
-    for non-daemon threads, run atexit handlers, drop __main__'s globals so
-    objects are finalized (open files flushed), then flush stdio."""
+    for non-daemon threads, run atexit handlers, drop __main__ so objects
+    are finalized (open files flushed), then flush stdio."""
     if "threading" in sys.modules:
         try:
             sys.modules["threading"]._shutdown()
@@ -204,11 +209,13 @@ def shut_down(status):
         atexit._run_exitfuncs()
     except BaseException:
         pass
+    # The order Py_FinalizeEx uses: collect, drop __main__, collect again. Objects
+    # are finalized while the globals they refer to still exist, so __del__ and
+    # daemon threads see a normal module, and unclosed files are flushed even when
+    # they sit in a cycle with a function's __globals__.
     try:
-        main_module = sys.modules.pop("__main__", None)
-        if main_module is not None:
-            main_module.__dict__.clear()
-        del main_module
+        gc.collect()
+        sys.modules.pop("__main__", None)
         gc.collect()
     except BaseException:
         pass
@@ -329,6 +336,14 @@ def main():
         name = name.strip()
         if name:
             importlib.import_module(name)
+    # Move everything that exists now (the interpreter plus the primed modules)
+    # into the permanent generation. Each worker runs gc.collect() at exit, and
+    # without the freeze that pass would scan the whole primed heap on every exec
+    # (about 20 ms with numpy and pandas). Frozen objects are never scanned, and
+    # freezing also keeps the collector from touching them, so forked children
+    # share those pages instead of copying them.
+    gc.collect()
+    gc.freeze()
     prime_ms = int((time.monotonic() - start) * 1000)
 
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
