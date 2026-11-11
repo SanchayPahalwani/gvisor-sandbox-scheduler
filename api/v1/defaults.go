@@ -23,6 +23,9 @@ const (
 
 // ApplyDefaults fills zero-valued fields of s in place.
 func ApplyDefaults(s *SandboxSpec) {
+	if s == nil {
+		return
+	}
 	if s.Resources == nil {
 		s.Resources = &Resources{}
 	}
@@ -38,8 +41,12 @@ func ApplyDefaults(s *SandboxSpec) {
 }
 
 // ValidateSpec checks s against the limits above. Call ApplyDefaults first;
-// a zero cpu_millis or memory_bytes is an error here.
+// a zero cpu_millis or memory_bytes is an error here, while a nil or zero ttl
+// is accepted (ApplyDefaults sets it). A nil spec is an error.
 func ValidateSpec(s *SandboxSpec) error {
+	if s == nil {
+		return fmt.Errorf("spec is required")
+	}
 	cpu := s.GetResources().GetCpuMillis()
 	if cpu < MinCPUMillis {
 		return fmt.Errorf("cpu_millis %d is below the minimum %d", cpu, MinCPUMillis)
@@ -75,8 +82,8 @@ func validateEgress(e string) error {
 		return fmt.Errorf("missing :port")
 	}
 	host, portStr := e[:i], e[i+1:]
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
 		return fmt.Errorf("port must be 1..65535")
 	}
 	if host == "" {
@@ -89,6 +96,33 @@ func validateEgress(e string) error {
 		p, err := netip.ParsePrefix(host)
 		if err != nil || !p.Addr().Is4() {
 			return fmt.Errorf("invalid IPv4 CIDR")
+		}
+		return nil
+	}
+	if strings.Trim(host, "0123456789.") == "" {
+		a, err := netip.ParseAddr(host)
+		if err != nil || !a.Is4() {
+			return fmt.Errorf("invalid IPv4 address")
+		}
+		return nil
+	}
+	return validateHostname(host)
+}
+
+// validateHostname checks RFC 1123 labels: [A-Za-z0-9-], 1-63 characters, no
+// leading or trailing hyphen, 253 characters in total.
+func validateHostname(h string) error {
+	if len(h) > 253 {
+		return fmt.Errorf("host name is longer than 253 characters")
+	}
+	for _, l := range strings.Split(h, ".") {
+		if len(l) < 1 || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return fmt.Errorf("invalid host name")
+		}
+		for _, c := range l {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return fmt.Errorf("invalid host name")
+			}
 		}
 	}
 	return nil

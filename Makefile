@@ -7,11 +7,11 @@ PKG ?= ./...
 RUN ?= .
 # Variables forwarded into the VM invocation. Append new ones here.
 FORWARD_VARS := PKG RUN
-FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$($(v))')
+FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
 LINUX_TARGETS := build test-integration
 
-.PHONY: vm vm-stop vm-delete proto build test lint test-integration
+.PHONY: vm vm-stop vm-delete proto test lint $(LINUX_TARGETS)
 
 ifeq ($(UNAME),Darwin)
 $(LINUX_TARGETS):
@@ -36,7 +36,11 @@ export PATH := /usr/local/go/bin:$(PATH)
 
 build:
 	@mkdir -p bin
-	@if [ -n "$$(go list ./cmd/... 2>/dev/null)" ]; then CGO_ENABLED=0 go build -o bin/ ./cmd/...; else echo "no cmd/ packages yet"; fi
+ifneq ($(wildcard cmd/*/),)
+	CGO_ENABLED=0 go build -o bin/ ./cmd/...
+else
+	@echo "no cmd/ packages yet"
+endif
 
 test-integration:
 	sudo env PATH=$$PATH GOCACHE=/var/cache/gss/go-build GOMODCACHE=/var/cache/gss/go-mod go test -tags integration -count=1 -p 1 -timeout 20m $(PKG) -run '$(RUN)'
