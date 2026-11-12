@@ -111,8 +111,9 @@ const containerLog = "container.log"
 // startSandbox runs a start path up to readiness (spec 7.3): network,
 // bundle, runsc create, then runsc start (the cold path, imageDir "") or
 // runsc restore from the checkpoint image in imageDir, then the readiness
-// probe. On failure it returns the name of the failing step; e records what
-// was done, for teardown.
+// probe, bounded by ReadyTimeout (and after a restore also by
+// restoreReadyTimeout). On failure it returns the name of the failing step;
+// e records what was done, for teardown.
 func (m *Manager) startSandbox(ctx context.Context, e *sandbox, imageDir string) (step string, err error) {
 	var netns string
 	var hosts []bundle.HostEntry
@@ -145,20 +146,24 @@ func (m *Manager) startSandbox(ctx context.Context, e *sandbox, imageDir string)
 	} else if err := m.rt.Restore(ctx, e.ref, e.bundleDir, imageDir); err != nil {
 		return "runsc.restore", err
 	}
-	if err := m.waitReady(ctx, e); err != nil {
+	ready := m.cfg.ReadyTimeout
+	if imageDir != "" && m.restoreReadyTimeout < ready {
+		ready = m.restoreReadyTimeout
+	}
+	if err := m.waitReady(ctx, e, ready); err != nil {
 		return "sandbox.ready", err
 	}
 	return "", nil
 }
 
 // waitReady runs the readiness probe (spec 6.3): a no-op python_code Exec,
-// bounded by ReadyTimeout. pyfork retries its connection to the zygote, so on
-// a cold start this one call returns when the interpreter is ready; a
-// restored zygote is already listening.
-func (m *Manager) waitReady(ctx context.Context, e *sandbox) (err error) {
+// bounded by timeout. pyfork retries its connection to the zygote, so on a
+// cold start this one call returns when the interpreter is ready; a restored
+// zygote is already listening.
+func (m *Manager) waitReady(ctx context.Context, e *sandbox, timeout time.Duration) (err error) {
 	ctx, span := startSpan(ctx, "sandbox.ready", attribute.String("runsc.id", e.ref.ID))
 	defer func() { endSpan(span, err) }()
-	ctx, cancel := context.WithTimeout(ctx, m.cfg.ReadyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out := &tailBuffer{max: 1024}
 	code, err := m.rt.Exec(ctx, e.ref, runsc.ExecSpec{

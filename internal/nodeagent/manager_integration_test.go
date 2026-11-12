@@ -367,6 +367,12 @@ func TestRealRestore(t *testing.T) {
 			t.Errorf("%s: exit %v, stdout %q, stderr %q; want 0 and \"True\\n\"", id, exit, r.stdout.String(), r.stderr.String())
 		}
 	}
+	// The sentry reads its memory total at boot, so a restored sandbox may
+	// report the image sandbox's size (256 MiB); logged, not checked.
+	r := runExec(ctx, m, pyReq("sb-1", `print(next(l for l in open("/proc/meminfo") if l.startswith("MemTotal")).strip())`), nil)
+	if exit := r.ok(t, "MemTotal"); exit.GetCode() == 0 {
+		t.Logf("sb-1 (512 MiB, restored from an image of a 256 MiB sandbox): %s", strings.TrimSpace(r.stdout.String()))
+	}
 	for rid, want := range map[string][2]string{
 		"sb-1_1_": {"100000 100000", "536870912"},
 		"sb-2_1_": {"50000 100000", "268435456"},
@@ -405,6 +411,78 @@ print(urllib.request.urlopen("http://target.test:8080/", timeout=5).status)`)
 	r = runExec(ctx, m, pyReq("eg-1", connectCode(tgt.Addr, tgt.BlockedPort)), nil)
 	if r.ok(t, "connect to 8081"); strings.TrimSpace(r.stdout.String()) != "timeout" {
 		t.Errorf("%s:8081 (not allowed): %q (stderr %q), want timeout", tgt.Addr, r.stdout.String(), r.stderr.String())
+	}
+}
+
+// netnsCount counts the network namespaces whose name starts with prefix.
+func netnsCount(t *testing.T, prefix string) int {
+	t.Helper()
+	n := 0
+	for _, line := range strings.Split(testenv.MustRun(t, "ip", "netns", "list"), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRealRestoreBrokenImage restores an egress sandbox from an image whose
+// checkpoint.img was cut in half: the Create falls back to cold, the node
+// stops using the image, and nothing of the failed restore is left
+// (container, cgroup, network namespace).
+func TestRealRestoreBrokenImage(t *testing.T) {
+	n := newRealNode(t)
+	tgt := testenv.EgressTarget(t)
+	np := egressPolicy(t, n.id, tgt)
+	m := restoreManager(t, n, np)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	dir, err := m.EnsureImage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := filepath.Join(dir, "checkpoint.img")
+	fi, err := os.Stat(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(img, fi.Size()/2); err != nil {
+		t.Fatal(err)
+	}
+
+	egress := &gssv1.SandboxSpec{EgressAllow: []string{tgt.Addr + ":" + tgt.AllowedPort}}
+	resp, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "eg-1", Incarnation: 1, Spec: egress})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("started as %v, want COLD after the broken restore", resp.GetStartedAs())
+	}
+	t.Logf("ready latency with the fallback: %v", resp.GetReadyLatency().AsDuration())
+	if m.ImageReady() {
+		t.Error("the node still uses the broken image")
+	}
+	rid := "eg-1_1_"
+	if got := n.listContainers(t); len(got) != 1 || got[0] != rid {
+		t.Errorf("runsc list = %q, want only the cold container %s", got, rid)
+	}
+	if got := childDirs(t, filepath.Join(cgroupRoot, "gss", n.id)); len(got) != 1 || got[0] != rid {
+		t.Errorf("cgroups under /gss/%s = %q, want only %s", n.id, got, rid)
+	}
+	nsPrefix := "gss-" + n.id + "-"
+	if got := netnsCount(t, nsPrefix); got != 1 {
+		t.Errorf("%d network namespaces %s*, want 1 (the cold sandbox's)", got, nsPrefix)
+	}
+	r := runExec(ctx, m, pyReq("eg-1", connectCode(tgt.Addr, tgt.AllowedPort)), nil)
+	if r.ok(t, "connect from the cold sandbox"); strings.TrimSpace(r.stdout.String()) != "connected" {
+		t.Errorf("%s:%s from the cold sandbox: %q (stderr %q), want connected", tgt.Addr, tgt.AllowedPort, r.stdout.String(), r.stderr.String())
+	}
+	if err := m.Destroy(ctx, "eg-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := netnsCount(t, nsPrefix); got != 0 {
+		t.Errorf("%d network namespaces %s* after Destroy, want 0", got, nsPrefix)
 	}
 }
 

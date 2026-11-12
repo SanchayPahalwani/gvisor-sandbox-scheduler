@@ -76,7 +76,8 @@ func (c *CLI) args(ref Ref, sub string, rest ...string) []string {
 	if network == "" {
 		network = NetworkNone
 	}
-	out := []string{"--root", c.Root, "--network=" + string(network), "--overlay2=none", sub}
+	out := append([]string{"--root", c.Root, "--network=" + string(network)}, SandboxFlags()...)
+	out = append(out, sub)
 	return append(out, rest...)
 }
 

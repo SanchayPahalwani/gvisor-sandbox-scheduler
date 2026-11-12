@@ -17,6 +17,11 @@ const (
 	NetworkSandbox Network = "sandbox"
 )
 
+// SandboxFlags are the top-level flags, besides --root and --network, that
+// CLI passes on every command for a sandbox. A checkpoint image is valid only
+// for the flags it was made with, so they are part of its key.
+func SandboxFlags() []string { return []string{"--overlay2=none"} }
+
 // Ref names one sandbox and the network mode it was created with. The mode is
 // a top-level runsc flag and must be the same on every command for that sandbox.
 type Ref struct {

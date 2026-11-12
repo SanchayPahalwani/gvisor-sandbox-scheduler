@@ -632,3 +632,43 @@ func TestNoopExecIsFast(t *testing.T) {
 		t.Fatalf("median no-op exec %v; want < 100ms", median)
 	}
 }
+
+// twoDraws runs code twice on one zygote primed with prime and returns the
+// two outputs. Every Exec is a fork of the same primed interpreter, as every
+// sandbox restored from one checkpoint image is.
+func twoDraws(t *testing.T, prime, code string) (string, string) {
+	t.Helper()
+	sock := startZygotePrimed(t, prime)
+	var out [2]string
+	for i := range out {
+		r := runWith(t, sock, input(code, 0, nil), 5*time.Second)
+		if r.code != 0 || r.stdout == "" {
+			t.Fatalf("exec %d: code %d stdout %q stderr %q", i+1, r.code, r.stdout, r.stderr)
+		}
+		out[i] = r.stdout
+	}
+	return out[0], out[1]
+}
+
+func TestNumpyRandomReseeded(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	if out, err := exec.Command(py, "-c", "import numpy.random").CombinedOutput(); err != nil {
+		t.Skipf("numpy is not importable by the host python3 (%v: %s); the sandbox rootfs has it", err, strings.TrimSpace(string(out)))
+	}
+	// numpy.random is primed explicitly: numpy 2 loads it lazily, and in the
+	// sandbox pandas loads it at import.
+	a, b := twoDraws(t, "numpy,numpy.random", "import numpy; print(numpy.random.randint(0, 2**62))")
+	if a == b {
+		t.Errorf("two Execs drew the same numpy.random.randint: %q", a)
+	}
+}
+
+func TestRandomReseeded(t *testing.T) {
+	a, b := twoDraws(t, "random", "import random; print(random.getrandbits(64))")
+	if a == b {
+		t.Errorf("two Execs drew the same random.getrandbits(64): %q", a)
+	}
+}

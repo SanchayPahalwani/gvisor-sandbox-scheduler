@@ -90,14 +90,19 @@ type Manager struct {
 	// Test hooks, set before Start.
 	processAlive         func(pid int) bool
 	reapEvery, liveEvery time.Duration
-	destroyLookedUp      func(e *sandbox) // called by Destroy before it destroys e
+	destroyLookedUp      func(e *sandbox)        // called by Destroy before it destroys e
+	fsync                func(path string) error // fsyncPath: syncs a file or directory
+	restoreReadyTimeout  time.Duration           // the readiness bound after a restore
 
-	mu        sync.Mutex
-	sandboxes map[string]*sandbox // by sandbox ID
-	imageDir  string              // the checkpoint image Creates restore from; "" if none
-	serving   bool                // Start finished; Create is open
-	started   bool
-	closed    bool
+	mu          sync.Mutex
+	sandboxes   map[string]*sandbox // by sandbox ID
+	imageDir    string              // the checkpoint image Creates restore from; "" if none
+	imageKey    string              // the key EnsureImage computed; "" before
+	imageBad    bool                // a restore from imageDir failed: no image until restart
+	imageLooked time.Time           // the last look for another agent's image (Deps.Now)
+	serving     bool                // Start finished; Create is open
+	started     bool
+	closed      bool
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -134,8 +139,8 @@ func NewManager(cfg Config, deps Deps) (*Manager, error) {
 	}
 	return &Manager{
 		cfg: cfg, rt: tracedRuntime{deps.Runtime}, cg: deps.Cgroups, net: deps.Net, now: now,
-		processAlive: pidAlive,
-		reapEvery:    reapInterval, liveEvery: livenessInterval,
+		processAlive: pidAlive, fsync: fsyncPath, restoreReadyTimeout: defaultRestoreReadyTimeout,
+		reapEvery: reapInterval, liveEvery: livenessInterval,
 		sandboxes: map[string]*sandbox{},
 		stop:      make(chan struct{}),
 	}, nil
@@ -176,8 +181,9 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Create starts a sandbox and returns when it is ready, on the path
-// chooseMode picks (spec 7.3). In AUTO mode a restore that fails in its own
-// steps is undone and the cold path runs once instead; a forced RESTORE
+// chooseMode picks (spec 7.3). A restore that fails in its own steps turns
+// restore off on this node until it restarts; in AUTO mode the restore is
+// then undone and the cold path runs once instead, and a forced RESTORE
 // fails with Internal.
 func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (resp *gssv1.NodeCreateResponse, err error) {
 	begin := time.Now() // ready_latency is a measurement: real time, not Deps.Now
@@ -202,7 +208,7 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	egress := len(spec.GetEgressAllow()) > 0
-	imageDir := m.image()
+	imageDir := m.restoreImage()
 	mode, err := chooseMode(spec.GetStartMode(), egress, noWarmPool, imageDir != "")
 	if err != nil {
 		return nil, err
@@ -220,10 +226,13 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	var step string
 	if mode == gssv1.StartMode_START_MODE_RESTORE {
 		step, err = m.startSandbox(ctx, e, imageDir)
-		if err != nil && spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO && restoreStep(step) && ctx.Err() == nil {
-			mode = gssv1.StartMode_START_MODE_COLD
-			span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
-			step, err = m.coldAfterRestore(ctx, e, step, err)
+		if err != nil && restoreStep(step) && ctx.Err() == nil {
+			m.dropImage(step, err)
+			if spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO {
+				mode = gssv1.StartMode_START_MODE_COLD
+				span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
+				step, err = m.coldAfterRestore(ctx, e, step, err)
+			}
 		}
 	} else {
 		step, err = m.startSandbox(ctx, e, "")

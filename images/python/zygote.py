@@ -319,6 +319,18 @@ def supervise(conn):
             os._exit(1)
 
 
+def reseed_numpy():
+    """Gives numpy's legacy global random state fresh OS entropy in a forked
+    child. numpy seeds it once, when numpy.random is imported, so without this
+    every Exec of a sandbox, and every sandbox restored from one checkpoint
+    image, would draw the same numbers from np.random.* (and pandas' sample()
+    without random_state). CPython reseeds `random` after fork itself. If
+    numpy.random was never imported here, the child seeds it on import."""
+    module = sys.modules.get("numpy.random")
+    if module is not None:
+        module.seed()
+
+
 def send_code(conn, code):
     try:
         conn.sendall(struct.pack(">i", code))
@@ -336,6 +348,8 @@ def main():
         name = name.strip()
         if name:
             importlib.import_module(name)
+    # Runs in every fork: the supervisor and the worker.
+    os.register_at_fork(after_in_child=reseed_numpy)
     # Move everything that exists now (the interpreter plus the primed modules)
     # into the permanent generation. Each worker runs gc.collect() at exit, and
     # without the freeze that pass would scan the whole primed heap on every exec

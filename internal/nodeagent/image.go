@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,72 +17,123 @@ import (
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bundle"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sys/unix"
 )
 
-// The checkpoint image (spec 7.2) of a node lives in CheckpointDir/<key>,
-// which every node agent on the host shares: an image is built by one agent
-// and restored by all of them. An image is complete when it holds
-// completeFile. A builder takes an exclusive flock on CheckpointDir/<key>.lock,
-// checkpoints into CheckpointDir/<key>.tmp-<pid>, writes completeFile there
-// and renames the directory to <key>, so no agent ever sees a partial image
-// under <key>.
+// The checkpoint image (spec 7.2, call D36) of a node lives in
+// CheckpointDir/<key>, which every node agent on the host shares: an image
+// is built by one agent and restored by all of them. An image is published
+// when it holds completeFile. A builder takes an exclusive flock on
+// CheckpointDir/<key>.lock, checkpoints into CheckpointDir/<key>.tmp-<pid>,
+// restores one sandbox from it, writes completeFile, fsyncs the directory
+// and renames it to <key>, so no agent ever sees a partial image, or one
+// that was never restored, under <key>.
 const (
 	completeFile = ".complete"
 	// lockPoll is how often a wait for another builder's lock tries again.
 	lockPoll = 20 * time.Millisecond
-	// unknownRootfsID stands for a rootfs without a build ID file.
-	unknownRootfsID = "unknown"
+	// defaultRestoreReadyTimeout bounds the readiness probe of a restored
+	// sandbox (about 85 ms in the VM); a cold start keeps Config.ReadyTimeout.
+	defaultRestoreReadyTimeout = 5 * time.Second
+	// imageRecheck is how often a node without an image looks for one that
+	// another agent on the host has built since.
+	imageRecheck = time.Second
 )
 
 // ImageKey identifies what a checkpoint image is valid for: the runsc
-// release, the rootfs build and the primed module list. It is the first 16
-// hex characters of sha256(runscVersion + "\n" + rootfsID + "\n" + prime).
+// release, the rootfs build, the primed module list, the sandbox layout the
+// bundle gives that list (on restore the process's credentials, rlimits and
+// environment come from the image, not from the new bundle), and the global
+// flags runsc runs with. It is the first 16 hex characters of the sha256 of
+// those five, joined by "\n".
 func ImageKey(runscVersion, rootfsID, prime string) string {
-	sum := sha256.Sum256([]byte(runscVersion + "\n" + rootfsID + "\n" + prime))
+	parts := []string{runscVersion, rootfsID, prime, sandboxLayout(prime), strings.Join(runsc.SandboxFlags(), " ")}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// sandboxLayout is layoutDigest of the bundle every sandbox with this primed
+// set gets. The fields a restored bundle may change (ID, directory, limits,
+// network namespace, hosts) take placeholder values: bundle.Spec does not
+// put them in the parts the digest covers.
+func sandboxLayout(prime string) string {
+	return layoutDigest(bundle.Spec(bundle.Options{
+		ID: "layout", Dir: "/layout", RootFS: "/layout", NodeID: "layout",
+		CPUMillis: 1000, MemoryBytes: 1 << 30, Prime: prime,
+	}))
+}
+
+// layoutDigest is the hex sha256 of the JSON of s's process section, then a
+// line per mount, in order, with its destination and type.
+func layoutDigest(s *specs.Spec) string {
+	h := sha256.New()
+	// The process section is plain strings, numbers and slices: it always
+	// marshals.
+	process, _ := json.Marshal(s.Process)
+	h.Write(process)
+	for _, mnt := range s.Mounts {
+		fmt.Fprintf(h, "\n%s %s", mnt.Destination, mnt.Type)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // EnsureImage returns the directory of the node's checkpoint image, building
 // it first if no agent has. Concurrent calls, in this process or in other
 // agents sharing CheckpointDir, build it once: the others wait for the lock
-// (bounded by ctx) and then find it complete. A failed build leaves no image
-// and no build directory. The sandbox that builds the image is not in the
-// manager's table, so it is neither listed nor counted, and EnsureImage
-// removes it before it returns; Close does not wait for EnsureImage. Start
-// calls it; once it has succeeded, Creates can take the restore path.
+// (bounded by ctx) and then find it published. A rootfs without a build ID
+// gets no image. A failed build leaves no image and no build directory.
+// The sandboxes that build the image are not in the manager's table, so
+// they are neither listed nor counted, and EnsureImage has removed them when
+// it returns, also when ctx ended. Start calls it; once it has succeeded,
+// Creates can take the restore path. After a restore from the image failed
+// on this manager it refuses.
 func (m *Manager) EnsureImage(ctx context.Context) (dir string, err error) {
 	if m.cfg.CheckpointDir == "" {
 		return "", errors.New("nodeagent: checkpoint images are off (no CheckpointDir)")
 	}
-	if d := m.image(); d != "" {
-		if imageComplete(d) {
+	m.mu.Lock()
+	d, bad, closed := m.imageDir, m.imageBad, m.closed
+	m.mu.Unlock()
+	switch {
+	case bad:
+		return "", errors.New("nodeagent: a restore from the checkpoint image failed; restore is off until the agent restarts")
+	case closed:
+		return "", errors.New("nodeagent: EnsureImage after Close")
+	}
+	if d != "" {
+		ok, err := imageComplete(d)
+		if err != nil {
+			return "", fmt.Errorf("nodeagent: checkpoint image: %w", err)
+		}
+		if ok {
 			return d, nil
 		}
 		m.setImage("") // it was removed: Creates start cold until it is back
 	}
-	m.mu.Lock()
-	closed := m.closed
-	m.mu.Unlock()
-	if closed {
-		return "", errors.New("nodeagent: EnsureImage after Close")
-	}
 
 	ctx, span := startSpan(ctx, "node.image")
 	defer func() { endSpan(span, err) }()
+	rootfs, err := rootfsID(m.cfg.RootFS)
+	if err != nil {
+		return "", fmt.Errorf("nodeagent: checkpoint images are off: %w", err)
+	}
 	version, err := m.rt.Version(ctx)
 	if err != nil {
 		return "", fmt.Errorf("nodeagent: checkpoint image: runsc version: %w", err)
 	}
-	rootfs, err := rootfsID(m.cfg.RootFS)
+	key := ImageKey(version, rootfs, m.cfg.Prime)
+	span.SetAttributes(attribute.String("image.key", key))
+	m.mu.Lock()
+	m.imageKey = key
+	m.mu.Unlock()
+	dir = filepath.Join(m.cfg.CheckpointDir, key)
+	ok, err := imageComplete(dir)
 	if err != nil {
 		return "", fmt.Errorf("nodeagent: checkpoint image: %w", err)
 	}
-	key := ImageKey(version, rootfs, m.cfg.Prime)
-	span.SetAttributes(attribute.String("image.key", key))
-	dir = filepath.Join(m.cfg.CheckpointDir, key)
-	if !imageComplete(dir) {
+	if !ok {
 		if err := os.MkdirAll(m.cfg.CheckpointDir, 0o700); err != nil {
 			return "", fmt.Errorf("nodeagent: checkpoint image: %w", err)
 		}
@@ -90,7 +143,10 @@ func (m *Manager) EnsureImage(ctx context.Context) (dir string, err error) {
 		}
 		defer unlock()
 		// Another agent may have built it while this one waited.
-		if !imageComplete(dir) {
+		if ok, err = imageComplete(dir); err != nil {
+			return "", fmt.Errorf("nodeagent: checkpoint image: %w", err)
+		}
+		if !ok {
 			span.SetAttributes(attribute.Bool("image.built", true))
 			info := fmt.Sprintf("runsc %s\nrootfs %s\nprime %s\n", version, rootfs, m.cfg.Prime)
 			if err := m.buildImage(ctx, key, dir, info); err != nil {
@@ -118,10 +174,59 @@ func (m *Manager) setImage(dir string) {
 	m.imageDir = dir
 }
 
-// buildImage cold-starts the image sandbox, checkpoints it into a build
-// directory, removes the sandbox, and publishes the directory as dir. The
-// caller holds the key's lock. Either dir is a complete image afterwards or
-// the build directory is gone.
+// restoreImage is the image a Create restores from, or "". A node that has
+// none, because its own build failed or its wait for another agent's build
+// ended, looks at most once per imageRecheck for the image of its key that
+// another agent has published since. After a failed restore it never looks.
+func (m *Manager) restoreImage() string {
+	m.mu.Lock()
+	dir, key := m.imageDir, m.imageKey
+	now := m.now()
+	look := dir == "" && key != "" && !m.imageBad && now.Sub(m.imageLooked) >= imageRecheck
+	if look {
+		m.imageLooked = now
+	}
+	m.mu.Unlock()
+	if !look {
+		return dir
+	}
+	found := filepath.Join(m.cfg.CheckpointDir, key)
+	if ok, err := imageComplete(found); err != nil || !ok {
+		return ""
+	}
+	m.mu.Lock()
+	adopted := m.imageDir == "" && !m.imageBad
+	if adopted {
+		m.imageDir = found
+	}
+	dir = m.imageDir
+	m.mu.Unlock()
+	if adopted {
+		slog.Info("checkpoint image found", "node", m.cfg.NodeID, "dir", found)
+	}
+	return dir
+}
+
+// dropImage turns restore off for good on this manager after a restore from
+// the image failed (step and err say how), so that it stops paying for a bad
+// image; a new agent builds or checks it again.
+func (m *Manager) dropImage(step string, err error) {
+	m.mu.Lock()
+	first := !m.imageBad
+	dir := m.imageDir
+	m.imageBad, m.imageDir = true, ""
+	m.mu.Unlock()
+	if first {
+		slog.Warn("restore from the checkpoint image failed; this node starts sandboxes cold until it restarts",
+			"node", m.cfg.NodeID, "dir", dir, "step", step, "err", err)
+	}
+}
+
+// buildImage makes the image under the key's lock, which the caller holds:
+// it cold-starts the image sandbox and checkpoints it into a build
+// directory, restores one sandbox from that directory to see that it works,
+// then marks it complete, fsyncs it and renames it to dir. Either dir is a
+// published image afterwards or the build directory is gone.
 func (m *Manager) buildImage(ctx context.Context, key, dir, info string) (err error) {
 	if err := removeStaleBuilds(m.cfg.CheckpointDir, key); err != nil {
 		return err
@@ -136,31 +241,55 @@ func (m *Manager) buildImage(ctx context.Context, key, dir, info string) (err er
 		}
 	}()
 
-	e := m.imageSandbox(key)
-	step, err := m.startSandbox(ctx, e, "")
-	if err == nil {
-		step, err = "runsc.checkpoint", m.rt.Checkpoint(ctx, e.ref, tmp)
-	}
-	if err != nil {
-		err = fmt.Errorf("%s: %w", step, err)
-	}
-	// runsc checkpoint leaves the container stopped; it goes either way.
-	if terr := m.teardown(ctx, e); terr != nil {
-		err = errors.Join(err, fmt.Errorf("remove image sandbox %s: %w", e.ref.ID, terr))
-	}
+	err = m.withImageSandbox(ctx, key, "", func(e *sandbox) (string, error) {
+		return "runsc.checkpoint", m.rt.Checkpoint(ctx, e.ref, tmp)
+	})
 	if err != nil {
 		return err
+	}
+	if err := m.withImageSandbox(ctx, key, tmp, nil); err != nil {
+		return fmt.Errorf("test restore: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(tmp, completeFile), []byte(info), 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, dir)
+	if err := m.syncTree(tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		return err
+	}
+	// The rename is durable only once the directory holding it is synced. A
+	// failure here leaves a published image, so it is not undone.
+	if err := m.fsync(m.cfg.CheckpointDir); err != nil {
+		slog.Warn("checkpoint image published, but syncing its directory failed", "dir", dir, "err", err)
+	}
+	return nil
 }
 
-// imageSandbox is the sandbox that an image is checkpointed from: no
-// network, the default size, and a runsc ID ("img_<key>_<pid>_") that no
-// user sandbox can have (sandbox IDs contain no '_', and "img" is reserved).
-// It is not in the manager's table.
+// withImageSandbox starts an image sandbox (cold, or restored from imageDir),
+// runs then on it once it is ready (if then is not nil), and removes it. The
+// removal runs whatever happened before, with its own bounded ctx, and is
+// done when withImageSandbox returns.
+func (m *Manager) withImageSandbox(ctx context.Context, key, imageDir string, then func(*sandbox) (string, error)) error {
+	e := m.imageSandbox(key)
+	step, err := m.startSandbox(ctx, e, imageDir)
+	if err == nil && then != nil {
+		step, err = then(e)
+	}
+	if err != nil {
+		err = fmt.Errorf("%s: %w", step, err)
+	}
+	if terr := m.teardown(ctx, e); terr != nil {
+		err = errors.Join(err, fmt.Errorf("remove image sandbox %s: %w", e.ref.ID, terr))
+	}
+	return err
+}
+
+// imageSandbox is a sandbox of the image build: no network, the default
+// size, and a runsc ID ("img_<key>_<pid>_") that no user sandbox can have
+// (sandbox IDs contain no '_', and "img" is reserved). The build's two
+// sandboxes use it one after the other. It is not in the manager's table.
 func (m *Manager) imageSandbox(key string) *sandbox {
 	rid := fmt.Sprintf("img_%s_%d_", key, os.Getpid())
 	spec := &gssv1.SandboxSpec{}
@@ -171,6 +300,40 @@ func (m *Manager) imageSandbox(key string) *sandbox {
 		bundleDir: filepath.Join(m.bundlesDir(), rid),
 		cgroup:    bundle.CgroupPath(m.cfg.NodeID, rid),
 	}
+}
+
+// syncTree fsyncs every regular file and directory below dir, then dir.
+func (m *Manager) syncTree(dir string) error {
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == dir || !(d.Type().IsRegular() || d.IsDir()) {
+			return nil
+		}
+		return m.fsync(path)
+	})
+	if err != nil {
+		return err
+	}
+	return m.fsync(dir)
+}
+
+// fsyncPath is Manager.fsync: it opens path (a file or a directory) and
+// fsyncs it.
+func fsyncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("fsync %s: %w", path, err)
+	}
+	return nil
 }
 
 // removeStaleBuilds removes what a builder of key that died left in ckdir:
@@ -190,23 +353,37 @@ func removeStaleBuilds(ckdir, key string) error {
 	return errors.Join(errs...)
 }
 
-func imageComplete(dir string) bool {
+// imageComplete reports whether dir holds a published image. Only a missing
+// marker means no; any other error is returned.
+func imageComplete(dir string) (bool, error) {
 	_, err := os.Stat(filepath.Join(dir, completeFile))
-	return err == nil
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	}
+	return false, err
 }
 
 // rootfsID is the build ID of the rootfs at path: the content of the sibling
-// file <path>.id that scripts/build-rootfs.sh writes, or "unknown" if there
-// is none.
+// file <path>.id that scripts/build-rootfs.sh writes. A rootfs without one
+// (no file, or an empty one) gets no image: an image is valid only for the
+// filesystem that made it.
 func rootfsID(path string) (string, error) {
-	b, err := os.ReadFile(filepath.Clean(path) + ".id")
+	idFile := filepath.Clean(path) + ".id"
+	b, err := os.ReadFile(idFile)
 	if errors.Is(err, fs.ErrNotExist) {
-		return unknownRootfsID, nil
+		return "", fmt.Errorf("the rootfs has no build ID (%s is missing)", idFile)
 	}
 	if err != nil {
 		return "", fmt.Errorf("rootfs build ID: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	id := strings.TrimSpace(string(b))
+	if id == "" {
+		return "", fmt.Errorf("the rootfs has no build ID (%s is empty)", idFile)
+	}
+	return id, nil
 }
 
 // lockFile takes an exclusive flock on path, creating the file if needed.

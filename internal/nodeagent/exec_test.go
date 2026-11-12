@@ -16,10 +16,8 @@ import (
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -829,10 +827,7 @@ func TestExecConcurrent(t *testing.T) {
 }
 
 func TestExecSpans(t *testing.T) {
-	sr := tracetest.NewSpanRecorder()
-	prev := otel.GetTracerProvider()
-	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
-	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	sr := recordSpans(t)
 
 	e := readyEnv(t, nil)
 	for _, req := range []*gssv1.ExecRequest{argvReq("sb-1", "true"), pyReq("sb-1", "pass")} {

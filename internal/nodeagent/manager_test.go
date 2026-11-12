@@ -940,10 +940,10 @@ func TestCreateRestore(t *testing.T) {
 }
 
 func TestCreateRestoreFallsBackToCold(t *testing.T) {
-	e, _ := restoreEnv(t, nil)
+	e, _ := restoreEnv(t, func(c *Config, _ *Deps) { c.CPUMillis = 1000 })
 	e.rt.Fail["Restore"] = errors.New("restore failed")
 	before := len(e.rt.Calls())
-	resp := e.mustCreate(t, "sb-1", 1, nil)
+	resp := e.mustCreate(t, "sb-1", 1, spec(500, 256<<20))
 	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
 		t.Errorf("started_as = %v, want COLD", resp.GetStartedAs())
 	}
@@ -970,43 +970,208 @@ func TestCreateRestoreFallsBackToCold(t *testing.T) {
 		t.Errorf("containers = %v", e.rt.Containers())
 	}
 
-	// A restored sandbox that does not get ready also falls back.
+	// The node drops the image and restores no more until it restarts, also
+	// after the time a node without an image looks for one again.
+	if e.m.ImageReady() {
+		t.Error("ImageReady after a failed restore")
+	}
+	e.clock.Set(t0.Add(2 * imageRecheck))
+	before = len(e.rt.Calls())
+	if resp := e.mustCreate(t, "sb-2", 1, spec(500, 256<<20)); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("after the failed restore: started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	if got := e.rt.Calls()[before:]; slices.Contains(got, "Restore id=sb-2_1_ net=none") {
+		t.Errorf("restored after the image was dropped: %q", got)
+	}
+	if _, err := e.m.EnsureImage(context.Background()); err == nil {
+		t.Error("EnsureImage succeeded after the image was dropped")
+	}
+	// sb-1 counts once: the node (1000m) is full.
+	_, err := e.create("sb-3", 1, spec(500, 256<<20))
+	wantCode(t, err, codes.ResourceExhausted, "third 500m sandbox")
+	_, err = e.create("sb-3", 1, &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_RESTORE})
+	wantCode(t, err, codes.FailedPrecondition, "forced RESTORE after the image was dropped")
+}
+
+func TestRestoreNotReadyFallsBack(t *testing.T) {
+	e, _ := restoreEnv(t, nil)
 	probes := 0
 	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
-		if ref.ID == "sb-2_1_" {
+		if ref.ID == "sb-1_1_" {
 			if probes++; probes == 1 {
-				return 1, nil
+				return 1, nil // the restored zygote does not answer
 			}
 		}
 		return 0, nil
 	}
-	if resp := e.mustCreate(t, "sb-2", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+	if resp := e.mustCreate(t, "sb-1", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
 		t.Errorf("not ready after restore: started_as = %v, want COLD", resp.GetStartedAs())
 	}
-	e.rt.ExecFunc = nil
+	if e.m.ImageReady() {
+		t.Error("ImageReady after a restored sandbox did not get ready")
+	}
+}
 
-	// A step the cold path shares does not fall back.
+// The readiness probe of a restored sandbox is bounded by
+// restoreReadyTimeout (5 s), not by the cold path's ReadyTimeout.
+func TestRestoreReadyBound(t *testing.T) {
+	if got := newEnv(t, nil).m.restoreReadyTimeout; got != 5*time.Second {
+		t.Errorf("restoreReadyTimeout = %v, want 5s", got)
+	}
+	e, _ := restoreEnv(t, nil)
+	e.m.restoreReadyTimeout = 50 * time.Millisecond
+	first := true
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		if ref.ID == "sb-1_1_" && first {
+			first = false
+			<-ctx.Done() // the restored zygote never answers
+			return -1, ctx.Err()
+		}
+		return 0, nil
+	}
+	begin := time.Now()
+	resp := e.mustCreate(t, "sb-1", 1, nil)
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Errorf("Create took %v; the restored probe should end after 50ms (ReadyTimeout is %v)", d, e.m.cfg.ReadyTimeout)
+	}
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("started_as = %v, want COLD", resp.GetStartedAs())
+	}
+}
+
+// A failure in a step the cold path shares neither falls back nor drops the
+// image; nor does a restore that ends because the caller went away.
+func TestRestoreFailureKeepsImage(t *testing.T) {
+	e, _ := restoreEnv(t, nil)
 	e.rt.Fail["Create"] = errors.New("create failed")
-	before = len(e.rt.Calls())
-	_, err := e.create("sb-3", 1, nil)
+	before := len(e.rt.Calls())
+	_, err := e.create("sb-1", 1, nil)
 	wantCode(t, err, codes.Internal, "create failure on the restore path")
-	if got, want := e.rt.Calls()[before:], []string{"Create id=sb-3_1_ net=none", "Delete id=sb-3_1_ net=none"}; !slices.Equal(got, want) {
+	if got, want := e.rt.Calls()[before:], []string{"Create id=sb-1_1_ net=none", "Delete id=sb-1_1_ net=none"}; !slices.Equal(got, want) {
 		t.Errorf("runtime calls = %q, want %q", got, want)
 	}
+	if !e.m.ImageReady() {
+		t.Error("a runsc create failure dropped the image")
+	}
 
-	// Forced RESTORE does not fall back.
-	e.rt.Fail["Restore"] = errors.New("restore failed")
+	e.rt.Delay["Restore"] = 5 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer cancel()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && !slices.Contains(e.rt.Calls(), "Restore id=sb-2_1_ net=none") {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
 	before = len(e.rt.Calls())
-	_, err = e.create("sb-4", 1, &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_RESTORE})
+	if _, err := e.m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "sb-2", Incarnation: 1}); err == nil {
+		t.Fatal("cancelled Create succeeded")
+	}
+	if got := e.rt.Calls()[before:]; slices.Contains(got, "Start id=sb-2_1_ net=none") {
+		t.Errorf("a cancelled Create fell back to cold: %q", got)
+	}
+	if !e.m.ImageReady() {
+		t.Error("a cancelled restore dropped the image")
+	}
+	delete(e.rt.Delay, "Restore")
+	if resp := e.mustCreate(t, "sb-3", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("started_as = %v, want RESTORE", resp.GetStartedAs())
+	}
+}
+
+func TestForcedRestoreFailure(t *testing.T) {
+	e, _ := restoreEnv(t, nil)
+	e.rt.Fail["Restore"] = errors.New("restore failed")
+	before := len(e.rt.Calls())
+	_, err := e.create("sb-1", 1, &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_RESTORE})
 	wantCode(t, err, codes.Internal, "forced RESTORE")
 	if !strings.Contains(err.Error(), "runsc.restore") || !strings.Contains(err.Error(), "restore failed") {
 		t.Errorf("error %v does not name the step and cause", err)
 	}
-	if got := e.rt.Calls()[before:]; slices.Contains(got, "Start id=sb-4_1_ net=none") {
+	if got := e.rt.Calls()[before:]; slices.Contains(got, "Start id=sb-1_1_ net=none") {
 		t.Errorf("forced RESTORE started cold: %q", got)
 	}
-	if _, ok := e.rt.Containers()["sb-4_1_"]; ok || exists(e.bundleDir("sb-4_1_")) || e.inTable("sb-4") {
-		t.Errorf("sb-4 not rolled back: containers %v", e.rt.Containers())
+	if _, ok := e.rt.Containers()["sb-1_1_"]; ok || exists(e.bundleDir("sb-1_1_")) || e.inTable("sb-1") {
+		t.Errorf("sb-1 not rolled back: containers %v", e.rt.Containers())
+	}
+	if e.m.ImageReady() {
+		t.Error("ImageReady after a failed forced restore")
+	}
+}
+
+// stuckDelete fails every Delete of one container while stuck is set.
+type stuckDelete struct {
+	runsc.Runtime
+	id    string
+	stuck atomic.Bool
+}
+
+func (s *stuckDelete) Delete(ctx context.Context, ref runsc.Ref) error {
+	if s.stuck.Load() && ref.ID == s.id {
+		return errors.New("delete failed")
+	}
+	return s.Runtime.Delete(ctx, ref)
+}
+
+// When the cleanup before the cold start fails, the Create fails and the
+// entry stays broken, holding its capacity until a retry removes it.
+func TestRestoreFallbackCleanupFails(t *testing.T) {
+	var sd *stuckDelete
+	e, _ := restoreEnv(t, func(c *Config, d *Deps) {
+		c.CPUMillis = 500
+		sd = &stuckDelete{Runtime: d.Runtime, id: "sb-1_1_"}
+		d.Runtime = sd
+	})
+	sd.stuck.Store(true)
+	e.rt.Fail["Restore"] = errors.New("restore failed")
+	_, err := e.create("sb-1", 1, spec(500, 256<<20))
+	wantCode(t, err, codes.Internal, "fallback with a failing cleanup")
+	if !strings.Contains(err.Error(), "cleanup") {
+		t.Errorf("error %v does not mention the cleanup", err)
+	}
+	if slices.Contains(e.rt.Calls(), "Start id=sb-1_1_ net=none") {
+		t.Errorf("cold start ran on a sandbox that was not cleaned up: %q", e.rt.Calls())
+	}
+	if !e.inTable("sb-1") || len(e.m.List()) != 0 {
+		t.Errorf("sb-1: in table %v, List %v; want broken (in the table, not listed)", e.inTable("sb-1"), e.m.List())
+	}
+	_, err = e.create("sb-2", 1, spec(500, 256<<20))
+	wantCode(t, err, codes.ResourceExhausted, "sb-2 while broken sb-1 holds the node")
+
+	sd.stuck.Store(false)
+	eventually(t, "the liveness loop to finish sb-1's teardown", func() bool { return !e.inTable("sb-1") })
+	if _, ok := e.rt.Containers()["sb-1_1_"]; ok {
+		t.Errorf("containers = %v", e.rt.Containers())
+	}
+	e.mustCreate(t, "sb-2", 1, spec(500, 256<<20))
+}
+
+// A node whose own image build failed picks up the image another agent on
+// the host builds, looking at most once per imageRecheck.
+func TestCreateFindsSiblingImage(t *testing.T) {
+	ck := t.TempDir()
+	a, _ := imageEnv(t, ck, nil)
+	a.rt.Fail["Checkpoint"] = errors.New("checkpoint failed")
+	a.start(t)
+	if a.m.ImageReady() {
+		t.Fatal("ImageReady after a failed build")
+	}
+	if resp := a.mustCreate(t, "sb-1", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("no image anywhere: started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	b, _ := imageEnv(t, ck, nil)
+	if _, err := b.m.EnsureImage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if resp := a.mustCreate(t, "sb-2", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("within %v of the last look: started_as = %v, want COLD", imageRecheck, resp.GetStartedAs())
+	}
+	a.clock.Set(t0.Add(imageRecheck))
+	if resp := a.mustCreate(t, "sb-3", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("after %v: started_as = %v, want RESTORE from the sibling's image", imageRecheck, resp.GetStartedAs())
+	}
+	if !a.m.ImageReady() {
+		t.Error("ImageReady = false after picking up the sibling's image")
 	}
 }
 
@@ -1117,10 +1282,7 @@ func TestNewManagerValidates(t *testing.T) {
 }
 
 func TestCreateSpans(t *testing.T) {
-	sr := tracetest.NewSpanRecorder()
-	prev := otel.GetTracerProvider()
-	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
-	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	sr := recordSpans(t)
 
 	e := startEnv(t, nil)
 	sr.Reset()
