@@ -9,7 +9,7 @@ RUN ?= .
 FORWARD_VARS := PKG RUN FORCE
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
-LINUX_TARGETS := build test-integration rootfs
+LINUX_TARGETS := build test-integration rootfs bench-start bench-throughput bench-density
 
 .PHONY: vm vm-stop vm-delete proto test lint sim $(LINUX_TARGETS)
 
@@ -47,6 +47,35 @@ test-integration:
 
 rootfs:
 	scripts/build-rootfs.sh
+
+# Benchmarks (spec section 10). Each one starts from a fresh cluster so runs do not
+# share state, and refuses to run with OTLP export on (spec call D25). start and
+# throughput use the default four nodes; density uses one large node with no warm pool.
+BENCH_NO_OTEL = if [ -n "$${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then \
+	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2; exit 1; fi
+DEFAULT_TOPOLOGY := env -u GSS_NODES -u GSS_NODE_CPU -u GSS_NODE_MEM -u GSS_NODE_MAX -u GSS_POOL
+DENSITY_TOPOLOGY := env GSS_NODES="a1:a:7101" GSS_NODE_CPU=64000 GSS_NODE_MEM=65536 GSS_NODE_MAX=200 GSS_POOL=0
+
+bench-start: build
+	@$(BENCH_NO_OTEL)
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh down
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh up
+	bin/loadgen start --out results/start.json
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh down
+
+bench-throughput: build
+	@$(BENCH_NO_OTEL)
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh down
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh up
+	bin/loadgen throughput --out results/throughput.json
+	$(DEFAULT_TOPOLOGY) scripts/cluster.sh down
+
+bench-density: build
+	@$(BENCH_NO_OTEL)
+	$(DENSITY_TOPOLOGY) scripts/cluster.sh down
+	$(DENSITY_TOPOLOGY) scripts/cluster.sh up
+	bin/loadgen density --out results/density.json
+	$(DENSITY_TOPOLOGY) scripts/cluster.sh down
 
 vm vm-stop vm-delete:
 	@echo "not needed on Linux"
