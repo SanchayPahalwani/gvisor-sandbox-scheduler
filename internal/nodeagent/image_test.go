@@ -552,3 +552,20 @@ func TestEnsureImageRemovedImage(t *testing.T) {
 		t.Errorf("no .complete in %s", dir)
 	}
 }
+
+// A drop of the image while EnsureImage is building (a concurrent Create
+// whose restore failed) is not undone when the build finishes.
+func TestEnsureImageKeepsConcurrentDrop(t *testing.T) {
+	e, _ := imageEnv(t, t.TempDir(), nil)
+	var once sync.Once
+	e.m.fsync = func(path string) error {
+		once.Do(func() { e.m.dropImage("runsc.restore", errors.New("restore failed")) })
+		return nil
+	}
+	if dir, err := e.m.EnsureImage(context.Background()); err == nil {
+		t.Errorf("EnsureImage = %q, nil; want an error after the image was dropped", dir)
+	}
+	if e.m.ImageReady() {
+		t.Error("ImageReady after a drop during the build")
+	}
+}

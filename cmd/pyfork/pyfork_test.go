@@ -651,13 +651,7 @@ func twoDraws(t *testing.T, prime, code string) (string, string) {
 }
 
 func TestNumpyRandomReseeded(t *testing.T) {
-	py, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not on PATH")
-	}
-	if out, err := exec.Command(py, "-c", "import numpy.random").CombinedOutput(); err != nil {
-		t.Skipf("numpy is not importable by the host python3 (%v: %s); the sandbox rootfs has it", err, strings.TrimSpace(string(out)))
-	}
+	numpyAvailable(t)
 	// numpy.random is primed explicitly: numpy 2 loads it lazily, and in the
 	// sandbox pandas loads it at import.
 	a, b := twoDraws(t, "numpy,numpy.random", "import numpy; print(numpy.random.randint(0, 2**62))")
@@ -670,5 +664,41 @@ func TestRandomReseeded(t *testing.T) {
 	a, b := twoDraws(t, "random", "import random; print(random.getrandbits(64))")
 	if a == b {
 		t.Errorf("two Execs drew the same random.getrandbits(64): %q", a)
+	}
+}
+
+// numpyAvailable skips the test unless the host python3 can import numpy.
+func numpyAvailable(t *testing.T) {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	if out, err := exec.Command(py, "-c", "import numpy.random").CombinedOutput(); err != nil {
+		t.Skipf("numpy is not importable by the host python3 (%v: %s); the sandbox rootfs has it", err, strings.TrimSpace(string(out)))
+	}
+}
+
+// The reseed happens once, in the worker before the code runs: a fork the
+// code makes itself keeps the state the code set.
+func TestNumpySeedCarriesIntoUserFork(t *testing.T) {
+	numpyAvailable(t)
+	sock := startZygotePrimed(t, "numpy,numpy.random")
+	code := `import os, numpy
+numpy.random.seed(7)
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.write(w, str(numpy.random.randint(0, 2**62)).encode())
+    os._exit(0)
+os.close(w)
+child = os.read(r, 64).decode()
+os.waitpid(pid, 0)
+parent = str(numpy.random.randint(0, 2**62))
+print(child == parent, child, parent)
+`
+	r := runWith(t, sock, input(code, 0, nil), 5*time.Second)
+	if r.code != 0 || !strings.HasPrefix(r.stdout, "True ") {
+		t.Errorf("code %d stdout %q stderr %q; want the child's first draw after seed(7) to equal the parent's (\"True ...\")", r.code, r.stdout, r.stderr)
 	}
 }

@@ -103,7 +103,7 @@ func (m *Manager) EnsureImage(ctx context.Context) (dir string, err error) {
 	m.mu.Unlock()
 	switch {
 	case bad:
-		return "", errors.New("nodeagent: a restore from the checkpoint image failed; restore is off until the agent restarts")
+		return "", errImageDropped
 	case closed:
 		return "", errors.New("nodeagent: EnsureImage after Close")
 	}
@@ -159,7 +159,9 @@ func (m *Manager) EnsureImage(ctx context.Context) (dir string, err error) {
 			}
 		}
 	}
-	m.setImage(dir)
+	if !m.setImage(dir) { // dropped while this call was building or waiting
+		return "", errImageDropped
+	}
 	return dir, nil
 }
 
@@ -173,10 +175,21 @@ func (m *Manager) image() string {
 	return m.imageDir
 }
 
-func (m *Manager) setImage(dir string) {
+// errImageDropped is EnsureImage's error once this manager dropped the image.
+var errImageDropped = errors.New("nodeagent: a restore from the checkpoint image failed; restore is off until the agent restarts")
+
+// setImage records dir as the image Creates restore from ("" for none) and
+// reports whether it did. Once the image was dropped (dropImage) it refuses
+// any dir but "", so a drop that came while EnsureImage was building is not
+// undone.
+func (m *Manager) setImage(dir string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if dir != "" && m.imageBad {
+		return false
+	}
 	m.imageDir = dir
+	return true
 }
 
 // restoreImage is the image a Create restores from, or "". A node that has
@@ -237,9 +250,11 @@ func (m *Manager) restoreSucceeded() {
 	m.readyFailures = 0
 }
 
-// dropImage turns restore off for good on this manager, so that it stops
-// paying for a bad image (step and err say what failed last); a new agent
-// builds or checks it again.
+// dropImage turns restore off on this manager until the agent restarts, so
+// that it stops paying for a bad image (step and err say what failed last).
+// The image stays on disk: a restarted agent adopts a published image
+// without checking it, and drops it again only after a restore of its own
+// fails the same way.
 func (m *Manager) dropImage(step string, err error) {
 	m.mu.Lock()
 	first := !m.imageBad
