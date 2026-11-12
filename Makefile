@@ -56,8 +56,10 @@ BENCH_NO_OTEL = if [ -n "$${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then \
 	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2; exit 1; fi; \
 	if command -v nerdctl >/dev/null 2>&1 && nerdctl ps --format '{{.Names}}' 2>/dev/null | grep -qx gss-obs; then \
 	echo "the gss-obs observability container is running; benchmarks run with observability off (spec call D25): make obs-down" >&2; exit 1; fi
-DEFAULT_TOPOLOGY := env -u GSS_NODES -u GSS_NODE_CPU -u GSS_NODE_MEM -u GSS_NODE_MAX -u GSS_POOL
-DENSITY_TOPOLOGY := env GSS_NODES="a1:a:7101" GSS_NODE_CPU=64000 GSS_NODE_MEM=65536 GSS_NODE_MAX=200 GSS_POOL=0
+# GSS_SCHED_ARGS is cleared too: these benchmarks use the default placement policy
+# (only the group-loss test runs spread, spec D35).
+DEFAULT_TOPOLOGY := env -u GSS_NODES -u GSS_NODE_CPU -u GSS_NODE_MEM -u GSS_NODE_MAX -u GSS_POOL -u GSS_SCHED_ARGS
+DENSITY_TOPOLOGY := env -u GSS_SCHED_ARGS GSS_NODES="a1:a:7101" GSS_NODE_CPU=64000 GSS_NODE_MEM=65536 GSS_NODE_MAX=200 GSS_POOL=0
 
 bench-start: build
 	@$(BENCH_NO_OTEL)

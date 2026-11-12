@@ -570,39 +570,73 @@ func TestDensityNeedsOneNode(t *testing.T) {
 }
 
 // A kept sandbox that the scheduler restarted (a new incarnation) is lost even though
-// Execs on it keep working: the step fails and the ramp stops.
+// Execs on it keep working; one whose GetSandbox fails is unconfirmed. Either fails the
+// step and stops the ramp, and the stop note says which.
 func TestDensityCountsLostSandbox(t *testing.T) {
-	f, c := densityFake(t)
-	bumped := false
-	f.tick = func(f *fake) {
-		// Step 10's first restore start makes 11 live: then sb-0 (kept since step 5)
-		// is restarted, as after an OOM-killed sentry.
-		if sb := f.live["sb-0"]; sb != nil && len(f.live) >= 11 && !bumped {
-			bumped = true
-			sb.Incarnation++
-		}
-	}
-	run, err := runDensity(context.Background(), c, densityConfigFor([]int{5, 10, 20}, 3), io.Discard)
-	if err != nil {
-		t.Fatalf("runDensity: %v", err)
-	}
-	if len(run.Rows) != 2 {
-		t.Fatalf("got %d rows, want 2 (step 10 lost a sandbox and stopped the ramp): %v", len(run.Rows), run.Rows)
-	}
-	if run.Rows[0]["lost"] != 0 || run.Rows[0]["failed"] != 0 {
-		t.Errorf("step 5 row = %v, want lost 0 and failed 0", run.Rows[0])
-	}
-	if run.Rows[1]["lost"] != 1 || run.Rows[1]["failed"] != 1 {
-		t.Errorf("step 10 row = %v, want lost 1 and failed 1", run.Rows[1])
-	}
-	if got := run.Scalars["max_live_within_2x"]; got != 5 {
-		t.Errorf("max_live_within_2x = %v, want 5", got)
-	}
-	if notes := strings.Join(run.Notes, "\n"); !strings.Contains(notes, "step 10") || !strings.Contains(notes, "lost") {
-		t.Errorf("notes do not say step 10 lost a sandbox: %q", run.Notes)
-	}
-	if f.liveCount() != 0 {
-		t.Errorf("%d sandboxes left live after the run", f.liveCount())
+	const lostWords, unconfirmedWords = "not READY at the incarnation they were created at", "not confirmed (GetSandbox failed)"
+	for _, tc := range []struct {
+		name                string
+		setup               func(f *fake)
+		lost, unconfirmed   int
+		wantNote, notInNote string
+	}{
+		{
+			name: "restarted",
+			setup: func(f *fake) {
+				bumped := false
+				f.tick = func(f *fake) {
+					// Step 10's first restore start makes 11 live: then sb-0 (kept since
+					// step 5) is restarted, as after an OOM-killed sentry.
+					if sb := f.live["sb-0"]; sb != nil && len(f.live) >= 11 && !bumped {
+						bumped = true
+						sb.Incarnation++
+					}
+				}
+			},
+			lost: 1, wantNote: lostWords, notInNote: unconfirmedWords,
+		},
+		{
+			name: "lookup fails",
+			setup: func(f *fake) {
+				// Step 5 makes 8 creates (5 kept, 3 restore starts); from step 10's check on,
+				// GetSandbox of sb-0 fails.
+				f.getErr = func(id string) error {
+					if id == "sb-0" && f.creates > 10 {
+						return status.Error(codes.Unavailable, "scheduler busy")
+					}
+					return nil
+				}
+			},
+			unconfirmed: 1, wantNote: unconfirmedWords, notInNote: lostWords,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := densityFake(t)
+			tc.setup(f)
+			run, err := runDensity(context.Background(), c, densityConfigFor([]int{5, 10, 20}, 3), io.Discard)
+			if err != nil {
+				t.Fatalf("runDensity: %v", err)
+			}
+			if len(run.Rows) != 2 {
+				t.Fatalf("got %d rows, want 2 (step 10 failed its check and stopped the ramp): %v", len(run.Rows), run.Rows)
+			}
+			if run.Rows[0]["lost"] != 0 || run.Rows[0]["unconfirmed"] != 0 || run.Rows[0]["failed"] != 0 {
+				t.Errorf("step 5 row = %v, want lost, unconfirmed and failed 0", run.Rows[0])
+			}
+			if run.Rows[1]["lost"] != tc.lost || run.Rows[1]["unconfirmed"] != tc.unconfirmed || run.Rows[1]["failed"] != 1 {
+				t.Errorf("step 10 row = %v, want lost %d, unconfirmed %d, failed 1", run.Rows[1], tc.lost, tc.unconfirmed)
+			}
+			if got := run.Scalars["max_live_within_2x"]; got != 5 {
+				t.Errorf("max_live_within_2x = %v, want 5", got)
+			}
+			stopped := run.Notes[0]
+			if !strings.Contains(stopped, "step 10") || !strings.Contains(stopped, tc.wantNote) || strings.Contains(stopped, tc.notInNote) {
+				t.Errorf("stop note %q: want step 10 and %q, not %q", stopped, tc.wantNote, tc.notInNote)
+			}
+			if f.liveCount() != 0 {
+				t.Errorf("%d sandboxes left live after the run", f.liveCount())
+			}
+		})
 	}
 }
 

@@ -20,9 +20,14 @@ if [[ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]]; then
 	echo "group-loss.sh: OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2
 	exit 1
 fi
-if command -v nerdctl >/dev/null 2>&1 && nerdctl ps --format '{{.Names}}' 2>/dev/null | grep -qx gss-obs; then
-	echo "group-loss.sh: the gss-obs observability container is running; benchmarks run with observability off (spec call D25): make obs-down" >&2
-	exit 1
+# The container list is read into a variable first: under pipefail, `nerdctl ps | grep -q`
+# can fail when grep exits on the first match and nerdctl dies of SIGPIPE.
+if command -v nerdctl >/dev/null 2>&1; then
+	containers=$(nerdctl ps --format '{{.Names}}' 2>/dev/null || true)
+	if grep -qx gss-obs <<<"$containers"; then
+		echo "group-loss.sh: the gss-obs observability container is running; benchmarks run with observability off (spec call D25): make obs-down" >&2
+		exit 1
+	fi
 fi
 
 cd "$repo"

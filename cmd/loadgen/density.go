@@ -178,30 +178,35 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 		}
 		// A kept sandbox that the scheduler restarted (its sentry OOM-killed, say) answers
 		// Execs again once the new incarnation is READY, so Exec success does not show the
-		// loss. Each kept sandbox must still be READY at the incarnation it was created at.
+		// loss. Each kept sandbox must still be READY at the incarnation it was created at;
+		// one whose GetSandbox fails cannot be confirmed, which fails the step as well.
 		for _, k := range kept {
 			sb, err := getSandbox(ctx, c, k.id)
 			if ctx.Err() != nil {
 				destroyKept()
 				return nil, ctx.Err()
 			}
-			if err == nil && (sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY || sb.GetIncarnation() != k.inc) {
-				err = fmt.Errorf("%s at incarnation %d, created at incarnation %d", sb.GetState(), sb.GetIncarnation(), k.inc)
-			}
-			if err != nil {
+			switch {
+			case err != nil:
+				st.unconfirmed++
+				fail("check of live sandbox "+k.id, err)
+			case sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY || sb.GetIncarnation() != k.inc:
 				st.lost++
-				fail("live sandbox "+k.id+" lost", err)
+				fail("live sandbox "+k.id+" lost", fmt.Errorf("%s at incarnation %d, created at incarnation %d", sb.GetState(), sb.GetIncarnation(), k.inc))
 			}
 		}
 		st.start, st.exec = bench.Summarize("start", "ms", startMS), bench.Summarize("exec", "ms", execMS)
 		steps = append(steps, st)
 		r.Rows = append(r.Rows, st.row())
-		fmt.Fprintf(log, "density step %d: live %d, start p95 %.1f ms, exec p95 %.1f ms, lost %d, failed %d\n",
-			step, st.live, st.start.P95, st.exec.P95, st.lost, st.failed)
+		fmt.Fprintf(log, "density step %d: live %d, start p95 %.1f ms, exec p95 %.1f ms, lost %d, unconfirmed %d, failed %d\n",
+			step, st.live, st.start.P95, st.exec.P95, st.lost, st.unconfirmed, st.failed)
 		if st.failed > 0 {
 			stopped = fmt.Sprintf("the ramp stopped at step %d (%d live) after %d failures", step, st.live, st.failed)
 			if st.lost > 0 {
 				stopped += fmt.Sprintf(", %d of them live sandboxes lost (not READY at the incarnation they were created at)", st.lost)
+			}
+			if st.unconfirmed > 0 {
+				stopped += fmt.Sprintf(", %d of them live sandboxes not confirmed (GetSandbox failed)", st.unconfirmed)
 			}
 			stopped += "; first: " + firstErr
 			break
@@ -223,7 +228,8 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 		`exec_* is Exec sent -> exit event of print("hello") in a live sandbox picked at random`,
 		"live is the number of sandboxes this run created and kept at that step",
 		"lost counts kept sandboxes that GetSandbox, after the step's measurements, did not show READY at the incarnation they were created at; a restarted sandbox answers Execs again, so Exec success alone would hide it",
-		"failed counts failed creates, restore starts and Execs at that step, and each lost sandbox",
+		"unconfirmed counts kept sandboxes whose GetSandbox call failed after the step's measurements, so their state is not known",
+		"failed counts failed creates, restore starts and Execs at that step, and each lost or unconfirmed sandbox",
 		"max_live_within_2x is the largest live count of a step with no failures and start_p95_ms <= 2 x baseline_start_p95_ms (the first step's)",
 		"node_mem_available_mib is MemAvailable from /proc/meminfo on the machine loadgen runs on (the VM that runs the node), read after the step's sandboxes were created",
 	}
@@ -238,6 +244,7 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 // densityStep is one step of the ramp.
 type densityStep struct {
 	step, live, lost, failed int
+	unconfirmed              int
 	start, exec              bench.Series // restore-start ready latency; Exec latency
 	memMiB                   float64
 	memOK                    bool
@@ -245,7 +252,7 @@ type densityStep struct {
 
 func (s densityStep) row() map[string]any {
 	row := map[string]any{
-		"step": s.step, "live": s.live, "lost": s.lost, "failed": s.failed,
+		"step": s.step, "live": s.live, "lost": s.lost, "unconfirmed": s.unconfirmed, "failed": s.failed,
 		"start_p50_ms": s.start.P50, "start_p95_ms": s.start.P95,
 		"exec_p50_ms": s.exec.P50, "exec_p95_ms": s.exec.P95,
 	}
@@ -313,14 +320,14 @@ func parseMemAvailableMiB(data []byte) (float64, error) {
 
 func printDensity(w io.Writer, r *bench.Run, out string) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "STEP\tLIVE\tSTART P50\tSTART P95\tEXEC P50\tEXEC P95\tLOST\tFAILED\tMEM AVAILABLE MIB")
+	fmt.Fprintln(tw, "STEP\tLIVE\tSTART P50\tSTART P95\tEXEC P50\tEXEC P95\tLOST\tUNCONFIRMED\tFAILED\tMEM AVAILABLE MIB")
 	for _, row := range r.Rows {
 		mem := "-"
 		if v, ok := row["node_mem_available_mib"].(float64); ok {
 			mem = fmt.Sprintf("%.0f", v)
 		}
-		fmt.Fprintf(tw, "%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%d\t%s\n", row["step"], row["live"],
-			row["start_p50_ms"], row["start_p95_ms"], row["exec_p50_ms"], row["exec_p95_ms"], row["lost"], row["failed"], mem)
+		fmt.Fprintf(tw, "%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%s\n", row["step"], row["live"],
+			row["start_p50_ms"], row["start_p95_ms"], row["exec_p50_ms"], row["exec_p95_ms"], row["lost"], row["unconfirmed"], row["failed"], mem)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
