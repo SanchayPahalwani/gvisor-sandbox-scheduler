@@ -3,9 +3,14 @@
 // root; on any other system, or without root, runsc or the sandbox rootfs,
 // it exits at once with a message saying why.
 //
+// One agent runs per state directory and per runsc root: each is locked
+// (<state-dir>/agent.lock, <runsc-root>.lock) before anything is touched.
+// The runsc root must be under /run/ and hold nothing runsc does not make.
+//
 // SIGINT or SIGTERM stops it: no new RPCs, every sandbox destroyed, the
-// node's network table removed, the runsc root removed. A second signal
-// during that ends the process at once.
+// node's network table removed, the runsc root and the node's cgroup
+// removed. A second signal during that, or during a failed start-up, ends
+// the process at once. A signal during start-up is a clean stop (exit 0).
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -159,6 +165,7 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	if o.runscRoot == "" {
 		o.runscRoot = "/run/gss/" + o.nodeID
 	}
+	o.runscRoot = filepath.Clean(o.runscRoot)
 	for _, p := range []struct{ flag, path string }{
 		{"--rootfs", o.rootfs}, {"--state-dir", o.stateDir}, {"--runsc-root", o.runscRoot}, {"--checkpoint-dir", o.checkpointDir},
 	} {
@@ -169,6 +176,11 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 			return fail("%s %q must be an absolute path other than /", p.flag, p.path)
 		}
 	}
+	// Start-up deletes every container under the runsc root and a clean
+	// shutdown removes it: keep it to a runtime directory.
+	if !strings.HasPrefix(o.runscRoot, "/run/") {
+		return fail("--runsc-root %q must be under /run/", o.runscRoot)
+	}
 	cidr, err := netip.ParsePrefix(egress)
 	if err != nil {
 		return fail("--egress-cidr: %v", err)
@@ -177,95 +189,164 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	return o, nil
 }
 
+// node is a node agent that has started.
+type node struct {
+	o         *options
+	rt        *runsc.CLI
+	cg        nodeagent.Cgroups
+	np        *netpolicy.Manager
+	m         *nodeagent.Manager
+	lis       net.Listener
+	advertise string
+	version   string     // runsc's
+	locks     []*os.File // held until the process ends
+}
+
 // run starts the node and serves until ctx ends (a signal) or the server
 // fails, then shuts the node down. stop restores the default signal
 // handling, so that a second signal ends the process.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("the node agent runs only on Linux (gVisor needs a Linux kernel), not on %s", runtime.GOOS)
-	}
-	if os.Geteuid() != 0 {
-		return errors.New("the node agent must run as root: runsc needs it for cgroups and namespaces")
-	}
-	runscPath, err := exec.LookPath(o.runsc)
+	n, err := start(ctx, stop, o)
 	if err != nil {
-		return fmt.Errorf("runsc not found (--runsc %q): %w", o.runsc, err)
-	}
-	if err := checkRootfs(o.rootfs); err != nil {
-		return err
-	}
-
-	sctx, cancel := context.WithTimeout(ctx, startTimeout)
-	defer cancel()
-	rt := runsc.NewCLI(runscPath, o.runscRoot)
-	version, err := rt.Version(sctx)
-	if err != nil {
-		return fmt.Errorf("runsc %s does not run: %w", runscPath, err)
-	}
-	lis, err := net.Listen("tcp", o.listen)
-	if err != nil {
-		return err
-	}
-	defer lis.Close() // the server closes it; this covers a failed start
-	advertise := o.advertise
-	if advertise == "" {
-		// The port actually listened on, also when --listen asked for port 0.
-		_, port, err := net.SplitHostPort(lis.Addr().String())
-		if err != nil {
-			return err
+		if ctx.Err() != nil {
+			slog.Info("node agent stopped during start-up", "node", o.nodeID, "err", err)
+			return nil
 		}
-		advertise = net.JoinHostPort("127.0.0.1", port)
-	}
-
-	// The network policy removes an earlier agent's namespaces and table
-	// before the manager starts sandboxes; it refuses to start when another
-	// node on this host owns the table or an overlapping range.
-	np, err := netpolicy.New(o.nodeID, o.egressCIDR, nil)
-	if err != nil {
 		return err
 	}
-	if err := np.Init(sctx); err != nil {
-		return err
-	}
-	m, err := nodeagent.NewManager(nodeagent.Config{
-		NodeID: o.nodeID, Group: o.group,
-		CPUMillis: o.cpuMillis, MemoryBytes: o.memoryBytes, MaxSandboxes: o.maxSandboxes,
-		RootFS: o.rootfs, StateDir: o.stateDir, CheckpointDir: o.checkpointDir,
-		WarmPoolSize: o.warmPoolSize,
-	}, nodeagent.Deps{Runtime: rt, Cgroups: nodeagent.NewCgroupFS(cgroupRoot), Net: np})
-	if err != nil {
-		return errors.Join(err, closeNet(np))
-	}
-	if err := m.Start(sctx); err != nil {
-		// Leftover containers may still be under the runsc root, so the
-		// root stays.
-		cctx, ccancel := context.WithTimeout(context.Background(), closeTimeout)
-		defer ccancel()
-		return errors.Join(err, m.Close(cctx), closeNet(np))
-	}
+	defer n.unlock()
 
 	srv := grpc.NewServer(nodeagent.ServerOptions()...)
-	gssv1.RegisterNodeServiceServer(srv, nodeagent.NewServer(m))
+	gssv1.RegisterNodeServiceServer(srv, nodeagent.NewServer(n.m))
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(lis) }()
+	go func() { served <- srv.Serve(n.lis) }()
 	slog.Info("node agent serving", "node", o.nodeID, "group", o.group,
-		"listen", lis.Addr().String(), "advertise", advertise, "runsc", version,
+		"listen", n.lis.Addr().String(), "advertise", n.advertise, "runsc", n.version,
 		"cpu_millis", o.cpuMillis, "memory_bytes", o.memoryBytes, "max_sandboxes", o.maxSandboxes,
 		"warm_pool_size", o.warmPoolSize, "checkpoint_dir", o.checkpointDir, "egress_cidr", o.egressCIDR.String())
 
 	var serveErr error
 	select {
 	case <-ctx.Done():
-		stop()
 		slog.Info("node agent shutting down", "node", o.nodeID)
 	case serveErr = <-served:
 		serveErr = fmt.Errorf("serve: %w", serveErr)
 	}
-	err = errors.Join(serveErr, shutdown(srv, m, np, rt))
-	if err == nil {
-		slog.Info("node agent stopped", "node", o.nodeID)
+	stop()
+	if err := errors.Join(serveErr, n.shutdown(srv)); err != nil {
+		return err
 	}
-	return err
+	slog.Info("node agent stopped", "node", o.nodeID)
+	return nil
+}
+
+// start brings the node up to the point of serving. On failure it restores
+// the default signal handling (stop), so that a second signal ends the
+// process, and undoes what it did, last step first.
+func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, err error) {
+	var undo []func() error
+	defer func() {
+		if err == nil {
+			return
+		}
+		stop()
+		for i := len(undo) - 1; i >= 0; i-- {
+			err = errors.Join(err, undo[i]())
+		}
+	}()
+
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("the node agent runs only on Linux (gVisor needs a Linux kernel), not on %s", runtime.GOOS)
+	}
+	if os.Geteuid() != 0 {
+		return nil, errors.New("the node agent must run as root: runsc needs it for cgroups and namespaces")
+	}
+	runscPath, err := exec.LookPath(o.runsc)
+	if err != nil {
+		return nil, fmt.Errorf("runsc not found (--runsc %q): %w", o.runsc, err)
+	}
+	if err := checkRootfs(o.rootfs); err != nil {
+		return nil, err
+	}
+
+	// Building the runtime, the network policy and the manager touches
+	// nothing on the host, so a configuration they refuse leaves no trace.
+	n := &node{o: o, rt: runsc.NewCLI(runscPath, o.runscRoot), cg: nodeagent.NewCgroupFS(cgroupRoot)}
+	if n.np, err = netpolicy.New(o.nodeID, o.egressCIDR, nil); err != nil {
+		return nil, err
+	}
+	n.m, err = nodeagent.NewManager(nodeagent.Config{
+		NodeID: o.nodeID, Group: o.group,
+		CPUMillis: o.cpuMillis, MemoryBytes: o.memoryBytes, MaxSandboxes: o.maxSandboxes,
+		RootFS: o.rootfs, StateDir: o.stateDir, CheckpointDir: o.checkpointDir,
+		WarmPoolSize: o.warmPoolSize,
+	}, nodeagent.Deps{Runtime: n.rt, Cgroups: n.cg, Net: n.np})
+	if err != nil {
+		return nil, err
+	}
+
+	// One agent per state directory and per runsc root, before anything
+	// else is touched.
+	for _, path := range []string{filepath.Join(o.stateDir, "agent.lock"), o.runscRoot + ".lock"} {
+		f, lerr := lockFile(path)
+		if lerr != nil {
+			return nil, lerr
+		}
+		n.locks = append(n.locks, f)
+		undo = append(undo, f.Close)
+	}
+	// The manager's start deletes every container under the runsc root and
+	// a clean shutdown removes the root: it must be runsc's own.
+	if err := n.rt.CheckRoot(); err != nil {
+		return nil, fmt.Errorf("--runsc-root: %w", err)
+	}
+
+	sctx, cancel := context.WithTimeout(ctx, startTimeout)
+	defer cancel()
+	if n.version, err = n.rt.Version(sctx); err != nil {
+		return nil, fmt.Errorf("runsc %s does not run: %w", runscPath, err)
+	}
+	if n.lis, err = net.Listen("tcp", o.listen); err != nil {
+		return nil, err
+	}
+	undo = append(undo, func() error {
+		n.lis.Close()
+		return nil
+	})
+	n.advertise = o.advertise
+	if n.advertise == "" {
+		// The port actually listened on, also when --listen asked for port 0.
+		_, port, err := net.SplitHostPort(n.lis.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		n.advertise = net.JoinHostPort("127.0.0.1", port)
+	}
+
+	// The network policy removes an earlier agent's namespaces and table
+	// before the manager starts sandboxes; it refuses to start when another
+	// node on this host owns the table or an overlapping range.
+	if err := n.np.Init(sctx); err != nil {
+		return nil, err
+	}
+	undo = append(undo, func() error { return closeNet(n.np) })
+	// After a failed Start leftover containers may still be under the runsc
+	// root, so the root stays.
+	undo = append(undo, func() error {
+		cctx, ccancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer ccancel()
+		return n.m.Close(cctx)
+	})
+	if err := n.m.Start(sctx); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (n *node) unlock() {
+	for _, f := range n.locks {
+		f.Close()
+	}
 }
 
 // checkRootfs fails unless dir holds the zygote and pyfork that every
@@ -280,13 +361,13 @@ func checkRootfs(dir string) error {
 }
 
 // shutdown stops the node in order: no new RPCs, the sandboxes destroyed,
-// the network policy closed, the runsc root removed.
+// the network policy closed, the runsc root and the node's cgroup removed.
 //
 // GracefulStop refuses new RPCs at once and then waits for the ones in
 // flight. Those end while Manager.Close runs: it waits for Creates in flight
 // and ends every Exec of a sandbox it destroys. An RPC still open
 // drainTimeout after that is cancelled.
-func shutdown(srv *grpc.Server, m *nodeagent.Manager, np *netpolicy.Manager, rt *runsc.CLI) error {
+func (n *node) shutdown(srv *grpc.Server) error {
 	drained := make(chan struct{})
 	go func() {
 		srv.GracefulStop()
@@ -294,7 +375,7 @@ func shutdown(srv *grpc.Server, m *nodeagent.Manager, np *netpolicy.Manager, rt 
 	}()
 	var errs []error
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-	if err := m.Close(ctx); err != nil {
+	if err := n.m.Close(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("destroy sandboxes: %w", err))
 	}
 	cancel()
@@ -304,26 +385,33 @@ func shutdown(srv *grpc.Server, m *nodeagent.Manager, np *netpolicy.Manager, rt 
 		srv.Stop()
 		<-drained
 	}
-	if err := closeNet(np); err != nil {
+	if err := closeNet(n.np); err != nil {
 		errs = append(errs, err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
-	// RemoveRoot only when no container is left: a sandbox whose teardown
-	// failed may still be running from it.
-	ids, err := rt.List(ctx)
+	// The root and the cgroup go only when no container is left: a sandbox
+	// whose teardown failed may still be running from them.
+	ids, err := n.rt.List(ctx)
 	switch {
 	case err != nil:
-		errs = append(errs, fmt.Errorf("runsc root %s left in place: %w", rt.Root, err))
+		errs = append(errs, fmt.Errorf("runsc root %s and node cgroup left in place: %w", n.rt.Root, err))
 	case len(ids) > 0:
-		errs = append(errs, fmt.Errorf("runsc root %s left in place: containers %q are still there", rt.Root, ids))
+		errs = append(errs, fmt.Errorf("runsc root %s and node cgroup left in place: containers %q are still there", n.rt.Root, ids))
 	default:
-		if err := rt.RemoveRoot(ctx); err != nil {
+		if err := n.rt.RemoveRoot(ctx); err != nil {
 			errs = append(errs, err)
+		}
+		if err := n.cg.Remove(nodeCgroup(n.o.nodeID)); err != nil {
+			errs = append(errs, fmt.Errorf("remove the node cgroup: %w", err))
 		}
 	}
 	return errors.Join(errs...)
 }
+
+// nodeCgroup is the parent of every sandbox cgroup of the node (the
+// "/gss/<node-id>" of bundle.CgroupPath).
+func nodeCgroup(nodeID string) string { return "/gss/" + nodeID }
 
 // closeNet closes the network policy, bounded by closeTimeout.
 func closeNet(np *netpolicy.Manager) error {

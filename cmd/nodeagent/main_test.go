@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"runtime"
@@ -33,6 +34,15 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" {
 		t.Errorf("checkpoint dir %q, pool %d, listen %q", o.checkpointDir, o.warmPoolSize, o.listen)
 	}
+
+	// The lock file sits next to the root, so the root is kept clean.
+	o, err = parseFlags([]string{"--node-id=n1", "--runsc-root=/run/gss/other/"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.runscRoot != "/run/gss/other" {
+		t.Errorf("runsc root %q, want /run/gss/other", o.runscRoot)
+	}
 }
 
 func TestParseFlagsRejects(t *testing.T) {
@@ -54,6 +64,9 @@ func TestParseFlagsRejects(t *testing.T) {
 		{[]string{"--node-id", "n1", "--warm-pool-size", "-1"}, "--warm-pool-size"},
 		{[]string{"--node-id", "n1", "--state-dir", "rel/dir"}, "--state-dir"},
 		{[]string{"--node-id", "n1", "--runsc-root", "/"}, "--runsc-root"},
+		{[]string{"--node-id", "n1", "--runsc-root", "/var/lib/gss"}, "under /run/"}, // a clean shutdown removes it
+		{[]string{"--node-id", "n1", "--runsc-root", "/run"}, "under /run/"},
+		{[]string{"--node-id", "n1", "--runsc-root", "/run/../var/lib"}, "under /run/"},
 		{[]string{"--node-id", "n1", "--egress-cidr", "10.200.0.0"}, "--egress-cidr"},
 		{[]string{"--node-id", "n1", "extra"}, "unexpected arguments"},
 	} {
@@ -83,8 +96,34 @@ func TestRunRefusesWithoutLinuxOrRoot(t *testing.T) {
 	default:
 		t.Skip("running as root on Linux")
 	}
-	err = run(context.Background(), func() {}, o)
+	stopped := false
+	err = run(context.Background(), func() { stopped = true }, o)
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("run = %v, want an error saying it %s", err, want)
+	}
+	if !stopped {
+		t.Error("a failed start did not restore the default signal handling")
+	}
+}
+
+// TestRunStoppedDuringStartUp: a signal during start-up is a clean stop.
+func TestRunStoppedDuringStartUp(t *testing.T) {
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		t.Skip("as root on Linux the start-up would touch the host")
+	}
+	o, err := parseFlags([]string{"--node-id", "n1"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(ctx, func() {}, o); err != nil {
+		t.Errorf("run with the signal context done = %v, want nil (exit 0)", err)
+	}
+	if !strings.Contains(logs.String(), `msg="node agent stopped during start-up"`) {
+		t.Errorf("log %q has no stopped-during-start-up line", logs.String())
 	}
 }

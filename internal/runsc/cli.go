@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,9 @@ const execStateTimeout = 5 * time.Second
 type CLI struct {
 	Binary string // default "runsc"
 	Root   string // runsc --root
+
+	mu   sync.Mutex
+	seen map[string]bool // container IDs passed to Create or returned by List
 }
 
 var _ Runtime = (*CLI)(nil)
@@ -126,6 +130,7 @@ func (c *CLI) Create(ctx context.Context, ref Ref, bundleDir string, logPath str
 	if err := checkRef(ref); err != nil {
 		return err
 	}
+	c.remember(ref.ID) // for RemoveRoot, even if create fails half way
 	log, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("runsc create: open log: %w", err)
@@ -354,7 +359,9 @@ func (c *CLI) List(ctx context.Context) ([]string, error) {
 	if err := c.run(ctx, "list", c.listArgs(), &out); err != nil {
 		return nil, err
 	}
-	return parseList(out.Bytes()), nil
+	ids := parseList(out.Bytes())
+	c.remember(ids...)
+	return ids, nil
 }
 
 func (c *CLI) Version(ctx context.Context) (string, error) {
@@ -369,23 +376,126 @@ func (c *CLI) Version(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// RemoveRoot unmounts the null-netns bind mount runsc leaves in the root
-// directory, then removes the directory. A missing root is not an error.
-// Call it only after every container under the root was deleted.
+// nullNetns is the file in the root that runsc bind-mounts a network
+// namespace on (seen with --network=none).
+const nullNetns = "null-netns"
+
+// umount unmounts path; tests replace it.
+var umount = func(ctx context.Context, path string) error {
+	if out, err := exec.CommandContext(ctx, "umount", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("umount %s: %w: %s", path, err, tail(out))
+	}
+	return nil
+}
+
+func (c *CLI) remember(ids ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = map[string]bool{}
+	}
+	for _, id := range ids {
+		c.seen[id] = true
+	}
+}
+
+// containers returns the container IDs a root directory with entries ents
+// is known to hold things for: those this CLI created or listed, and those
+// named by a state file ("<container>_sandbox:<sandbox>.state").
+func (c *CLI) containers(ents []os.DirEntry) map[string]bool {
+	ids := map[string]bool{}
+	c.mu.Lock()
+	for id := range c.seen {
+		ids[id] = true
+	}
+	c.mu.Unlock()
+	for _, e := range ents {
+		if name, ok := strings.CutSuffix(e.Name(), ".state"); ok && !e.IsDir() {
+			if id, _, ok := strings.Cut(name, "_sandbox:"); ok {
+				ids[id] = true
+			}
+		}
+	}
+	return ids
+}
+
+// runscEntry reports whether e, an entry of the root, is one runsc makes
+// there: null-netns, a "*.state" or "*.lock" file, or a directory named
+// after a container in containers.
+func runscEntry(e os.DirEntry, containers map[string]bool) bool {
+	name := e.Name()
+	if e.IsDir() {
+		return containers[name]
+	}
+	return name == nullNetns || strings.HasSuffix(name, ".state") || strings.HasSuffix(name, ".lock")
+}
+
+// CheckRoot returns an error naming every entry of the root that runsc does
+// not make there (see runscEntry), so that a root that is the wrong
+// directory is neither used nor removed. A missing root is fine.
+func (c *CLI) CheckRoot() error {
+	ents, err := os.ReadDir(c.Root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("runsc: root %s: %w", c.Root, err)
+	}
+	known := c.containers(ents)
+	var foreign []string
+	for _, e := range ents {
+		if !runscEntry(e, known) {
+			foreign = append(foreign, e.Name())
+		}
+	}
+	if len(foreign) > 0 {
+		return fmt.Errorf("runsc: root %s holds entries runsc does not make: %q", c.Root, foreign)
+	}
+	return nil
+}
+
+// RemoveRoot removes the root directory and what runsc keeps in it, and
+// nothing else: it unmounts and removes null-netns, removes the "*.state"
+// and "*.lock" files and the directories named after a container (one this
+// CLI created or listed, or one a state file names), and then removes the
+// directory itself, which fails, naming what is left, if anything else is
+// in it. A missing root is not an error. Call it only after every
+// container under the root was deleted.
 func (c *CLI) RemoveRoot(ctx context.Context) error {
 	if c.Root == "" || filepath.Clean(c.Root) == "/" {
 		return fmt.Errorf("runsc: refusing to remove root %q", c.Root)
 	}
-	var umountErr error
-	netns := filepath.Join(c.Root, "null-netns")
-	if _, err := os.Lstat(netns); err == nil {
-		if out, err := exec.CommandContext(ctx, "umount", netns).CombinedOutput(); err != nil {
-			// Not mounted is fine; RemoveAll below reports a mount that stayed.
-			umountErr = fmt.Errorf("umount %s: %w: %s", netns, err, tail(out))
+	ents, err := os.ReadDir(c.Root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("runsc: remove root: %w", err)
+	}
+	known := c.containers(ents)
+	var errs, left []string
+	for _, e := range ents {
+		if !runscEntry(e, known) {
+			left = append(left, e.Name())
+			continue
+		}
+		p := filepath.Join(c.Root, e.Name())
+		var umountErr error
+		if e.Name() == nullNetns {
+			// Not mounted is fine; the Remove below fails on a mount that stayed.
+			umountErr = umount(ctx, p)
+		}
+		if err := os.RemoveAll(p); err != nil {
+			errs = append(errs, errors.Join(umountErr, err).Error())
 		}
 	}
-	if err := os.RemoveAll(c.Root); err != nil {
-		return errors.Join(umountErr, fmt.Errorf("runsc: remove root: %w", err))
+	if len(left) > 0 {
+		errs = append(errs, fmt.Sprintf("it holds entries runsc does not make, left in place: %q", left))
+	} else if err := os.Remove(c.Root); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("runsc: root %s not removed: %s", c.Root, strings.Join(errs, "; "))
 	}
 	return nil
 }

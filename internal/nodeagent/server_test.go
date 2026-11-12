@@ -32,7 +32,9 @@ func dialServer(t *testing.T, srv gssv1.NodeServiceServer) gssv1.NodeServiceClie
 	go func() { _ = s.Serve(lis) }()
 	conn, err := grpc.NewClient("passthrough:///bufconn",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// What the scheduler's node client sets.
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(MaxMessageBytes), grpc.MaxCallRecvMsgSize(MaxMessageBytes)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +75,15 @@ func echoExec(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error)
 	return 0, nil
 }
 
-// serverEnv starts a manager with echoExec and returns a client of its
-// NodeService and the server's log.
-func serverEnv(t *testing.T) (*env, gssv1.NodeServiceClient, *syncBuffer) {
+// serverEnv starts a manager whose runtime runs fn (nil: echoExec) and
+// returns a client of its NodeService and the server's log.
+func serverEnv(t *testing.T, fn func(context.Context, runsc.Ref, runsc.ExecSpec) (int, error)) (*env, gssv1.NodeServiceClient, *syncBuffer) {
 	t.Helper()
 	e := newEnv(t, nil)
 	e.rt.ExecFunc = echoExec
+	if fn != nil {
+		e.rt.ExecFunc = fn
+	}
 	e.start(t)
 	logs := &syncBuffer{}
 	srv := NewServer(e.m).(*server)
@@ -112,7 +117,7 @@ func recvAll(stream grpc.ServerStreamingClient[gssv1.ExecEvent]) ([]string, erro
 }
 
 func TestServerCreateExecDestroy(t *testing.T) {
-	e, c, _ := serverEnv(t)
+	e, c, _ := serverEnv(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -156,7 +161,7 @@ func TestServerCreateExecDestroy(t *testing.T) {
 }
 
 func TestServerStatusCodes(t *testing.T) {
-	_, c, _ := serverEnv(t)
+	_, c, _ := serverEnv(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -186,8 +191,42 @@ func TestServerStatusCodes(t *testing.T) {
 	wantCode(t, err, codes.InvalidArgument, "Exec with no command")
 }
 
+// TestServerLargeMessage: python_code above gRPC's default 4 MiB limit
+// reaches the manager.
+func TestServerLargeMessage(t *testing.T) {
+	code := "#" + strings.Repeat("x", 5<<20-1)
+	got := make(chan int, 1)
+	_, c, _ := serverEnv(t, func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		b, err := io.ReadAll(s.Stdin)
+		if _, rest, ok := bytes.Cut(b, []byte("\n")); ok && len(b) > len(readyProbe) {
+			got <- len(rest) // the code, after pyfork's header line
+		}
+		return 0, err
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.CreateSandbox(ctx, &gssv1.NodeCreateRequest{SandboxId: "sb-1", Incarnation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := c.Exec(ctx, pyReq("sb-1", code))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evs, err := recvAll(stream); err != nil {
+		t.Fatalf("Exec of %d bytes of python_code: %v (events %q)", len(code), err, evs)
+	}
+	select {
+	case n := <-got:
+		if n != len(code) {
+			t.Errorf("the runtime got %d bytes of code, want %d", n, len(code))
+		}
+	default:
+		t.Error("the Exec never reached the runtime")
+	}
+}
+
 func TestServerLogs(t *testing.T) {
-	_, c, logs := serverEnv(t)
+	_, c, logs := serverEnv(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

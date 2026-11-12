@@ -205,8 +205,10 @@ func fakeRunsc(t *testing.T) *CLI {
 	script := `#!/bin/sh
 for a in "$@"; do last=$a; done
 sub=""
-for a in "$@"; do case $a in exec|state|start|kill|delete|checkpoint) sub=$a; break;; esac; done
+for a in "$@"; do case $a in exec|state|start|kill|delete|checkpoint|list) sub=$a; break;; esac; done
 case "$sub" in
+list)
+	echo listed-1; exit 0;;
 state)
 	case "$last" in
 	ab) echo '{"id":"abc","status":"running","pid":7}';;
@@ -505,5 +507,131 @@ func TestSameWriterUncomparable(t *testing.T) {
 	if code, err := c.Exec(context.Background(), Ref{ID: "sb1", Network: NetworkNone},
 		ExecSpec{Args: []string{"exit3"}, Stdout: a, Stderr: b}); code != 3 || err != nil {
 		t.Errorf("Exec with uncomparable writers = %d, %v", code, err)
+	}
+}
+
+// fakeUmount replaces umount for the test and returns the paths it was
+// called with.
+func fakeUmount(t *testing.T) *[]string {
+	t.Helper()
+	var calls []string
+	old := umount
+	umount = func(ctx context.Context, path string) error {
+		calls = append(calls, path)
+		return nil
+	}
+	t.Cleanup(func() { umount = old })
+	return &calls
+}
+
+// makeEntries creates files in dir; a name ending in "/" is a directory.
+func makeEntries(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		var err error
+		if strings.HasSuffix(n, "/") {
+			err = os.MkdirAll(p, 0o700)
+		} else {
+			err = os.WriteFile(p, nil, 0o600)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func entryNames(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range ents {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
+func TestRemoveRoot(t *testing.T) {
+	umounts := fakeUmount(t)
+	c := fakeRunsc(t)
+	ctx := context.Background()
+	if ids, err := c.List(ctx); err != nil || !reflect.DeepEqual(ids, []string{"listed-1"}) {
+		t.Fatalf("List = %q, %v", ids, err)
+	}
+	// The fake fails create, but runsc may have made something for it.
+	if err := c.Create(ctx, Ref{ID: "made-1", Network: NetworkNone}, "/b", filepath.Join(t.TempDir(), "log")); err == nil {
+		t.Fatal("fake create succeeded")
+	}
+	makeEntries(t, c.Root,
+		"a_sandbox:a.state", "a_sandbox:a.lock", "runsc.lock", "null-netns",
+		"a/", "a/x", // named after the container of a state file
+		"listed-1/", "listed-1/y", "made-1/") // named after containers this CLI listed or created
+	if err := c.RemoveRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.Root); !os.IsNotExist(err) {
+		t.Errorf("root %s after RemoveRoot: %v, want it gone", c.Root, err)
+	}
+	if want := []string{filepath.Join(c.Root, "null-netns")}; !reflect.DeepEqual(*umounts, want) {
+		t.Errorf("umount calls %q, want %q", *umounts, want)
+	}
+}
+
+// TestRemoveRootKeepsForeignEntries: a root that is the wrong directory
+// loses only what runsc would have put there, and stays.
+func TestRemoveRootKeepsForeignEntries(t *testing.T) {
+	fakeUmount(t)
+	c := NewCLI("", t.TempDir())
+	makeEntries(t, c.Root, "a_sandbox:a.state", "notes.txt", "data/", "data/f", "x.state/", "x.state/f")
+	err := c.RemoveRoot(context.Background())
+	if err == nil {
+		t.Fatal("RemoveRoot of a root with foreign entries: want error")
+	}
+	for _, name := range []string{"notes.txt", "data", "x.state"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("error %q does not name %s", err, name)
+		}
+	}
+	if got, want := entryNames(t, c.Root), []string{"data", "notes.txt", "x.state"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("root holds %q after RemoveRoot, want %q", got, want)
+	}
+	if got := entryNames(t, filepath.Join(c.Root, "data")); !reflect.DeepEqual(got, []string{"f"}) {
+		t.Errorf("data/ holds %q, want [f]", got)
+	}
+}
+
+func TestRemoveRootMissingOrRefused(t *testing.T) {
+	if err := NewCLI("", filepath.Join(t.TempDir(), "none")).RemoveRoot(context.Background()); err != nil {
+		t.Errorf("RemoveRoot of a missing root = %v, want nil", err)
+	}
+	for _, root := range []string{"", "/", "//"} {
+		if err := NewCLI("", root).RemoveRoot(context.Background()); err == nil {
+			t.Errorf("RemoveRoot of %q: want error", root)
+		}
+	}
+}
+
+func TestCheckRoot(t *testing.T) {
+	missing := NewCLI("", filepath.Join(t.TempDir(), "none"))
+	if err := missing.CheckRoot(); err != nil {
+		t.Errorf("CheckRoot of a missing root = %v, want nil", err)
+	}
+	c := NewCLI("", t.TempDir())
+	makeEntries(t, c.Root, "a_sandbox:a.state", "a_sandbox:a.lock", "runsc.lock", "null-netns", "a/")
+	if err := c.CheckRoot(); err != nil {
+		t.Errorf("CheckRoot of runsc's own entries = %v, want nil", err)
+	}
+	makeEntries(t, c.Root, "notes.txt", "b/")
+	err := c.CheckRoot()
+	if err == nil || !strings.Contains(err.Error(), `"b"`) || !strings.Contains(err.Error(), `"notes.txt"`) {
+		t.Errorf("CheckRoot with foreign entries = %v, want an error naming b and notes.txt", err)
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	makeEntries(t, filepath.Dir(file), "file")
+	if err := NewCLI("", file).CheckRoot(); err == nil {
+		t.Error("CheckRoot of a root that is a file: want error")
 	}
 }

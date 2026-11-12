@@ -7,13 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io/fs"
-	"math/big"
-	"net"
-	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,7 +18,6 @@ import (
 	"time"
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
-	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/netpolicy"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/testenv"
 )
@@ -289,175 +283,6 @@ func TestRealSandboxProcessDeath(t *testing.T) {
 	t.Errorf("cgroup %s of the dead sandbox is still there", n.cgroupDir(rid))
 }
 
-// The egress target of TestRealEgressSandbox: the fixture of
-// internal/netpolicy's integration test, with the same names, so that each
-// test removes what the other may have left.
-const (
-	targetNS   = "gss-test-target"
-	targetVeth = "gsstgt0"
-	targetHost = "10.210.0.1"
-	targetAddr = "10.210.0.2"
-)
-
-func mustRun(t *testing.T, name string, args ...string) string {
-	t.Helper()
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s %s: %v: %s", name, strings.Join(args, " "), err, out)
-	}
-	return string(out)
-}
-
-// egressTarget creates the target namespace, joined to the host by a veth,
-// with HTTP servers on targetAddr:8080 and :8081.
-func egressTarget(t *testing.T) {
-	t.Helper()
-	cleanup := func() {
-		_ = exec.Command("ip", "netns", "del", targetNS).Run()
-		_ = exec.Command("ip", "link", "del", targetVeth).Run()
-	}
-	cleanup()
-	t.Cleanup(cleanup)
-	mustRun(t, "ip", "netns", "add", targetNS)
-	mustRun(t, "ip", "link", "add", targetVeth, "type", "veth", "peer", "name", "eth0", "netns", targetNS)
-	mustRun(t, "ip", "addr", "add", targetHost+"/30", "dev", targetVeth)
-	mustRun(t, "ip", "link", "set", targetVeth, "up")
-	mustRun(t, "ip", "-n", targetNS, "addr", "add", targetAddr+"/30", "dev", "eth0")
-	mustRun(t, "ip", "-n", targetNS, "link", "set", "eth0", "up")
-	mustRun(t, "ip", "-n", targetNS, "link", "set", "lo", "up")
-	mustRun(t, "ip", "-n", targetNS, "route", "add", "default", "via", targetHost, "dev", "eth0")
-	for _, port := range []string{"8080", "8081"} {
-		cmd := exec.Command("ip", "netns", "exec", targetNS, "python3", "-m", "http.server", port, "--bind", "0.0.0.0")
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start http.server %s: %v", port, err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			c, err := net.DialTimeout("tcp", net.JoinHostPort(targetAddr, port), time.Second)
-			if err == nil {
-				c.Close()
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("http.server on %s:%s did not answer: %v", targetAddr, port, err)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
-// egressPolicy returns a real network policy for node, initialised on a
-// random 10.208.<n>.0/24 and closed at cleanup. It resolves target.test to
-// targetAddr and no other name.
-func egressPolicy(t *testing.T, node string) *netpolicy.Manager {
-	t.Helper()
-	n, err := rand.Int(rand.Reader, big.NewInt(256))
-	if err != nil {
-		t.Fatal(err)
-	}
-	np, err := netpolicy.New(node, netip.MustParsePrefix(fmt.Sprintf("10.208.%d.0/24", n.Int64())), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	np.SetResolver(func(ctx context.Context, host string) ([]netip.Addr, error) {
-		if host == "target.test" {
-			return []netip.Addr{netip.MustParseAddr(targetAddr)}, nil
-		}
-		return nil, fmt.Errorf("no such host %q", host)
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := np.Init(ctx); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := np.Close(ctx); err != nil {
-			t.Errorf("netpolicy Close: %v", err)
-		}
-	})
-	return np
-}
-
-// connectCode is python_code that tries a TCP connection to addr:port and
-// prints "connected", "timeout" or "error <reason>".
-func connectCode(addr string, port int) string {
-	return fmt.Sprintf(`import socket
-s = socket.socket()
-s.settimeout(2)
-try:
-    s.connect((%q, %d))
-    print("connected")
-except socket.timeout:
-    print("timeout")
-except OSError as e:
-    print("error", e)
-`, addr, port)
-}
-
-func TestRealEgressSandbox(t *testing.T) {
-	n := newRealNode(t)
-	egressTarget(t)
-	np := egressPolicy(t, n.id)
-	m := n.managerNet(t, np)
-	t.Cleanup(func() { // before np's Close: the manager's teardowns use it
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-		if err := m.Close(ctx); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	egress := &gssv1.SandboxSpec{EgressAllow: []string{targetAddr + ":8080", "target.test:8080"}}
-	if _, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "eg-1", Incarnation: 1, Spec: egress}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "none-1", Incarnation: 1}); err != nil {
-		t.Fatal(err)
-	}
-
-	get := pyReq("eg-1", `import urllib.request
-print(urllib.request.urlopen("http://target.test:8080/", timeout=5).status)`)
-	r := runExec(ctx, m, get, nil)
-	if exit := r.ok(t, "GET http://target.test:8080/"); exit.GetCode() != 0 || r.stdout.String() != "200\n" {
-		t.Errorf("GET http://target.test:8080/: exit %v, stdout %q, stderr %q; want 0 and \"200\\n\"", exit, r.stdout.String(), r.stderr.String())
-	}
-	r = runExec(ctx, m, pyReq("eg-1", connectCode(targetAddr, 8081)), nil)
-	if r.ok(t, "connect to 8081"); strings.TrimSpace(r.stdout.String()) != "timeout" {
-		t.Errorf("%s:8081 (not allowed): %q (stderr %q), want timeout", targetAddr, r.stdout.String(), r.stderr.String())
-	}
-	r = runExec(ctx, m, pyReq("none-1", connectCode(targetAddr, 8080)), nil)
-	if r.ok(t, "connect without egress"); !strings.Contains(r.stdout.String(), "Network is unreachable") {
-		t.Errorf("%s:8080 from a sandbox without egress: %q (stderr %q), want \"Network is unreachable\"", targetAddr, r.stdout.String(), r.stderr.String())
-	}
-
-	// netpolicy names the namespace gss-<node>-<hash> and the chain sb_<hash>,
-	// in the table gss_<node> (node IDs here hold only letters and digits).
-	nsPrefix, table := "gss-"+n.id+"-", "gss_"+n.id
-	if out := mustRun(t, "ip", "netns", "list"); !strings.Contains(out, nsPrefix) {
-		t.Fatalf("no namespace %s* for the egress sandbox:\n%s", nsPrefix, out)
-	}
-	if out := mustRun(t, "nft", "list", "table", "inet", table); !strings.Contains(out, "chain sb_") {
-		t.Fatalf("no sandbox chain in table %s:\n%s", table, out)
-	}
-	if err := m.Destroy(ctx, "eg-1", 0); err != nil {
-		t.Fatal(err)
-	}
-	if out := mustRun(t, "ip", "netns", "list"); strings.Contains(out, nsPrefix) {
-		t.Errorf("namespace left after Destroy:\n%s", out)
-	}
-	if out := mustRun(t, "nft", "list", "table", "inet", table); strings.Contains(out, "chain sb_") {
-		t.Errorf("sandbox chain left after Destroy:\n%s", out)
-	}
-}
-
 // restoreManager returns a started manager on n, with np as its network
 // policy, whose checkpoint images live in the node's state directory: each
 // test builds its own image, and it goes with the state directory. The
@@ -557,13 +382,13 @@ func TestRealRestore(t *testing.T) {
 
 func TestRealRestoreEgress(t *testing.T) {
 	n := newRealNode(t)
-	egressTarget(t)
-	np := egressPolicy(t, n.id)
+	tgt := testenv.EgressTarget(t)
+	np := egressPolicy(t, n.id, tgt)
 	m := restoreManager(t, n, np)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	egress := &gssv1.SandboxSpec{EgressAllow: []string{targetAddr + ":8080", "target.test:8080"}}
+	egress := &gssv1.SandboxSpec{EgressAllow: []string{tgt.Addr + ":" + tgt.AllowedPort, "target.test:" + tgt.AllowedPort}}
 	resp, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "eg-1", Incarnation: 1, Spec: egress})
 	if err != nil {
 		t.Fatal(err)
@@ -577,9 +402,9 @@ print(urllib.request.urlopen("http://target.test:8080/", timeout=5).status)`)
 	if exit := r.ok(t, "GET http://target.test:8080/"); exit.GetCode() != 0 || r.stdout.String() != "200\n" {
 		t.Errorf("GET http://target.test:8080/: exit %v, stdout %q, stderr %q; want 0 and \"200\\n\"", exit, r.stdout.String(), r.stderr.String())
 	}
-	r = runExec(ctx, m, pyReq("eg-1", connectCode(targetAddr, 8081)), nil)
+	r = runExec(ctx, m, pyReq("eg-1", connectCode(tgt.Addr, tgt.BlockedPort)), nil)
 	if r.ok(t, "connect to 8081"); strings.TrimSpace(r.stdout.String()) != "timeout" {
-		t.Errorf("%s:8081 (not allowed): %q (stderr %q), want timeout", targetAddr, r.stdout.String(), r.stderr.String())
+		t.Errorf("%s:8081 (not allowed): %q (stderr %q), want timeout", tgt.Addr, r.stdout.String(), r.stderr.String())
 	}
 }
 

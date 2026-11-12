@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net"
 	"net/netip"
 	"os/exec"
 	"slices"
@@ -22,25 +21,9 @@ import (
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/testenv"
 )
 
-const (
-	targetNS   = "gss-test-target"
-	targetVeth = "gsstgt0"
-	targetHost = "10.210.0.1"
-	targetAddr = "10.210.0.2"
-)
-
 func cmdOut(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	return string(out), err
-}
-
-func mustRun(t *testing.T, name string, args ...string) string {
-	t.Helper()
-	out, err := cmdOut(name, args...)
-	if err != nil {
-		t.Fatalf("%s %s: %v: %s", name, strings.Join(args, " "), err, out)
-	}
-	return out
 }
 
 // testManager returns a Manager for a random node id and a random 10.209.<n>.0/24,
@@ -75,64 +58,6 @@ func testManager(t *testing.T) (*Manager, string) {
 	return m, node
 }
 
-// targetFixture creates the target namespace joined to the host by a veth,
-// with HTTP servers on 8080 and 8081, and a host listener on 8099.
-func targetFixture(t *testing.T) {
-	t.Helper()
-	cleanup := func() {
-		_, _ = cmdOut("ip", "netns", "del", targetNS)
-		_, _ = cmdOut("ip", "link", "del", targetVeth)
-	}
-	cleanup()
-	t.Cleanup(cleanup)
-	mustRun(t, "ip", "netns", "add", targetNS)
-	mustRun(t, "ip", "link", "add", targetVeth, "type", "veth", "peer", "name", "eth0", "netns", targetNS)
-	mustRun(t, "ip", "addr", "add", targetHost+"/30", "dev", targetVeth)
-	mustRun(t, "ip", "link", "set", targetVeth, "up")
-	mustRun(t, "ip", "-n", targetNS, "addr", "add", targetAddr+"/30", "dev", "eth0")
-	mustRun(t, "ip", "-n", targetNS, "link", "set", "eth0", "up")
-	mustRun(t, "ip", "-n", targetNS, "link", "set", "lo", "up")
-	mustRun(t, "ip", "-n", targetNS, "route", "add", "default", "via", targetHost, "dev", "eth0")
-
-	for _, port := range []string{"8080", "8081"} {
-		cmd := exec.Command("ip", "netns", "exec", targetNS, "python3", "-m", "http.server", port, "--bind", "0.0.0.0")
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start http.server %s: %v", port, err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			c, err := net.DialTimeout("tcp", net.JoinHostPort(targetAddr, port), time.Second)
-			if err == nil {
-				c.Close()
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("http.server on %s:%s did not answer: %v", targetAddr, port, err)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	ln, err := net.Listen("tcp", ":8099")
-	if err != nil {
-		t.Fatalf("listen on :8099: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-}
-
 // connectPy connects to argv[1]:argv[2] from source port argv[3] (0 = any).
 // With a fourth argument it keeps the connection open for 10 minutes.
 const connectPy = `import socket, sys, time
@@ -163,17 +88,17 @@ func connect(t *testing.T, nsPath, addr, port string) string {
 
 func connectFrom(t *testing.T, nsPath, addr, port string, srcPort int) string {
 	t.Helper()
-	out := mustRun(t, "ip", "netns", "exec", nsName(nsPath), "python3", "-c", connectPy, addr, port, fmt.Sprint(srcPort))
+	out := testenv.MustRun(t, "ip", "netns", "exec", nsName(nsPath), "python3", "-c", connectPy, addr, port, fmt.Sprint(srcPort))
 	return strings.TrimSpace(out)
 }
 
 func TestEgressAllowlist(t *testing.T) {
 	testenv.RequireRoot(t)
-	targetFixture(t)
+	tgt := testenv.EgressTarget(t)
 	m, node := testManager(t)
 	ctx := context.Background()
 
-	path, hosts, err := m.Setup(ctx, "sb1", []string{targetAddr + ":8080"})
+	path, hosts, err := m.Setup(ctx, "sb1", []string{tgt.Addr + ":" + tgt.AllowedPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,27 +111,27 @@ func TestEgressAllowlist(t *testing.T) {
 	}
 	hostSide, _ := m.slotAddrs(m.sbs["sb1"].slot)
 
-	if got := connect(t, path, targetAddr, "8080"); got != "connected" {
-		t.Errorf("%s:8080 (allowed): %s", targetAddr, got)
+	if got := connect(t, path, tgt.Addr, tgt.AllowedPort); got != "connected" {
+		t.Errorf("%s:8080 (allowed): %s", tgt.Addr, got)
 	}
-	if got := connect(t, path, targetAddr, "8081"); got != "timeout" {
-		t.Errorf("%s:8081 (not allowed): %s, want timeout", targetAddr, got)
+	if got := connect(t, path, tgt.Addr, tgt.BlockedPort); got != "timeout" {
+		t.Errorf("%s:8081 (not allowed): %s, want timeout", tgt.Addr, got)
 	}
-	if got := connect(t, path, hostSide.String(), "8099"); got != "timeout" {
+	if got := connect(t, path, hostSide.String(), tgt.HostPort); got != "timeout" {
 		t.Errorf("host veth %s:8099: %s, want timeout", hostSide, got)
 	}
 
 	if err := m.Teardown(ctx, "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	table := mustRun(t, "nft", "list", "table", "inet", m.names.table)
+	table := testenv.MustRun(t, "nft", "list", "table", "inet", m.names.table)
 	if strings.Contains(table, "sb_") {
 		t.Errorf("table still has a sandbox chain after Teardown:\n%s", table)
 	}
-	if out := mustRun(t, "ip", "netns", "list"); strings.Contains(out, "gss-"+node+"-") {
+	if out := testenv.MustRun(t, "ip", "netns", "list"); strings.Contains(out, "gss-"+node+"-") {
 		t.Errorf("namespace left after Teardown:\n%s", out)
 	}
-	if out := mustRun(t, "ip", "-o", "link", "show"); strings.Contains(out, m.names.prefix) {
+	if out := testenv.MustRun(t, "ip", "-o", "link", "show"); strings.Contains(out, m.names.prefix) {
 		t.Errorf("veth left after Teardown:\n%s", out)
 	}
 	if err := m.Teardown(ctx, "sb1"); err != nil {
@@ -241,13 +166,13 @@ func TestInitRemovesLeftovers(t *testing.T) {
 	if err := m2.Init(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if out := mustRun(t, "ip", "netns", "list"); strings.Contains(out, "gss-"+node+"-") {
+	if out := testenv.MustRun(t, "ip", "netns", "list"); strings.Contains(out, "gss-"+node+"-") {
 		t.Errorf("namespaces left after Init:\n%s", out)
 	}
-	if out := mustRun(t, "ip", "-o", "link", "show"); strings.Contains(out, m2.names.prefix) {
+	if out := testenv.MustRun(t, "ip", "-o", "link", "show"); strings.Contains(out, m2.names.prefix) {
 		t.Errorf("veths left after Init:\n%s", out)
 	}
-	table := mustRun(t, "nft", "list", "table", "inet", m2.names.table)
+	table := testenv.MustRun(t, "nft", "list", "table", "inet", m2.names.table)
 	if strings.Contains(table, "sb_") || strings.Contains(table, ": jump") {
 		t.Errorf("sandbox rules left after Init:\n%s", table)
 	}
@@ -264,11 +189,11 @@ func TestInitRemovesLeftovers(t *testing.T) {
 // earlier sandbox on the same /30 must not be usable by the next sandbox.
 func TestStaleFlowNotInherited(t *testing.T) {
 	testenv.RequireRoot(t)
-	targetFixture(t)
+	tgt := testenv.EgressTarget(t)
 	m, _ := testManager(t)
 	ctx := context.Background()
 
-	oldPath, _, err := m.Setup(ctx, "old", []string{targetAddr + ":8081"})
+	oldPath, _, err := m.Setup(ctx, "old", []string{tgt.Addr + ":" + tgt.BlockedPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +201,7 @@ func TestStaleFlowNotInherited(t *testing.T) {
 	_, oldGuest := m.slotAddrs(m.sbs["old"].slot)
 
 	// The old sandbox holds a connection to 8081 from source port 40001.
-	hold := exec.Command("ip", "netns", "exec", nsName(oldPath), "python3", "-c", connectPy, targetAddr, "8081", "40001", "hold")
+	hold := exec.Command("ip", "netns", "exec", nsName(oldPath), "python3", "-c", connectPy, tgt.Addr, tgt.BlockedPort, "40001", "hold")
 	stdout, err := hold.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -298,17 +223,17 @@ func TestStaleFlowNotInherited(t *testing.T) {
 	_ = hold.Wait()
 
 	// The target forgets the flow without the host seeing a FIN or RST.
-	mustRun(t, "ip", "netns", "exec", targetNS, "nft", "add", "table", "inet", "gss_test_tgtdrop")
+	testenv.MustRun(t, "ip", "netns", "exec", tgt.NS, "nft", "add", "table", "inet", "gss_test_tgtdrop")
 	t.Cleanup(func() {
-		_, _ = cmdOut("ip", "netns", "exec", targetNS, "nft", "delete", "table", "inet", "gss_test_tgtdrop")
+		_, _ = cmdOut("ip", "netns", "exec", tgt.NS, "nft", "delete", "table", "inet", "gss_test_tgtdrop")
 	})
-	mustRun(t, "ip", "netns", "exec", targetNS, "nft", "add", "chain", "inet", "gss_test_tgtdrop", "out",
+	testenv.MustRun(t, "ip", "netns", "exec", tgt.NS, "nft", "add", "chain", "inet", "gss_test_tgtdrop", "out",
 		"{ type filter hook output priority filter; policy accept; }")
-	mustRun(t, "ip", "netns", "exec", targetNS, "nft", "add", "rule", "inet", "gss_test_tgtdrop", "out", "tcp", "sport", "8081", "drop")
-	mustRun(t, "ip", "netns", "exec", targetNS, "ss", "-K", "state", "established", "( sport = :8081 )")
-	mustRun(t, "ip", "netns", "exec", targetNS, "nft", "delete", "table", "inet", "gss_test_tgtdrop")
+	testenv.MustRun(t, "ip", "netns", "exec", tgt.NS, "nft", "add", "rule", "inet", "gss_test_tgtdrop", "out", "tcp", "sport", tgt.BlockedPort, "drop")
+	testenv.MustRun(t, "ip", "netns", "exec", tgt.NS, "ss", "-K", "state", "established", "( sport = :"+tgt.BlockedPort+" )")
+	testenv.MustRun(t, "ip", "netns", "exec", tgt.NS, "nft", "delete", "table", "inet", "gss_test_tgtdrop")
 
-	newPath, _, err := m.Setup(ctx, "new", []string{targetAddr + ":8080"})
+	newPath, _, err := m.Setup(ctx, "new", []string{tgt.Addr + ":" + tgt.AllowedPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,13 +241,13 @@ func TestStaleFlowNotInherited(t *testing.T) {
 	if _, g := m.slotAddrs(m.sbs["new"].slot); g != oldGuest {
 		t.Fatalf("new sandbox got %s, want the old sandbox's %s", g, oldGuest)
 	}
-	if got := connectFrom(t, newPath, targetAddr, "8080", 40002); got != "connected" {
+	if got := connectFrom(t, newPath, tgt.Addr, tgt.AllowedPort, 40002); got != "connected" {
 		t.Errorf("new sandbox -> 8080 (allowed): %s", got)
 	}
-	if got := connectFrom(t, newPath, targetAddr, "8081", 40002); got != "timeout" {
+	if got := connectFrom(t, newPath, tgt.Addr, tgt.BlockedPort, 40002); got != "timeout" {
 		t.Errorf("new sandbox -> 8081 from a fresh port: %s, want timeout", got)
 	}
-	if got := connectFrom(t, newPath, targetAddr, "8081", 40001); got != "timeout" {
+	if got := connectFrom(t, newPath, tgt.Addr, tgt.BlockedPort, 40001); got != "timeout" {
 		t.Errorf("new sandbox -> 8081 from the old sandbox's port: %s, want timeout", got)
 	}
 }
@@ -330,7 +255,7 @@ func TestStaleFlowNotInherited(t *testing.T) {
 // counter returns the packet count of the rule in chain whose text contains match.
 func counter(t *testing.T, m *Manager, chain, match string) int {
 	t.Helper()
-	out := mustRun(t, "nft", "list", "chain", "inet", m.names.table, chain)
+	out := testenv.MustRun(t, "nft", "list", "chain", "inet", m.names.table, chain)
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, match) {
 			continue
@@ -424,29 +349,29 @@ except OSError as e:
 // sandbox's own guest address is dropped in prerouting.
 func TestSourceAddressEnforced(t *testing.T) {
 	testenv.RequireRoot(t)
-	targetFixture(t)
+	tgt := testenv.EgressTarget(t)
 	m, _ := testManager(t)
 	ctx := context.Background()
-	path, _, err := m.Setup(ctx, "sb1", []string{targetAddr + ":8080"})
+	path, _, err := m.Setup(ctx, "sb1", []string{tgt.Addr + ":" + tgt.AllowedPort})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Teardown(context.Background(), "sb1") })
 	ns := nsName(path)
-	mustRun(t, "ip", "netns", "exec", ns, "ip", "addr", "add", "10.99.0.1/32", "dev", "eth0")
+	testenv.MustRun(t, "ip", "netns", "exec", ns, "ip", "addr", "add", "10.99.0.1/32", "dev", "eth0")
 
 	// Count, inside the target namespace, packets that arrive from 10.99.0.1.
-	tgt := func(args ...string) string {
-		return mustRun(t, "ip", append([]string{"netns", "exec", targetNS, "nft"}, args...)...)
+	nftTarget := func(args ...string) string {
+		return testenv.MustRun(t, "ip", append([]string{"netns", "exec", tgt.NS, "nft"}, args...)...)
 	}
-	tgt("add", "table", "inet", "gss_test_tgtcount")
+	nftTarget("add", "table", "inet", "gss_test_tgtcount")
 	t.Cleanup(func() {
-		_, _ = cmdOut("ip", "netns", "exec", targetNS, "nft", "delete", "table", "inet", "gss_test_tgtcount")
+		_, _ = cmdOut("ip", "netns", "exec", tgt.NS, "nft", "delete", "table", "inet", "gss_test_tgtcount")
 	})
-	tgt("add", "chain", "inet", "gss_test_tgtcount", "in", "{ type filter hook input priority filter; policy accept; }")
-	tgt("add", "rule", "inet", "gss_test_tgtcount", "in", "ip", "saddr", "10.99.0.1", "counter")
+	nftTarget("add", "chain", "inet", "gss_test_tgtcount", "in", "{ type filter hook input priority filter; policy accept; }")
+	nftTarget("add", "rule", "inet", "gss_test_tgtcount", "in", "ip", "saddr", "10.99.0.1", "counter")
 	arrived := func() string {
-		out := tgt("list", "chain", "inet", "gss_test_tgtcount", "in")
+		out := nftTarget("list", "chain", "inet", "gss_test_tgtcount", "in")
 		for _, line := range strings.Split(out, "\n") {
 			if strings.Contains(line, "10.99.0.1") {
 				return strings.TrimSpace(line)
@@ -456,7 +381,7 @@ func TestSourceAddressEnforced(t *testing.T) {
 	}
 
 	before := counter(t, m, "prerouting", "@src_ok")
-	if out := strings.TrimSpace(mustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, targetAddr, "8080", "10.99.0.1")); out != "timeout" {
+	if out := strings.TrimSpace(testenv.MustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, tgt.Addr, tgt.AllowedPort, "10.99.0.1")); out != "timeout" {
 		t.Errorf("connect from 10.99.0.1 to an allowed address and port: %s, want timeout", out)
 	}
 	if after := counter(t, m, "prerouting", "@src_ok"); after <= before {
@@ -465,7 +390,7 @@ func TestSourceAddressEnforced(t *testing.T) {
 	if got := arrived(); !strings.Contains(got, "packets 0 ") {
 		t.Errorf("packets from 10.99.0.1 reached the target: %s", got)
 	}
-	if out := strings.TrimSpace(mustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, targetAddr, "8080")); out != "connected" {
+	if out := strings.TrimSpace(testenv.MustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, tgt.Addr, tgt.AllowedPort)); out != "connected" {
 		t.Errorf("connect from the guest address: %s, want connected", out)
 	}
 }
@@ -489,16 +414,16 @@ socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(sys.argv[3].encode(), (s
 
 func TestUDPAndICMPDropped(t *testing.T) {
 	testenv.RequireRoot(t)
-	targetFixture(t)
+	tgt := testenv.EgressTarget(t)
 	m, _ := testManager(t)
 	ctx := context.Background()
-	path, _, err := m.Setup(ctx, "sb1", []string{targetAddr + ":8080"})
+	path, _, err := m.Setup(ctx, "sb1", []string{tgt.Addr + ":" + tgt.AllowedPort})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Teardown(context.Background(), "sb1") })
 
-	recv := exec.Command("ip", "netns", "exec", targetNS, "python3", "-c", udpRecvPy, "8080")
+	recv := exec.Command("ip", "netns", "exec", tgt.NS, "python3", "-c", udpRecvPy, tgt.AllowedPort)
 	stdout, err := recv.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -511,8 +436,8 @@ func TestUDPAndICMPDropped(t *testing.T) {
 	if line, _ := rd.ReadString('\n'); strings.TrimSpace(line) != "ready" {
 		t.Fatalf("udp receiver: %q", line)
 	}
-	mustRun(t, "ip", "netns", "exec", nsName(path), "python3", "-c", udpSendPy, targetAddr, "8080", "sandbox")
-	mustRun(t, "python3", "-c", udpSendPy, targetAddr, "8080", "host") // control: not through the sandbox
+	testenv.MustRun(t, "ip", "netns", "exec", nsName(path), "python3", "-c", udpSendPy, tgt.Addr, tgt.AllowedPort, "sandbox")
+	testenv.MustRun(t, "python3", "-c", udpSendPy, tgt.Addr, tgt.AllowedPort, "host") // control: not through the sandbox
 	var got []string
 	for {
 		line, err := rd.ReadString('\n')
@@ -530,10 +455,10 @@ func TestUDPAndICMPDropped(t *testing.T) {
 		t.Errorf("UDP from the sandbox to an allowed address and port was delivered: %v", got)
 	}
 
-	if out, err := cmdOut("ping", "-c", "1", "-W", "2", targetAddr); err != nil {
+	if out, err := cmdOut("ping", "-c", "1", "-W", "2", tgt.Addr); err != nil {
 		t.Errorf("control ping from the host failed: %v: %s", err, out)
 	}
-	if out, err := cmdOut("ip", "netns", "exec", nsName(path), "ping", "-c", "1", "-W", "2", targetAddr); err == nil {
+	if out, err := cmdOut("ip", "netns", "exec", nsName(path), "ping", "-c", "1", "-W", "2", tgt.Addr); err == nil {
 		t.Errorf("ping from the sandbox to an allowed address succeeded:\n%s", out)
 	}
 }
@@ -551,7 +476,7 @@ func TestInitRefusesOverlappingNode(t *testing.T) {
 	} else {
 		t.Logf("Init refused: %v", err)
 	}
-	table := mustRun(t, "nft", "-t", "list", "table", "inet", m1.names.table)
+	table := testenv.MustRun(t, "nft", "-t", "list", "table", "inet", m1.names.table)
 	if !strings.Contains(table, tableComment(m1.names, m1.cidr)) || !strings.Contains(table, "chain forward") {
 		t.Errorf("first node's table changed:\n%s", table)
 	}

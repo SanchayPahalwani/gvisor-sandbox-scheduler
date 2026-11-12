@@ -85,7 +85,10 @@ type Runtime interface {
 	List(ctx context.Context) ([]string, error)
 	// Version returns the runsc release, e.g. "release-20261102.0".
 	Version(ctx context.Context) (string, error)
-	// RemoveRoot unmounts <root>/null-netns if mounted and removes the root
-	// directory. Call it only after every container under the root was deleted.
+	// RemoveRoot removes the root directory and the entries runsc makes in
+	// it (null-netns, unmounted first, state and lock files, container
+	// directories), and fails, removing nothing else, if the root holds
+	// anything more. Call it only after every container under the root was
+	// deleted.
 	RemoveRoot(ctx context.Context) error
 }

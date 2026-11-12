@@ -33,7 +33,7 @@ func buildNodeAgent(t *testing.T) string {
 		t.Fatalf("go not found on PATH: %v", err)
 	}
 	bin := filepath.Join(testenv.TempStateDir(t), "nodeagent")
-	cmd := exec.Command(gobin, "build", "-o", bin, "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/cmd/nodeagent")
+	cmd := exec.Command(gobin, "build", "-buildvcs=false", "-o", bin, "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/cmd/nodeagent")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build nodeagent: %v\n%s", err, out)
@@ -103,12 +103,17 @@ func TestRealNodeAgentBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	table := "gss_" + n.id // netpolicy's table; node IDs here hold only letters and digits
-	t.Cleanup(func() { _ = exec.Command("nft", "delete", "table", "inet", table).Run() })
-	p, addr := startAgent(t, bin,
+	t.Cleanup(func() {
+		_ = exec.Command("nft", "delete", "table", "inet", table).Run()
+		_ = os.Remove(n.rt.Root + ".lock")
+	})
+	args := []string{
 		"--node-id", n.id, "--listen", "127.0.0.1:0",
 		"--warm-pool-size=0", "--checkpoint-dir=",
 		"--state-dir", n.state, "--rootfs", testenv.Rootfs(t), "--runsc", testenv.RunscPath(t),
-		"--egress-cidr", fmt.Sprintf("10.207.%d.0/24", r.Int64()))
+		"--egress-cidr", fmt.Sprintf("10.207.%d.0/24", r.Int64()),
+	}
+	p, addr := startAgent(t, bin, args...)
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -154,6 +159,19 @@ func TestRealNodeAgentBinary(t *testing.T) {
 		t.Errorf("runsc list after DestroySandbox sb-1 = %q, want [sb-2_1_]", got)
 	}
 
+	// A second agent for the same node is refused before it touches
+	// anything: the first one's sandbox lives on.
+	sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
+	out, err := exec.CommandContext(sctx, bin, args...).CombinedOutput()
+	scancel()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !strings.Contains(string(out), "locked by another node agent") {
+		t.Errorf("second agent for node %s: %v, output:\n%s\nwant exit 1 saying the node is locked", n.id, err, out)
+	}
+	if got := n.listContainers(t); len(got) != 1 || got[0] != "sb-2_1_" {
+		t.Errorf("runsc list after the second agent = %q, want [sb-2_1_]", got)
+	}
+
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -168,8 +186,8 @@ func TestRealNodeAgentBinary(t *testing.T) {
 	if _, err := os.Stat(n.rt.Root); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("runsc root %s after shutdown: %v, want it gone", n.rt.Root, err)
 	}
-	if _, err := os.Stat(n.cgroupDir("sb-2_1_")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("cgroup of sb-2 after shutdown: %v, want it gone", err)
+	if dir := filepath.Dir(n.cgroupDir("sb-2_1_")); !errors.Is(statErr(dir), fs.ErrNotExist) {
+		t.Errorf("node cgroup %s after shutdown: %v, want it gone", dir, statErr(dir))
 	}
 	if out, err := exec.Command("nft", "list", "table", "inet", table).CombinedOutput(); err == nil {
 		t.Errorf("table %s still there after shutdown:\n%s", table, out)
@@ -184,4 +202,9 @@ func TestRealNodeAgentBinary(t *testing.T) {
 			t.Errorf("node agent log has no %q", want)
 		}
 	}
+}
+
+func statErr(path string) error {
+	_, err := os.Stat(path)
+	return err
 }

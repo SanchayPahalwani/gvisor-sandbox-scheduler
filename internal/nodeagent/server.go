@@ -12,17 +12,25 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// MaxMessageBytes is the largest gRPC message a node agent sends or
+// receives: room for python_code up to pyfork's 16 MiB limit plus stdin.
+// Clients of NodeService set the same limit with grpc.WithDefaultCallOptions
+// (grpc.MaxCallSendMsgSize, grpc.MaxCallRecvMsgSize).
+const MaxMessageBytes = 20 << 20
+
 // keepaliveMinTime is the shortest interval between a client's keepalive
 // pings that the server accepts; a client that pings more often is cut off.
 const keepaliveMinTime = time.Second
 
 // ServerOptions are the gRPC server options of a node agent: the otelgrpc
-// stats handler (spans for each RPC, continuing the caller's trace) and a
-// keepalive policy that lets the scheduler ping its connections once a
-// second, also while no RPC is open.
+// stats handler (spans for each RPC, continuing the caller's trace), message
+// limits of MaxMessageBytes, and a keepalive policy that lets the scheduler
+// ping its connections once a second, also while no RPC is open.
 func ServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.MaxRecvMsgSize(MaxMessageBytes),
+		grpc.MaxSendMsgSize(MaxMessageBytes),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             keepaliveMinTime,
 			PermitWithoutStream: true,
