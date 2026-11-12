@@ -24,6 +24,7 @@ subcommands:
   start       start latency per start path (cold, restore, warm)
   throughput  closed-loop create, Exec, destroy against the whole cluster
   density     live sandboxes on one node against start and Exec latency
+  grouploss   local failure-domain test: kill every node of one group under load
 
 common flags: --scheduler 127.0.0.1:7000, --out results/<subcommand>.json
 run "loadgen <subcommand> -h" for its flags
@@ -53,6 +54,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		err = throughputCmd(ctx, args, stdout, stderr)
 	case "density":
 		err = densityCmd(ctx, args, stdout, stderr)
+	case "grouploss":
+		err = groupLossCmd(ctx, args, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return nil

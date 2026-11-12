@@ -9,7 +9,7 @@ RUN ?= .
 FORWARD_VARS := PKG RUN FORCE
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
-LINUX_TARGETS := build test-integration rootfs bench-start bench-throughput bench-density
+LINUX_TARGETS := build test-integration rootfs bench-start bench-throughput bench-density bench-grouploss
 
 .PHONY: vm vm-stop vm-delete proto test lint sim $(LINUX_TARGETS)
 
@@ -76,6 +76,11 @@ bench-density: build
 	$(DENSITY_TOPOLOGY) scripts/cluster.sh up
 	bin/loadgen density --out results/density.json
 	$(DENSITY_TOPOLOGY) scripts/cluster.sh down
+
+# Local failure-domain test (spec 8.6); the script brings its own clusters up and down.
+bench-grouploss: build
+	@$(BENCH_NO_OTEL)
+	scripts/group-loss.sh
 
 vm vm-stop vm-delete:
 	@echo "not needed on Linux"
