@@ -993,22 +993,74 @@ func TestCreateRestoreFallsBackToCold(t *testing.T) {
 	wantCode(t, err, codes.FailedPrecondition, "forced RESTORE after the image was dropped")
 }
 
-func TestRestoreNotReadyFallsBack(t *testing.T) {
-	e, _ := restoreEnv(t, nil)
-	probes := 0
+// notReadyAfterRestore makes the first readiness probe of each sandbox whose
+// runsc ID is in fail (the probe after its restore) fail; the cold probe
+// after the fallback passes.
+func notReadyAfterRestore(e *env, fail ...string) {
+	var mu sync.Mutex
+	probed := map[string]bool{}
 	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
-		if ref.ID == "sb-1_1_" {
-			if probes++; probes == 1 {
-				return 1, nil // the restored zygote does not answer
-			}
+		mu.Lock()
+		defer mu.Unlock()
+		if slices.Contains(fail, ref.ID) && !probed[ref.ID] {
+			probed[ref.ID] = true
+			return 1, nil // the restored zygote does not answer
 		}
 		return 0, nil
 	}
+}
+
+// One restored sandbox that does not get ready falls back to cold but
+// keeps the image: a slow probe under load is not a bad image.
+func TestRestoreNotReadyFallsBack(t *testing.T) {
+	e, _ := restoreEnv(t, nil)
+	notReadyAfterRestore(e, "sb-1_1_")
 	if resp := e.mustCreate(t, "sb-1", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
 		t.Errorf("not ready after restore: started_as = %v, want COLD", resp.GetStartedAs())
 	}
+	if !e.m.ImageReady() {
+		t.Error("one readiness failure after a restore dropped the image")
+	}
+	if resp := e.mustCreate(t, "sb-2", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("next create: started_as = %v, want RESTORE", resp.GetStartedAs())
+	}
+}
+
+// Readiness failures after a restore drop the image only when
+// readyFailuresToDrop of them come in a row; a good restore resets the count.
+func TestRestoreNotReadyInARowDropsImage(t *testing.T) {
+	if readyFailuresToDrop != 3 {
+		t.Errorf("readyFailuresToDrop = %d, want 3", readyFailuresToDrop)
+	}
+	e, _ := restoreEnv(t, nil)
+	// fail, fail, good, fail, fail: never three in a row.
+	notReadyAfterRestore(e, "a1_1_", "a2_1_", "a4_1_", "a5_1_")
+	for i, id := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		want := gssv1.StartMode_START_MODE_COLD
+		if id == "a3" {
+			want = gssv1.StartMode_START_MODE_RESTORE
+		}
+		if resp := e.mustCreate(t, id, 1, nil); resp.GetStartedAs() != want {
+			t.Errorf("create %d (%s): started_as = %v, want %v", i+1, id, resp.GetStartedAs(), want)
+		}
+		if !e.m.ImageReady() {
+			t.Fatalf("image dropped after create %d (%s); at most two failures were in a row", i+1, id)
+		}
+	}
+	// The third in a row drops it; the request itself still starts cold.
+	notReadyAfterRestore(e, "a6_1_")
+	if resp := e.mustCreate(t, "a6", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("third failure in a row: started_as = %v, want COLD", resp.GetStartedAs())
+	}
 	if e.m.ImageReady() {
-		t.Error("ImageReady after a restored sandbox did not get ready")
+		t.Error("ImageReady after three readiness failures in a row")
+	}
+	before := len(e.rt.Calls())
+	if resp := e.mustCreate(t, "a7", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("after the drop: started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	if got := e.rt.Calls()[before:]; slices.Contains(got, "Restore id=a7_1_ net=none") {
+		t.Errorf("restored after the image was dropped: %q", got)
 	}
 }
 
@@ -1036,6 +1088,9 @@ func TestRestoreReadyBound(t *testing.T) {
 	}
 	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
 		t.Errorf("started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	if !e.m.ImageReady() {
+		t.Error("one slow restored probe dropped the image")
 	}
 }
 

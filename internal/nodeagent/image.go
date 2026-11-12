@@ -40,6 +40,11 @@ const (
 	// imageRecheck is how often a node without an image looks for one that
 	// another agent on the host has built since.
 	imageRecheck = time.Second
+	// readyFailuresToDrop is how many restored sandboxes in a row must fail
+	// their readiness probe before the node drops the image. One slow probe
+	// on a loaded node (the density benchmark loads nodes until starts slow
+	// down) is not a bad image.
+	readyFailuresToDrop = 3
 )
 
 // ImageKey identifies what a checkpoint image is valid for: the runsc
@@ -87,8 +92,8 @@ func layoutDigest(s *specs.Spec) string {
 // The sandboxes that build the image are not in the manager's table, so
 // they are neither listed nor counted, and EnsureImage has removed them when
 // it returns, also when ctx ended. Start calls it; once it has succeeded,
-// Creates can take the restore path. After a restore from the image failed
-// on this manager it refuses.
+// Creates can take the restore path. After this manager dropped the image
+// (restoreFailed) it refuses.
 func (m *Manager) EnsureImage(ctx context.Context) (dir string, err error) {
 	if m.cfg.CheckpointDir == "" {
 		return "", errors.New("nodeagent: checkpoint images are off (no CheckpointDir)")
@@ -207,9 +212,34 @@ func (m *Manager) restoreImage() string {
 	return dir
 }
 
-// dropImage turns restore off for good on this manager after a restore from
-// the image failed (step and err say how), so that it stops paying for a bad
-// image; a new agent builds or checks it again.
+// restoreFailed counts a restore from the image that failed in step (a
+// Create whose ctx ended does not count). A failed runsc restore drops the
+// image at once. A restored sandbox that did not get ready drops it only as
+// the readyFailuresToDrop-th such failure in a row; restoreSucceeded resets
+// the count.
+func (m *Manager) restoreFailed(step string, err error) {
+	if step == "sandbox.ready" {
+		m.mu.Lock()
+		m.readyFailures++
+		inARow := m.readyFailures
+		m.mu.Unlock()
+		if inARow < readyFailuresToDrop {
+			return
+		}
+	}
+	m.dropImage(step, err)
+}
+
+// restoreSucceeded records a restored sandbox that got ready.
+func (m *Manager) restoreSucceeded() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readyFailures = 0
+}
+
+// dropImage turns restore off for good on this manager, so that it stops
+// paying for a bad image (step and err say what failed last); a new agent
+// builds or checks it again.
 func (m *Manager) dropImage(step string, err error) {
 	m.mu.Lock()
 	first := !m.imageBad
@@ -262,7 +292,8 @@ func (m *Manager) buildImage(ctx context.Context, key, dir, info string) (err er
 	// The rename is durable only once the directory holding it is synced. A
 	// failure here leaves a published image, so it is not undone.
 	if err := m.fsync(m.cfg.CheckpointDir); err != nil {
-		slog.Warn("checkpoint image published, but syncing its directory failed", "dir", dir, "err", err)
+		slog.Warn("checkpoint image published, but fsync of the checkpoint directory failed",
+			"path", m.cfg.CheckpointDir, "image", dir, "err", err)
 	}
 	return nil
 }

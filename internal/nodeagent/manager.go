@@ -94,15 +94,16 @@ type Manager struct {
 	fsync                func(path string) error // fsyncPath: syncs a file or directory
 	restoreReadyTimeout  time.Duration           // the readiness bound after a restore
 
-	mu          sync.Mutex
-	sandboxes   map[string]*sandbox // by sandbox ID
-	imageDir    string              // the checkpoint image Creates restore from; "" if none
-	imageKey    string              // the key EnsureImage computed; "" before
-	imageBad    bool                // a restore from imageDir failed: no image until restart
-	imageLooked time.Time           // the last look for another agent's image (Deps.Now)
-	serving     bool                // Start finished; Create is open
-	started     bool
-	closed      bool
+	mu            sync.Mutex
+	sandboxes     map[string]*sandbox // by sandbox ID
+	imageDir      string              // the checkpoint image Creates restore from; "" if none
+	imageKey      string              // the key EnsureImage computed; "" before
+	imageBad      bool                // the image was dropped after failed restores: none until restart
+	readyFailures int                 // restored sandboxes in a row that did not get ready
+	imageLooked   time.Time           // the last look for another agent's image (Deps.Now)
+	serving       bool                // Start finished; Create is open
+	started       bool
+	closed        bool
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -181,10 +182,11 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Create starts a sandbox and returns when it is ready, on the path
-// chooseMode picks (spec 7.3). A restore that fails in its own steps turns
-// restore off on this node until it restarts; in AUTO mode the restore is
-// then undone and the cold path runs once instead, and a forced RESTORE
-// fails with Internal.
+// chooseMode picks (spec 7.3). When a restore fails in its own steps, in
+// AUTO mode the restore is undone and the cold path runs once instead, and a
+// forced RESTORE fails with Internal. A failed runsc restore also turns
+// restore off on this node until it restarts, and so do three restored
+// sandboxes in a row that do not get ready (restoreFailed).
 func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (resp *gssv1.NodeCreateResponse, err error) {
 	begin := time.Now() // ready_latency is a measurement: real time, not Deps.Now
 	ctx, span := startSpan(ctx, "node.create",
@@ -226,8 +228,10 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	var step string
 	if mode == gssv1.StartMode_START_MODE_RESTORE {
 		step, err = m.startSandbox(ctx, e, imageDir)
-		if err != nil && restoreStep(step) && ctx.Err() == nil {
-			m.dropImage(step, err)
+		if err == nil {
+			m.restoreSucceeded()
+		} else if restoreStep(step) && ctx.Err() == nil {
+			m.restoreFailed(step, err)
 			if spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO {
 				mode = gssv1.StartMode_START_MODE_COLD
 				span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
