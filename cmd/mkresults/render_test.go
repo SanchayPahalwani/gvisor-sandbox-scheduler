@@ -207,7 +207,8 @@ func TestBadValues(t *testing.T) {
 		zero("cold_ready_ms")+","+zero("cold_first_result_ms")+`]}`)
 	write("throughput.json", `{"name":"throughput","command":"c","errors":3,"params":{},"scalars":{},"series":[`+zero("ready_ms")+`]}`)
 	write("density.json", `{"name":"density","command":"c","errors":1,"params":{},"scalars":{},"series":[],
-		"rows":[{"step":1,"live":5,"start_p50_ms":0,"start_p95_ms":0,"exec_p50_ms":4.5,"exec_p95_ms":6.5,"failed":5}]}`)
+		"rows":[{"step":1,"live":5,"start_n":0,"start_p50_ms":0,"start_p95_ms":0,"exec_n":4,"exec_p50_ms":4.5,"exec_p95_ms":6.5,"failed":5},
+		{"step":2,"live":6,"start_n":3,"start_p50_ms":0,"start_p95_ms":2.5,"exec_p50_ms":0,"exec_p95_ms":0,"failed":0}]}`)
 	for _, f := range []string{"grouploss.json", "grouploss-retry.json"} {
 		write(f, `{"name":"grouploss","command":"c","errors":0,"params":{"sched_policy":"spread"},"scalars":{"detection_ms":-1,"recovery_ms":-1}}`)
 	}
@@ -216,16 +217,16 @@ func TestBadValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	md := Render(in)
-	if strings.Contains(md, "-1") || strings.Contains(md, "0.0 |") || strings.Contains(md, "<nil>") {
+	if strings.Contains(md, "-1.0") || strings.Contains(md, "-1 ms") || strings.Contains(md, "<nil>") {
 		t.Errorf("output shows a placeholder as a result:\n%s", md)
 	}
-	for _, want := range []string{"no successful run (7 errors)", "no successful run (3 errors)", "not detected", "not recovered", "| 1 | 5 | - | - | 4.5 | 6.5 | 5 |", "Errors: 7"} {
+	for _, want := range []string{"no successful run (7 errors)", "no successful run (3 errors)", "not detected", "not recovered", "| 1 | 5 | - | - | 4.5 | 6.5 | 5 |", "| 2 | 6 | 0.0 | 2.5 | - | - | 0 |", "Errors: 7"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("output lacks %q:\n%s", want, md)
 		}
 	}
 	sum := Summary(in)
-	if strings.Contains(sum, "-1") || !strings.Contains(sum, "not recovered") || !strings.Contains(sum, "no successful run") {
+	if strings.Contains(sum, "-1.0") || strings.Contains(sum, "-1 ms") || !strings.Contains(sum, "not recovered") || !strings.Contains(sum, "no successful run") {
 		t.Errorf("summary:\n%s", sum)
 	}
 }

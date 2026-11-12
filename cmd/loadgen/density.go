@@ -253,6 +253,7 @@ type densityStep struct {
 func (s densityStep) row() map[string]any {
 	row := map[string]any{
 		"step": s.step, "live": s.live, "lost": s.lost, "unconfirmed": s.unconfirmed, "failed": s.failed,
+		"start_n": s.start.Count, "exec_n": s.exec.Count,
 		"start_p50_ms": s.start.P50, "start_p95_ms": s.start.P95,
 		"exec_p50_ms": s.exec.P50, "exec_p95_ms": s.exec.P95,
 	}

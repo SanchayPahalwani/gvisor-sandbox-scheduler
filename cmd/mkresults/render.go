@@ -429,12 +429,21 @@ func renderDensity(in *Inputs) string {
 		}
 		return "-"
 	}
-	// A latency column of exactly 0 means the step had no successful sample
-	// (bench.Summarize returns zeros for an empty series); loadgen records no count.
-	lat := func(row map[string]any, key, pair string) string {
+	// start_n and exec_n are the step's sample counts; a count of 0 means no sample
+	// (bench.Summarize returns zeros). Rows without counts fall back to both
+	// percentiles being exactly 0.
+	lat := func(row map[string]any, key, pair, count string) string {
 		v, ok := rowNum(row, key)
-		w, ok2 := rowNum(row, pair)
-		if !ok || (v == 0 && ok2 && w == 0) {
+		if !ok {
+			return "-"
+		}
+		if n, ok := rowNum(row, count); ok {
+			if n == 0 {
+				return "-"
+			}
+			return fmtMS(v)
+		}
+		if w, ok := rowNum(row, pair); v == 0 && ok && w == 0 {
 			return "-"
 		}
 		return fmtMS(v)
@@ -443,8 +452,8 @@ func renderDensity(in *Inputs) string {
 	for _, row := range r.Rows {
 		rows = append(rows, []string{
 			opt(row, "step", fmtInt), opt(row, "live", fmtInt),
-			lat(row, "start_p50_ms", "start_p95_ms"), lat(row, "start_p95_ms", "start_p50_ms"),
-			lat(row, "exec_p50_ms", "exec_p95_ms"), lat(row, "exec_p95_ms", "exec_p50_ms"),
+			lat(row, "start_p50_ms", "start_p95_ms", "start_n"), lat(row, "start_p95_ms", "start_p50_ms", "start_n"),
+			lat(row, "exec_p50_ms", "exec_p95_ms", "exec_n"), lat(row, "exec_p95_ms", "exec_p50_ms", "exec_n"),
 			opt(row, "failed", fmtInt), opt(row, "lost", fmtInt), opt(row, "unconfirmed", fmtInt),
 			opt(row, "node_mem_available_mib", fmtInt),
 		})

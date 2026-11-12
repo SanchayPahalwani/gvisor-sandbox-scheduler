@@ -488,11 +488,14 @@ func TestDensityStopsOnFailure(t *testing.T) {
 		if row["node_mem_available_mib"] != 1000.0 {
 			t.Errorf("row %d node_mem_available_mib = %v, want 1000", i, row["node_mem_available_mib"])
 		}
-		for _, k := range []string{"live", "start_p50_ms", "start_p95_ms", "exec_p50_ms", "exec_p95_ms", "failed"} {
+		for _, k := range []string{"live", "start_p50_ms", "start_p95_ms", "exec_p50_ms", "exec_p95_ms", "failed", "start_n", "exec_n"} {
 			if _, ok := row[k]; !ok {
 				t.Errorf("row %d has no %q: %v", i, k, row)
 			}
 		}
+	}
+	if run.Rows[0]["start_n"] != 3 || run.Rows[0]["exec_n"] != 3 {
+		t.Errorf("row 0 sample counts = %v, %v: want 3 each", run.Rows[0]["start_n"], run.Rows[0]["exec_n"])
 	}
 	if run.Rows[0]["live"] != 5 || run.Rows[1]["live"] != 10 || run.Rows[0]["failed"] != 0 || run.Rows[1]["failed"] != 0 {
 		t.Errorf("rows 0 and 1 = %v, %v: want live 5 and 10 with no failures", run.Rows[0], run.Rows[1])
