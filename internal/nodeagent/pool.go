@@ -234,20 +234,45 @@ func (m *Manager) runscIDUsedLocked(rid string) bool {
 }
 
 // claimLocked takes a ready pool sandbox for sandbox id at incarnation inc
-// and puts it in the table as starting, with spec and its lifecycle lock
-// held by the caller; nil if the pool is empty. It keeps its runsc ID,
-// bundle, cgroup and pid. Call with mu held, after admitLocked.
+// and puts it in the table as starting (Execs wait for the claim to finish:
+// until then it has the pool's limits), with spec and its lifecycle lock
+// held by the caller; nil if the pool has no live sandbox. A pool sandbox
+// whose process is gone is torn down in the background and skipped. The
+// claimed one keeps its runsc ID, bundle, cgroup and pid. Call with mu
+// held, while serving, after admitLocked.
 func (m *Manager) claimLocked(id string, inc int32, spec *gssv1.SandboxSpec) *sandbox {
-	p := m.popWarmLocked()
-	if p == nil {
-		return nil
+	for {
+		p := m.popWarmLocked()
+		if p == nil {
+			return nil
+		}
+		// Signal 0 to the sandbox process: no runsc call.
+		if !m.processAlive(p.pid) {
+			m.dropLaterLocked(p, "exited")
+			continue
+		}
+		p.op <- struct{}{} // free: no one else holds a pool sandbox
+		p.id, p.incarnation, p.spec = id, inc, spec
+		p.startedAs = gssv1.StartMode_START_MODE_WARM
+		p.expires = m.now().Add(spec.GetTtl().AsDuration() + m.cfg.TTLGrace)
+		p.state = stateStarting
+		m.sandboxes[id] = p
+		return p
 	}
-	p.op <- struct{}{} // free: no one else holds a pool sandbox
-	p.id, p.incarnation, p.spec = id, inc, spec
-	p.startedAs = gssv1.StartMode_START_MODE_WARM
-	p.expires = m.now().Add(spec.GetTtl().AsDuration() + m.cfg.TTLGrace)
-	m.sandboxes[id] = p
-	return p
+}
+
+// dropLaterLocked has p, a pool sandbox the caller took out of the pool,
+// torn down in the background; Close waits for it with the loops. Call
+// with mu held, while serving: Close has not begun waiting for the loops.
+func (m *Manager) dropLaterLocked(p *sandbox, reason string) {
+	m.dropping[p] = true
+	m.loops.Add(1)
+	go func() {
+		defer m.loops.Done()
+		if err := m.dropPooled(context.Background(), p, reason); err != nil {
+			slog.Warn("destroy failed", "runsc_id", p.ref.ID, "reason", reason, "err", err)
+		}
+	}()
 }
 
 // popWarmLocked takes the oldest ready pool sandbox out of the pool; nil if
@@ -275,11 +300,8 @@ func (m *Manager) claim(ctx context.Context, id string, inc int32, spec *gssv1.S
 	defer e.unlock()
 	defer m.kickRefill()
 	if err := m.setClaimLimits(ctx, e); err != nil {
-		m.mu.Lock()
-		e.state = stateDestroying
-		m.mu.Unlock()
 		err = fmt.Errorf("pool.claim: %w", err)
-		if rerr := m.remove(ctx, e); rerr != nil {
+		if rerr := m.destroyHeld(ctx, e); rerr != nil {
 			err = fmt.Errorf("%w (cleanup failed: %v)", err, rerr)
 		}
 		slog.Warn("claim failed; pool sandbox removed", "sandbox", id, "runsc_id", e.ref.ID, "err", err)

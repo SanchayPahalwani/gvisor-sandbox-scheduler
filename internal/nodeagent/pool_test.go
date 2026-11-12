@@ -90,32 +90,39 @@ func poolIDs(calls []string, method string) []string {
 }
 
 // gatedPool holds runsc start and restore of pool sandboxes while hold is
-// set, until the call's ctx ends (a Create taking the sandbox's place, or
-// Close). blocked counts the calls held.
+// set: a held call goes on once hold is cleared, and fails when its ctx ends
+// first (a Create taking the sandbox's place, or Close). blocked counts the
+// calls held.
 type gatedPool struct {
 	runsc.Runtime
 	hold    atomic.Bool
 	blocked atomic.Int32
 }
 
-func (g *gatedPool) held(ctx context.Context, ref runsc.Ref) (bool, error) {
+func (g *gatedPool) wait(ctx context.Context, ref runsc.Ref) error {
 	if !g.hold.Load() || !strings.HasPrefix(ref.ID, "warm_") {
-		return false, nil
+		return nil
 	}
 	g.blocked.Add(1)
-	<-ctx.Done()
-	return true, ctx.Err()
+	for g.hold.Load() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func (g *gatedPool) Start(ctx context.Context, ref runsc.Ref) error {
-	if held, err := g.held(ctx, ref); held {
+	if err := g.wait(ctx, ref); err != nil {
 		return err
 	}
 	return g.Runtime.Start(ctx, ref)
 }
 
 func (g *gatedPool) Restore(ctx context.Context, ref runsc.Ref, bundleDir, imagePath string) error {
-	if held, err := g.held(ctx, ref); held {
+	if err := g.wait(ctx, ref); err != nil {
 		return err
 	}
 	return g.Runtime.Restore(ctx, ref, bundleDir, imagePath)
@@ -142,6 +149,64 @@ func (c *failLimits) SetLimits(path string, cpu, mem int64) error {
 		return errors.New("write cpu.max: permission denied")
 	}
 	return c.fakeCgroups.SetLimits(path, cpu, mem)
+}
+
+// holdLimits holds every SetLimits: it sends on entered, then waits for
+// the outcome on release (nil: the limits are written).
+type holdLimits struct {
+	*fakeCgroups
+	entered chan struct{}
+	release chan error
+}
+
+func (c *holdLimits) SetLimits(path string, cpu, mem int64) error {
+	c.entered <- struct{}{}
+	if err := <-c.release; err != nil {
+		return err
+	}
+	return c.fakeCgroups.SetLimits(path, cpu, mem)
+}
+
+// holdLimitsOf wraps the env's cgroups in a holdLimits, stored in *c.
+func holdLimitsOf(c **holdLimits) func(*Config, *Deps) {
+	return func(_ *Config, d *Deps) {
+		*c = &holdLimits{fakeCgroups: d.Cgroups.(*fakeCgroups), entered: make(chan struct{}), release: make(chan error)}
+		d.Cgroups = *c
+	}
+}
+
+// stuckPoolDelete fails runsc delete of pool sandboxes while stuck is set.
+type stuckPoolDelete struct {
+	runsc.Runtime
+	stuck atomic.Bool
+	fails atomic.Int32 // deletes failed so far
+}
+
+func (s *stuckPoolDelete) Delete(ctx context.Context, ref runsc.Ref) error {
+	if s.stuck.Load() && strings.HasPrefix(ref.ID, "warm_") {
+		s.fails.Add(1)
+		return errors.New("delete failed")
+	}
+	return s.Runtime.Delete(ctx, ref)
+}
+
+// pidOf returns the sandbox process of the container rid.
+func (e *env) pidOf(t *testing.T, rid string) int {
+	t.Helper()
+	st, err := e.rt.State(context.Background(), runsc.Ref{ID: rid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.PID
+}
+
+// brokenEntry reports whether the table holds rid as a broken entry under
+// its runsc ID.
+func (e *env) brokenEntry(rid string) bool {
+	e.m.mu.Lock()
+	defer e.m.mu.Unlock()
+	s := e.m.sandboxes[rid]
+	return s != nil && s.state == stateBroken
 }
 
 func TestPoolFills(t *testing.T) {
@@ -673,5 +738,292 @@ func TestCloseDestroysPool(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(filepath.Join(f.state, "bundles")); len(ents) != 0 {
 		t.Errorf("bundles after Close: %v", ents)
+	}
+}
+
+// A claimed sandbox is starting, not ready, until its limits are written:
+// an Exec in that window gets Unavailable, as for any sandbox still
+// starting, so nothing runs at the pool's size.
+func TestClaimNotReadyUntilLimits(t *testing.T) {
+	var cg *holdLimits
+	e := poolEnv(t, 1, holdLimitsOf(&cg))
+	e.waitWarm(t, 1)
+	ctx := context.Background()
+	var resp *gssv1.NodeCreateResponse
+	created := make(chan error, 1)
+	go func() {
+		var err error
+		resp, err = e.create("sb-1", 1, spec(1000, 512<<20))
+		created <- err
+	}()
+	<-cg.entered
+	c := &collector{}
+	err := e.m.Exec(ctx, pyReq("sb-1", "print(1)"), c.send)
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "still starting") {
+		t.Errorf("Exec during the claim: %v, want Unavailable \"still starting\"", err)
+	}
+	if len(c.events) != 0 {
+		t.Errorf("Exec during the claim sent %d events", len(c.events))
+	}
+	cg.release <- nil
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_WARM {
+		t.Errorf("started as %v, want WARM", resp.GetStartedAs())
+	}
+	c = &collector{}
+	if err := e.m.Exec(ctx, pyReq("sb-1", "print(1)"), c.send); err != nil {
+		t.Fatalf("Exec after the claim: %v", err)
+	}
+	c.exit(t)
+}
+
+// A claim whose SetLimits fails ends the Execs registered on the sandbox,
+// as a destroy does, before the container goes. No Exec can register while
+// the claimed sandbox is starting, so the test marks it ready by hand to
+// register one.
+func TestClaimFailureEndsExecs(t *testing.T) {
+	var cg *holdLimits
+	e := newEnv(t, withPool(1, holdLimitsOf(&cg)))
+	// User Execs (they have a pid file) run until stopped; probes pass.
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		if s.InternalPIDFile == "" {
+			return 0, nil
+		}
+		<-ctx.Done()
+		return -1, ctx.Err()
+	}
+	e.start(t)
+	e.waitWarm(t, 1)
+	created := make(chan error, 1)
+	go func() {
+		_, err := e.create("sb-1", 1, warmSpec)
+		created <- err
+	}()
+	<-cg.entered
+	e.m.mu.Lock()
+	s := e.m.sandboxes["sb-1"]
+	rid := s.ref.ID
+	s.state = stateReady
+	e.m.mu.Unlock()
+	execd := make(chan error, 1)
+	go func() { execd <- e.m.Exec(context.Background(), pyReq("sb-1", "print(1)"), (&collector{}).send) }()
+	eventually(t, "the Exec to register", func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return len(s.execs) == 1
+	})
+	cg.release <- errors.New("write cpu.max: permission denied")
+	wantCode(t, <-created, codes.Internal, "forced WARM with a failed SetLimits")
+	select {
+	case err := <-execd:
+		wantCode(t, err, codes.Unavailable, "Exec on the failed claim")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Exec on the failed claim did not end")
+	}
+	if _, ok := e.rt.Containers()[rid]; ok || e.inTable("sb-1") || exists(e.bundleDir(rid)) {
+		t.Errorf("failed claim left %s: containers %v", rid, e.rt.Containers())
+	}
+}
+
+// The liveness loop drops a ready pool sandbox whose process is gone, and
+// the pool replaces it.
+func TestPoolDropsDeadSandbox(t *testing.T) {
+	var g *gatedPool
+	e := newEnv(t, withPool(2, gate(&g)))
+	var dead atomic.Int64
+	e.m.processAlive = func(pid int) bool { return int64(pid) != dead.Load() }
+	e.start(t)
+	e.waitWarm(t, 2)
+	gone := e.warmIDs()[0]
+	g.hold.Store(true) // the replacement waits, so the drop shows
+	dead.Store(int64(e.pidOf(t, gone)))
+	e.waitWarm(t, 1)
+	if slices.Contains(e.warmIDs(), gone) {
+		t.Fatalf("dead %s is still in the pool", gone)
+	}
+	eventually(t, "the dead pool sandbox's teardown", func() bool {
+		_, ok := e.rt.Containers()[gone]
+		return !ok && !exists(e.bundleDir(gone)) && e.cg.count("Remove "+bundle.CgroupPath("n1", gone)) == 1
+	})
+	g.hold.Store(false)
+	e.waitWarm(t, 2)
+	if slices.Contains(e.warmIDs(), gone) {
+		t.Errorf("dead %s is back in the pool %q", gone, e.warmIDs())
+	}
+}
+
+// A pool sandbox whose teardown fails stays as a broken table entry under
+// its runsc ID: not listed, counted against the node, retried by the
+// liveness loop, and removed by Close.
+func TestPoolTeardownFailure(t *testing.T) {
+	var sd *stuckPoolDelete
+	stuck := func(c *Config, d *Deps) {
+		c.MaxSandboxes = 1
+		sd = &stuckPoolDelete{Runtime: d.Runtime}
+		d.Runtime = sd
+	}
+	e := newEnv(t, withPool(1, stuck))
+	var dead atomic.Int64
+	e.m.processAlive = func(pid int) bool { return int64(pid) != dead.Load() }
+	e.start(t)
+	e.waitWarm(t, 1)
+	rid := e.warmIDs()[0]
+	sd.stuck.Store(true)
+	dead.Store(int64(e.pidOf(t, rid)))
+	eventually(t, "a broken entry for the dead pool sandbox", func() bool { return e.brokenEntry(rid) })
+	if got := e.m.List(); len(got) != 0 {
+		t.Errorf("List = %v, want nothing", got)
+	}
+	_, err := e.create("sb-1", 1, coldSpec)
+	wantCode(t, err, codes.ResourceExhausted, "Create while the broken pool sandbox holds the node")
+	fails := sd.fails.Load()
+	eventually(t, "the liveness loop to retry the teardown", func() bool { return sd.fails.Load() > fails })
+	sd.stuck.Store(false)
+	eventually(t, "the retried teardown", func() bool { return !e.inTable(rid) })
+	if _, ok := e.rt.Containers()[rid]; ok || exists(e.bundleDir(rid)) {
+		t.Errorf("%s not cleaned up: containers %v", rid, e.rt.Containers())
+	}
+	e.waitWarm(t, 1) // the node has room for the pool again
+
+	// A teardown that fails when a Create takes a pool sandbox's place: the
+	// Create fails, and Close removes the broken entry.
+	f := newEnv(t, withPool(1, stuck))
+	f.m.liveEvery = time.Hour // only Close retries
+	if err := f.m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.waitWarm(t, 1)
+	rid = f.warmIDs()[0]
+	sd.stuck.Store(true)
+	_, err = f.create("sb-1", 1, coldSpec)
+	wantCode(t, err, codes.Internal, "Create whose pool sandbox would not go")
+	if !f.brokenEntry(rid) || f.inTable("sb-1") {
+		t.Errorf("broken %s in the table: %v, sb-1 in the table: %v; want true, false", rid, f.brokenEntry(rid), f.inTable("sb-1"))
+	}
+	sd.stuck.Store(false)
+	if err := f.m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.rt.Containers(); len(got) != 0 || f.inTable(rid) || exists(f.bundleDir(rid)) {
+		t.Errorf("after Close: containers %v, %s in the table %v", got, rid, f.inTable(rid))
+	}
+}
+
+// A claim never hands out a pool sandbox whose process is gone: it has it
+// torn down and takes the next one, or misses when none is left.
+func TestClaimSkipsDeadSandbox(t *testing.T) {
+	var dead atomic.Int64
+	alive := func(pid int) bool { return int64(pid) != dead.Load() }
+	e := newEnv(t, withPool(2, nil))
+	e.m.liveEvery = time.Hour // only the claim looks at the pool's processes
+	e.m.processAlive = alive
+	e.start(t)
+	e.waitWarm(t, 2)
+	ids := e.warmIDs()
+	dead.Store(int64(e.pidOf(t, ids[0]))) // the oldest, which a claim takes first
+	if resp := e.mustCreate(t, "sb-1", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_WARM {
+		t.Errorf("started as %v, want WARM", resp.GetStartedAs())
+	}
+	if rid := e.runscIDOf(t, "sb-1"); rid != ids[1] {
+		t.Errorf("sb-1 runs as %s, want the live pool sandbox %s (not the dead %s)", rid, ids[1], ids[0])
+	}
+	eventually(t, "the dead pool sandbox's teardown", func() bool {
+		_, ok := e.rt.Containers()[ids[0]]
+		return !ok && !exists(e.bundleDir(ids[0]))
+	})
+	e.waitWarm(t, 2)
+	if slices.Contains(e.warmIDs(), ids[0]) {
+		t.Errorf("dead %s is back in the pool", ids[0])
+	}
+
+	// With the only pool sandbox dead, AUTO misses and starts cold, and a
+	// forced WARM finds the pool empty.
+	var g *gatedPool
+	f := newEnv(t, withPool(1, gate(&g)))
+	f.m.liveEvery = time.Hour
+	f.m.processAlive = alive
+	f.start(t)
+	f.waitWarm(t, 1)
+	g.hold.Store(true) // no replacement
+	dead.Store(int64(f.pidOf(t, f.warmIDs()[0])))
+	if resp := f.mustCreate(t, "sb-1", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("AUTO with a dead pool started as %v, want COLD", resp.GetStartedAs())
+	}
+	_, err := f.create("sb-2", 1, warmSpec)
+	if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != "warm pool empty" {
+		t.Errorf("forced WARM with a dead pool: %v, want FailedPrecondition \"warm pool empty\"", err)
+	}
+}
+
+// A claim that races Close ends either WARM, and then destroyed by Close,
+// or Unavailable; Close leaves nothing.
+func TestClaimDuringClose(t *testing.T) {
+	ctx := context.Background()
+	empty := func(e *env, what string) {
+		t.Helper()
+		e.m.mu.Lock()
+		entries := len(e.m.sandboxes)
+		e.m.mu.Unlock()
+		ents, _ := os.ReadDir(filepath.Join(e.state, "bundles"))
+		if got := e.rt.Containers(); len(got) != 0 || len(ents) != 0 || entries != 0 || e.m.WarmReady() != 0 {
+			t.Errorf("%s: containers %v, bundles %v, %d table entries, WarmReady %d; want nothing", what, got, ents, entries, e.m.WarmReady())
+		}
+	}
+
+	// Close begins while a claim waits in SetLimits: Close waits for the
+	// claim, then destroys the sandbox.
+	var cg *holdLimits
+	e := newEnv(t, withPool(1, holdLimitsOf(&cg)))
+	if err := e.m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.waitWarm(t, 1)
+	var resp *gssv1.NodeCreateResponse
+	created := make(chan error, 1)
+	go func() {
+		var err error
+		resp, err = e.create("sb-1", 1, nil)
+		created <- err
+	}()
+	<-cg.entered
+	closed := make(chan error, 1)
+	go func() { closed <- e.m.Close(ctx) }()
+	select {
+	case err := <-closed:
+		t.Errorf("Close returned (%v) while a claim was in flight", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cg.release <- nil
+	if err := <-created; err != nil || resp.GetStartedAs() != gssv1.StartMode_START_MODE_WARM {
+		t.Errorf("Create during Close: %v, %v; want WARM", resp, err)
+	}
+	if err := <-closed; err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	empty(e, "claim held during Close")
+
+	// Unheld, in whichever order the two run.
+	for i := range 20 {
+		f := newEnv(t, withPool(1, nil))
+		if err := f.m.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		f.waitWarm(t, 1)
+		var resp *gssv1.NodeCreateResponse
+		var cerr, closeErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); resp, cerr = f.create("sb-1", 1, nil) }()
+		go func() { defer wg.Done(); closeErr = f.m.Close(ctx) }()
+		wg.Wait()
+		if !(cerr == nil && resp.GetStartedAs() == gssv1.StartMode_START_MODE_WARM) && status.Code(cerr) != codes.Unavailable {
+			t.Errorf("round %d: Create %v, %v; want WARM or Unavailable", i, resp, cerr)
+		}
+		if closeErr != nil {
+			t.Errorf("round %d: Close: %v", i, closeErr)
+		}
+		empty(f, fmt.Sprintf("round %d", i))
 	}
 }

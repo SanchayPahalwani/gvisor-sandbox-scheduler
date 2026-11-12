@@ -207,6 +207,11 @@ func (m *Manager) destroyEntry(ctx context.Context, e *sandbox) error {
 		return err
 	}
 	defer e.unlock()
+	return m.destroyHeld(ctx, e)
+}
+
+// destroyHeld is destroyEntry for a caller that holds e's lifecycle lock.
+func (m *Manager) destroyHeld(ctx context.Context, e *sandbox) error {
 	m.mu.Lock()
 	if e.state == stateGone {
 		m.mu.Unlock()
