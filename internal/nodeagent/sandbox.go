@@ -63,7 +63,6 @@ type sandbox struct {
 	id          string
 	incarnation int32
 	spec        *gssv1.SandboxSpec // defaulted and validated
-	startedAs   gssv1.StartMode
 	ref         runsc.Ref
 	bundleDir   string
 	cgroup      string
@@ -74,8 +73,9 @@ type sandbox struct {
 	op chan struct{}
 
 	// Guarded by Manager.mu; changed only by the holder of op.
-	state sandboxState
-	pid   int // the runsc sandbox process, once ready
+	state     sandboxState
+	pid       int             // the runsc sandbox process, once ready
+	startedAs gssv1.StartMode // COLD after a restore that fell back
 
 	// The Execs in flight, guarded by Manager.mu. An Exec adds itself while
 	// the entry is ready; a destroy ends them all when it starts.
@@ -108,10 +108,12 @@ const readyProbe = `{"code_len":4,"timeout_s":0,"env":{}}` + "\n" + "pass"
 // own stdout and stderr (the zygote's, not an Exec's).
 const containerLog = "container.log"
 
-// startCold runs the cold start path up to readiness: network, bundle,
-// runsc create, runsc start, readiness probe. On failure it returns the name
-// of the failing step; e records what was done, for teardown.
-func (m *Manager) startCold(ctx context.Context, e *sandbox) (step string, err error) {
+// startSandbox runs a start path up to readiness (spec 7.3): network,
+// bundle, runsc create, then runsc start (the cold path, imageDir "") or
+// runsc restore from the checkpoint image in imageDir, then the readiness
+// probe. On failure it returns the name of the failing step; e records what
+// was done, for teardown.
+func (m *Manager) startSandbox(ctx context.Context, e *sandbox, imageDir string) (step string, err error) {
 	var netns string
 	var hosts []bundle.HostEntry
 	if len(e.spec.GetEgressAllow()) > 0 {
@@ -136,8 +138,12 @@ func (m *Manager) startCold(ctx context.Context, e *sandbox) (step string, err e
 	if err := m.rt.Create(ctx, e.ref, e.bundleDir, filepath.Join(e.bundleDir, containerLog)); err != nil {
 		return "runsc.create", err
 	}
-	if err := m.rt.Start(ctx, e.ref); err != nil {
-		return "runsc.start", err
+	if imageDir == "" {
+		if err := m.rt.Start(ctx, e.ref); err != nil {
+			return "runsc.start", err
+		}
+	} else if err := m.rt.Restore(ctx, e.ref, e.bundleDir, imageDir); err != nil {
+		return "runsc.restore", err
 	}
 	if err := m.waitReady(ctx, e); err != nil {
 		return "sandbox.ready", err
@@ -147,7 +153,8 @@ func (m *Manager) startCold(ctx context.Context, e *sandbox) (step string, err e
 
 // waitReady runs the readiness probe (spec 6.3): a no-op python_code Exec,
 // bounded by ReadyTimeout. pyfork retries its connection to the zygote, so on
-// a cold start this one call returns when the interpreter is ready.
+// a cold start this one call returns when the interpreter is ready; a
+// restored zygote is already listening.
 func (m *Manager) waitReady(ctx context.Context, e *sandbox) (err error) {
 	ctx, span := startSpan(ctx, "sandbox.ready", attribute.String("runsc.id", e.ref.ID))
 	defer func() { endSpan(span, err) }()

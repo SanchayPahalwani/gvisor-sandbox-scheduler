@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -83,11 +84,21 @@ func (n *realNode) manager(t *testing.T) *Manager {
 // managerNet is manager with np as the network policy (nil: none).
 func (n *realNode) managerNet(t *testing.T, np NetPolicy) *Manager {
 	t.Helper()
-	m, err := NewManager(Config{
+	return n.managerConfig(t, np, nil)
+}
+
+// managerConfig is managerNet with mod (if not nil) applied to the config.
+func (n *realNode) managerConfig(t *testing.T, np NetPolicy, mod func(*Config)) *Manager {
+	t.Helper()
+	cfg := Config{
 		NodeID: n.id, Group: "test",
 		CPUMillis: 4000, MemoryBytes: 4 << 30, MaxSandboxes: 8,
 		RootFS: testenv.Rootfs(t), StateDir: n.state,
-	}, Deps{Runtime: n.rt, Cgroups: NewCgroupFS(cgroupRoot), Net: np})
+	}
+	if mod != nil {
+		mod(&cfg)
+	}
+	m, err := NewManager(cfg, Deps{Runtime: n.rt, Cgroups: NewCgroupFS(cgroupRoot), Net: np})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,5 +455,158 @@ print(urllib.request.urlopen("http://target.test:8080/", timeout=5).status)`)
 	}
 	if out := mustRun(t, "nft", "list", "table", "inet", table); strings.Contains(out, "chain sb_") {
 		t.Errorf("sandbox chain left after Destroy:\n%s", out)
+	}
+}
+
+// restoreManager returns a started manager on n, with np as its network
+// policy, whose checkpoint images live in the node's state directory: each
+// test builds its own image, and it goes with the state directory. The
+// manager is closed at cleanup (before np, which was made earlier).
+func restoreManager(t *testing.T, n *realNode, np NetPolicy) *Manager {
+	t.Helper()
+	m := n.managerConfig(t, np, func(c *Config) { c.CheckpointDir = filepath.Join(n.state, "checkpoints") })
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := m.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if !m.ImageReady() {
+		t.Fatal("Start did not build the checkpoint image")
+	}
+	return m
+}
+
+// readCgroup returns the trimmed content of one interface file of a sandbox's cgroup.
+func (n *realNode) readCgroup(t *testing.T, rid, file string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(n.cgroupDir(rid), file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func TestRealRestore(t *testing.T) {
+	n := newRealNode(t)
+	m := restoreManager(t, n, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	dir, err := m.EnsureImage(ctx) // the one Start built
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := filepath.Dir(dir), filepath.Join(n.state, "checkpoints"); got != want {
+		t.Errorf("image directory %s is not in %s", dir, want)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "checkpoint.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("image %s: checkpoint.img %d bytes", dir, fi.Size())
+	if got := n.listContainers(t); len(got) != 0 {
+		t.Errorf("runsc list after the image build = %q, want none", got)
+	}
+
+	// Two sandboxes restored from the image at the same time; sb-1 with
+	// limits other than the image sandbox's.
+	ids := []string{"sb-1", "sb-2"}
+	specs := []*gssv1.SandboxSpec{{Resources: &gssv1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}}, nil}
+	resps, errs := make([]*gssv1.NodeCreateResponse, len(ids)), make([]error, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resps[i], errs[i] = m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: id, Incarnation: 1, Spec: specs[i]})
+		}()
+	}
+	wg.Wait()
+	for i, id := range ids {
+		if errs[i] != nil {
+			t.Fatalf("Create %s: %v", id, errs[i])
+		}
+		if got := resps[i].GetStartedAs(); got != gssv1.StartMode_START_MODE_RESTORE {
+			t.Errorf("%s started as %v, want RESTORE", id, got)
+		}
+		t.Logf("%s restore ready latency %v", id, resps[i].GetReadyLatency().AsDuration())
+	}
+	if got := n.listContainers(t); len(got) != 2 {
+		t.Errorf("runsc list = %q, want sb-1_1_ and sb-2_1_", got)
+	}
+	for _, id := range ids {
+		r := runExec(ctx, m, pyReq(id, `import sys; print("pandas" in sys.modules)`), nil)
+		if exit := r.ok(t, id); exit.GetCode() != 0 || r.stdout.String() != "True\n" {
+			t.Errorf("%s: exit %v, stdout %q, stderr %q; want 0 and \"True\\n\"", id, exit, r.stdout.String(), r.stderr.String())
+		}
+	}
+	for rid, want := range map[string][2]string{
+		"sb-1_1_": {"100000 100000", "536870912"},
+		"sb-2_1_": {"50000 100000", "268435456"},
+	} {
+		if got := n.readCgroup(t, rid, "cpu.max"); got != want[0] {
+			t.Errorf("%s cpu.max = %q, want %q", rid, got, want[0])
+		}
+		if got := n.readCgroup(t, rid, "memory.max"); got != want[1] {
+			t.Errorf("%s memory.max = %q, want %q", rid, got, want[1])
+		}
+	}
+}
+
+func TestRealRestoreEgress(t *testing.T) {
+	n := newRealNode(t)
+	egressTarget(t)
+	np := egressPolicy(t, n.id)
+	m := restoreManager(t, n, np)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	egress := &gssv1.SandboxSpec{EgressAllow: []string{targetAddr + ":8080", "target.test:8080"}}
+	resp, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "eg-1", Incarnation: 1, Spec: egress})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Fatalf("started as %v, want RESTORE (a no-network image restored into an egress sandbox)", resp.GetStartedAs())
+	}
+	get := pyReq("eg-1", `import urllib.request
+print(urllib.request.urlopen("http://target.test:8080/", timeout=5).status)`)
+	r := runExec(ctx, m, get, nil)
+	if exit := r.ok(t, "GET http://target.test:8080/"); exit.GetCode() != 0 || r.stdout.String() != "200\n" {
+		t.Errorf("GET http://target.test:8080/: exit %v, stdout %q, stderr %q; want 0 and \"200\\n\"", exit, r.stdout.String(), r.stderr.String())
+	}
+	r = runExec(ctx, m, pyReq("eg-1", connectCode(targetAddr, 8081)), nil)
+	if r.ok(t, "connect to 8081"); strings.TrimSpace(r.stdout.String()) != "timeout" {
+		t.Errorf("%s:8081 (not allowed): %q (stderr %q), want timeout", targetAddr, r.stdout.String(), r.stderr.String())
+	}
+}
+
+func TestRealColdStillWorks(t *testing.T) {
+	n := newRealNode(t)
+	m := restoreManager(t, n, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	cold, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "sb-1", Incarnation: 1,
+		Spec: &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_COLD}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cold.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("forced COLD started as %v", cold.GetStartedAs())
+	}
+	auto, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "sb-2", Incarnation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auto.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("AUTO on the same node started as %v, want RESTORE", auto.GetStartedAs())
+	}
+	t.Logf("ready latency: cold %v, restore %v", cold.GetReadyLatency().AsDuration(), auto.GetReadyLatency().AsDuration())
+	r := runExec(ctx, m, pyReq("sb-1", `print("hello")`), nil)
+	if exit := r.ok(t, "cold sandbox"); exit.GetCode() != 0 || r.stdout.String() != "hello\n" {
+		t.Errorf("cold sandbox: exit %v, stdout %q, stderr %q", exit, r.stdout.String(), r.stderr.String())
 	}
 }

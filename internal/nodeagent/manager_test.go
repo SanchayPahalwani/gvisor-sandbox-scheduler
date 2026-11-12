@@ -796,6 +796,260 @@ func TestStartRequired(t *testing.T) {
 	}
 }
 
+// recordSpans makes a span recorder the global tracer provider for the test.
+func recordSpans(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	sr := tracetest.NewSpanRecorder()
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	return sr
+}
+
+// lastSpan returns the last ended span called name, or nil.
+func lastSpan(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	var out sdktrace.ReadOnlySpan
+	for _, s := range spans {
+		if s.Name() == name {
+			out = s
+		}
+	}
+	return out
+}
+
+// checkParent checks that the last span called child is a child of the last
+// span called parent.
+func checkParent(t *testing.T, spans []sdktrace.ReadOnlySpan, child, parent string) {
+	t.Helper()
+	c, p := lastSpan(spans, child), lastSpan(spans, parent)
+	if c == nil || p == nil {
+		t.Errorf("missing span %q or %q in %d spans", child, parent, len(spans))
+		return
+	}
+	if c.Parent().SpanID() != p.SpanContext().SpanID() {
+		t.Errorf("span %s is not a child of %s", child, parent)
+	}
+}
+
+func TestChooseMode(t *testing.T) {
+	const (
+		auto    = gssv1.StartMode_START_MODE_AUTO
+		cold    = gssv1.StartMode_START_MODE_COLD
+		restore = gssv1.StartMode_START_MODE_RESTORE
+		warm    = gssv1.StartMode_START_MODE_WARM
+	)
+	for _, tc := range []struct {
+		requested  gssv1.StartMode
+		egress     bool
+		poolReady  int
+		imageReady bool
+		want       gssv1.StartMode
+		wantErr    string // FailedPrecondition with this message
+	}{
+		{requested: auto, poolReady: 2, imageReady: true, want: warm},
+		{requested: auto, egress: true, poolReady: 2, imageReady: true, want: restore},
+		{requested: auto, imageReady: true, want: restore},
+		{requested: auto, want: cold},
+		{requested: auto, egress: true, poolReady: 2, want: cold},
+		{requested: cold, egress: true, poolReady: 2, imageReady: true, want: cold},
+		{requested: restore, imageReady: true, want: restore},
+		{requested: restore, egress: true, poolReady: 2, imageReady: true, want: restore},
+		{requested: restore, poolReady: 2, wantErr: "no checkpoint image"},
+		{requested: warm, poolReady: 1, want: warm},
+		{requested: warm, imageReady: true, wantErr: "warm pool empty"},
+		{requested: warm, egress: true, poolReady: 2, imageReady: true, wantErr: "warm pool cannot serve egress"},
+	} {
+		name := fmt.Sprintf("%v egress=%v pool=%d image=%v", tc.requested, tc.egress, tc.poolReady, tc.imageReady)
+		got, err := chooseMode(tc.requested, tc.egress, tc.poolReady, tc.imageReady)
+		if tc.wantErr != "" {
+			if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != tc.wantErr {
+				t.Errorf("%s: %v, %v; want FailedPrecondition %q", name, got, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%s: %v, %v; want %v", name, got, err, tc.want)
+		}
+	}
+	if _, err := chooseMode(9, false, 0, true); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown mode: %v, want InvalidArgument", err)
+	}
+}
+
+// restoreEnv returns a started env whose image is ready.
+func restoreEnv(t *testing.T, mod func(*Config, *Deps)) (*env, *imageFake) {
+	t.Helper()
+	e, f := imageEnv(t, t.TempDir(), mod)
+	e.start(t)
+	if !e.m.ImageReady() {
+		t.Fatal("Start did not make the image ready")
+	}
+	return e, f
+}
+
+func TestCreateRestore(t *testing.T) {
+	sr := recordSpans(t)
+	e, f := restoreEnv(t, nil)
+	before, paths := len(e.rt.Calls()), len(f.Paths())
+	resp := e.mustCreate(t, "sb-1", 1, spec(1000, 512<<20))
+
+	rid := "sb-1_1_"
+	want := []string{
+		"Create id=" + rid + " net=none",
+		"Restore id=" + rid + " net=none",
+		"Exec id=" + rid + " net=none",  // the readiness probe
+		"State id=" + rid + " net=none", // the sandbox pid
+	}
+	if got := e.rt.Calls()[before:]; !slices.Equal(got, want) {
+		t.Errorf("runtime calls = %q, want %q", got, want)
+	}
+	image := filepath.Join(e.m.cfg.CheckpointDir, testImageKey())
+	if got := f.Paths()[paths:]; !slices.Equal(got, []string{"Restore " + image}) {
+		t.Errorf("image paths = %q, want a restore from %s", got, image)
+	}
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE || resp.GetReadyLatency() == nil {
+		t.Errorf("response = %v, want RESTORE with ready_latency", resp)
+	}
+	if l := e.m.List(); len(l) != 1 || l[0].GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("List = %v", l)
+	}
+	// The bundle has the request's limits, not the image's.
+	raw, err := os.ReadFile(filepath.Join(e.bundleDir(rid), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"limit": 536870912`) || !strings.Contains(string(raw), `"quota": 100000`) {
+		t.Errorf("bundle does not carry 1000m / 512 MiB:\n%s", raw)
+	}
+	spans := sr.Ended()
+	for _, name := range []string{"runsc.create", "runsc.restore", "sandbox.ready"} {
+		checkParent(t, spans, name, "node.create")
+	}
+	create := lastSpan(spans, "node.create")
+	if create == nil {
+		t.Fatal("no node.create span")
+	}
+	for _, s := range spans {
+		if s.Name() == "runsc.start" && s.Parent().SpanID() == create.SpanContext().SpanID() {
+			t.Error("the restore path ran runsc start")
+		}
+	}
+	if !slices.Contains(create.Attributes(), attribute.String("start.mode", "restore")) {
+		t.Errorf("node.create attributes = %v", create.Attributes())
+	}
+}
+
+func TestCreateRestoreFallsBackToCold(t *testing.T) {
+	e, _ := restoreEnv(t, nil)
+	e.rt.Fail["Restore"] = errors.New("restore failed")
+	before := len(e.rt.Calls())
+	resp := e.mustCreate(t, "sb-1", 1, nil)
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	rid := "sb-1_1_"
+	want := []string{
+		"Create id=" + rid + " net=none",
+		"Restore id=" + rid + " net=none",
+		"Delete id=" + rid + " net=none", // what the restore made goes first
+		"Create id=" + rid + " net=none",
+		"Start id=" + rid + " net=none",
+		"Exec id=" + rid + " net=none",
+		"State id=" + rid + " net=none",
+	}
+	if got := e.rt.Calls()[before:]; !slices.Equal(got, want) {
+		t.Errorf("runtime calls = %q, want %q", got, want)
+	}
+	if n := e.cg.count("Remove " + bundle.CgroupPath("n1", rid)); n != 1 {
+		t.Errorf("cgroup removed %d times before the cold start, want 1: %q", n, e.cg.Calls())
+	}
+	if l := e.m.List(); len(l) != 1 || l[0].GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("List = %v", l)
+	}
+	if e.rt.Containers()[rid] != "running" {
+		t.Errorf("containers = %v", e.rt.Containers())
+	}
+
+	// A restored sandbox that does not get ready also falls back.
+	probes := 0
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		if ref.ID == "sb-2_1_" {
+			if probes++; probes == 1 {
+				return 1, nil
+			}
+		}
+		return 0, nil
+	}
+	if resp := e.mustCreate(t, "sb-2", 1, nil); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("not ready after restore: started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	e.rt.ExecFunc = nil
+
+	// A step the cold path shares does not fall back.
+	e.rt.Fail["Create"] = errors.New("create failed")
+	before = len(e.rt.Calls())
+	_, err := e.create("sb-3", 1, nil)
+	wantCode(t, err, codes.Internal, "create failure on the restore path")
+	if got, want := e.rt.Calls()[before:], []string{"Create id=sb-3_1_ net=none", "Delete id=sb-3_1_ net=none"}; !slices.Equal(got, want) {
+		t.Errorf("runtime calls = %q, want %q", got, want)
+	}
+
+	// Forced RESTORE does not fall back.
+	e.rt.Fail["Restore"] = errors.New("restore failed")
+	before = len(e.rt.Calls())
+	_, err = e.create("sb-4", 1, &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_RESTORE})
+	wantCode(t, err, codes.Internal, "forced RESTORE")
+	if !strings.Contains(err.Error(), "runsc.restore") || !strings.Contains(err.Error(), "restore failed") {
+		t.Errorf("error %v does not name the step and cause", err)
+	}
+	if got := e.rt.Calls()[before:]; slices.Contains(got, "Start id=sb-4_1_ net=none") {
+		t.Errorf("forced RESTORE started cold: %q", got)
+	}
+	if _, ok := e.rt.Containers()["sb-4_1_"]; ok || exists(e.bundleDir("sb-4_1_")) || e.inTable("sb-4") {
+		t.Errorf("sb-4 not rolled back: containers %v", e.rt.Containers())
+	}
+}
+
+func TestEgressUsesRestore(t *testing.T) {
+	n := &fakeNet{}
+	e, _ := restoreEnv(t, func(_ *Config, d *Deps) { d.Net = n })
+	egress := &gssv1.SandboxSpec{EgressAllow: []string{"api.example:443"}}
+	before := len(e.rt.Calls())
+	resp := e.mustCreate(t, "eg-1", 1, egress)
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_RESTORE {
+		t.Errorf("started_as = %v, want RESTORE", resp.GetStartedAs())
+	}
+	got := e.rt.Calls()[before:]
+	for _, call := range []string{"Create id=eg-1_1_ net=sandbox", "Restore id=eg-1_1_ net=sandbox"} {
+		if !slices.Contains(got, call) {
+			t.Errorf("runtime calls = %q, want %q", got, call)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(e.bundleDir("eg-1_1_"), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"path": "/var/run/netns/gss-eg-1_1_"`) {
+		t.Error("bundle does not join the prepared namespace")
+	}
+	if got, want := n.Calls(), []string{"Setup eg-1_1_ api.example:443"}; !slices.Equal(got, want) {
+		t.Errorf("net calls = %q, want %q", got, want)
+	}
+
+	// A fallback to cold tears the network down and sets it up again.
+	e.rt.Fail["Restore"] = errors.New("restore failed")
+	if resp := e.mustCreate(t, "eg-2", 1, egress); resp.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("started_as = %v, want COLD", resp.GetStartedAs())
+	}
+	want := []string{"Setup eg-2_1_ api.example:443", "Teardown eg-2_1_", "Setup eg-2_1_ api.example:443"}
+	if got := n.Calls()[1:]; !slices.Equal(got, want) {
+		t.Errorf("net calls = %q, want %q", got, want)
+	}
+	if !slices.Contains(e.rt.Calls(), "Start id=eg-2_1_ net=sandbox") {
+		t.Errorf("runtime calls = %q", e.rt.Calls())
+	}
+}
+
 func TestForcedModesUnavailable(t *testing.T) {
 	e := startEnv(t, nil)
 	before := len(e.rt.Calls())

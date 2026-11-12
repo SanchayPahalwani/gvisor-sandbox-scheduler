@@ -32,7 +32,7 @@ type Config struct {
 	MaxSandboxes  int
 	RootFS        string
 	StateDir      string        // bundles live in StateDir/bundles/<runsc-id>
-	CheckpointDir string        // "" disables checkpoint/restore
+	CheckpointDir string        // "" disables checkpoint/restore; shared by the agents of a host
 	WarmPoolSize  int           // 0 disables the pool
 	Prime         string        // default bundle.DefaultPrime
 	ReadyTimeout  time.Duration // default 30s
@@ -76,10 +76,10 @@ var nodeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
 // against the node's capacity, the start and teardown steps, the TTL reaper
 // and the liveness check.
 //
-// Locking: mu guards the table and each entry's state and pid. Each entry
-// also has a lifecycle lock (sandbox.op) held for the whole of a Create or a
-// destroy, so those never run at once on one entry; mu is never held while
-// waiting for that lock or while calling runsc.
+// Locking: mu guards the table, the image directory, and each entry's state,
+// pid and start mode. Each entry also has a lifecycle lock (sandbox.op) held
+// for the whole of a Create or a destroy, so those never run at once on one
+// entry; mu is never held while waiting for that lock or while calling runsc.
 type Manager struct {
 	cfg Config
 	rt  runsc.Runtime // every call is traced as runsc.<method>
@@ -94,6 +94,7 @@ type Manager struct {
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandbox // by sandbox ID
+	imageDir  string              // the checkpoint image Creates restore from; "" if none
 	serving   bool                // Start finished; Create is open
 	started   bool
 	closed    bool
@@ -140,10 +141,12 @@ func NewManager(cfg Config, deps Deps) (*Manager, error) {
 	}, nil
 }
 
-// Start removes what an earlier agent with this node ID left behind, then
-// starts the reaper and the liveness loop, which run until Close. Create is
-// refused until Start has succeeded: the leftover sweep deletes every
-// container under the runsc root.
+// Start removes what an earlier agent with this node ID left behind, makes
+// sure the checkpoint image exists (when CheckpointDir is set), then starts
+// the reaper and the liveness loop, which run until Close. Create is refused
+// until Start has succeeded: the leftover sweep deletes every container under
+// the runsc root. A failed image build is logged and does not fail Start:
+// the node then serves cold starts.
 func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
 	if m.started || m.closed {
@@ -156,6 +159,13 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err := m.removeLeftovers(ctx); err != nil {
 		return fmt.Errorf("nodeagent: remove leftovers: %w", err)
 	}
+	if m.cfg.CheckpointDir != "" {
+		if dir, err := m.EnsureImage(ctx); err != nil {
+			slog.Warn("no checkpoint image; sandboxes start cold", "node", m.cfg.NodeID, "err", err)
+		} else {
+			slog.Info("checkpoint image ready", "node", m.cfg.NodeID, "dir", dir)
+		}
+	}
 	m.loops.Add(2)
 	go m.loop(m.reapEvery, m.reapExpired)
 	go m.loop(m.liveEvery, m.checkLiveness)
@@ -165,8 +175,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Create starts a sandbox and returns when it is ready (spec 7.3; only the
-// cold path exists so far).
+// Create starts a sandbox and returns when it is ready, on the path
+// chooseMode picks (spec 7.3). In AUTO mode a restore that fails in its own
+// steps is undone and the cold path runs once instead; a forced RESTORE
+// fails with Internal.
 func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (resp *gssv1.NodeCreateResponse, err error) {
 	begin := time.Now() // ready_latency is a measurement: real time, not Deps.Now
 	ctx, span := startSpan(ctx, "node.create",
@@ -189,11 +201,13 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	if err := gssv1.ValidateSpec(spec); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	mode, err := startMode(spec.GetStartMode())
+	egress := len(spec.GetEgressAllow()) > 0
+	imageDir := m.image()
+	mode, err := chooseMode(spec.GetStartMode(), egress, noWarmPool, imageDir != "")
 	if err != nil {
 		return nil, err
 	}
-	if len(spec.GetEgressAllow()) > 0 && m.net == nil {
+	if egress && m.net == nil {
 		return nil, status.Error(codes.FailedPrecondition, "egress_allow needs a network policy, and this node has none")
 	}
 	span.SetAttributes(attribute.String("start.mode", modeName(mode)))
@@ -203,7 +217,17 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 		return nil, err
 	}
 	defer e.unlock()
-	step, err := m.startCold(ctx, e)
+	var step string
+	if mode == gssv1.StartMode_START_MODE_RESTORE {
+		step, err = m.startSandbox(ctx, e, imageDir)
+		if err != nil && spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO && restoreStep(step) && ctx.Err() == nil {
+			mode = gssv1.StartMode_START_MODE_COLD
+			span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
+			step, err = m.coldAfterRestore(ctx, e, step, err)
+		}
+	} else {
+		step, err = m.startSandbox(ctx, e, "")
+	}
 	latency := time.Since(begin)
 	if err == nil {
 		step, err = "runsc.state", m.recordPID(ctx, e)
@@ -223,18 +247,62 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(latency)}, nil
 }
 
-// startMode picks the start path. Until the warm pool and checkpoint images
-// exist, forcing either fails rather than measuring a different path.
-func startMode(requested gssv1.StartMode) (gssv1.StartMode, error) {
+// noWarmPool is the number of ready pooled sandboxes until the node has a
+// warm pool.
+const noWarmPool = 0
+
+// chooseMode is the whole start-path policy (spec 7.3). AUTO takes the warm
+// pool for a no-network sandbox when it has a ready sandbox, else restores
+// when there is a checkpoint image, else starts cold. A forced mode that
+// cannot be served fails with FailedPrecondition rather than measuring a
+// different path.
+func chooseMode(requested gssv1.StartMode, hasEgress bool, poolReady int, imageReady bool) (gssv1.StartMode, error) {
+	warm := poolReady > 0 && !hasEgress
 	switch requested {
-	case gssv1.StartMode_START_MODE_AUTO, gssv1.StartMode_START_MODE_COLD:
+	case gssv1.StartMode_START_MODE_AUTO:
+		switch {
+		case warm:
+			return gssv1.StartMode_START_MODE_WARM, nil
+		case imageReady:
+			return gssv1.StartMode_START_MODE_RESTORE, nil
+		}
 		return gssv1.StartMode_START_MODE_COLD, nil
-	case gssv1.StartMode_START_MODE_WARM:
-		return 0, status.Error(codes.FailedPrecondition, "warm pool empty")
+	case gssv1.StartMode_START_MODE_COLD:
+		return gssv1.StartMode_START_MODE_COLD, nil
 	case gssv1.StartMode_START_MODE_RESTORE:
-		return 0, status.Error(codes.FailedPrecondition, "no checkpoint image")
+		if !imageReady {
+			return 0, status.Error(codes.FailedPrecondition, "no checkpoint image")
+		}
+		return gssv1.StartMode_START_MODE_RESTORE, nil
+	case gssv1.StartMode_START_MODE_WARM:
+		switch {
+		case hasEgress:
+			return 0, status.Error(codes.FailedPrecondition, "warm pool cannot serve egress")
+		case !warm:
+			return 0, status.Error(codes.FailedPrecondition, "warm pool empty")
+		}
+		return gssv1.StartMode_START_MODE_WARM, nil
 	}
 	return 0, status.Errorf(codes.InvalidArgument, "unknown start_mode %d", requested)
+}
+
+// restoreStep reports whether a failure in step of the restore path is the
+// restore's own (the image did not give a ready sandbox), as opposed to a
+// step the cold path shares and would fail the same way.
+func restoreStep(step string) bool { return step == "runsc.restore" || step == "sandbox.ready" }
+
+// coldAfterRestore is the AUTO fallback after the restore path failed with
+// err in step: it removes everything the restore made (container, bundle,
+// cgroup, network), then runs the cold path for the same entry once.
+func (m *Manager) coldAfterRestore(ctx context.Context, e *sandbox, step string, err error) (string, error) {
+	slog.Warn("restore failed; starting cold", "sandbox", e.id, "runsc_id", e.ref.ID, "step", step, "err", err)
+	if terr := m.teardown(ctx, e); terr != nil {
+		return step, fmt.Errorf("%w (cleanup before the cold start failed: %v)", err, terr)
+	}
+	m.mu.Lock()
+	e.startedAs = gssv1.StartMode_START_MODE_COLD
+	m.mu.Unlock()
+	return m.startSandbox(ctx, e, "")
 }
 
 func modeName(mode gssv1.StartMode) string {
