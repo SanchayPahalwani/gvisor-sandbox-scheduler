@@ -6,7 +6,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,7 +42,8 @@ func TestRenderGolden(t *testing.T) {
 	for _, want := range []string{
 		"Local failure-domain test: both node groups are processes in one VM on one laptop. It says nothing about networks, regions or providers.",
 		"spread policy",
-		"Primed set: numpy, pandas and the standard library",
+		"Primed set (the node agent's default, `bundle.DefaultPrime`): json,",
+		"Sandbox sizes are listed under each table",
 		"192 MiB",
 	} {
 		if !strings.Contains(got, want) {
@@ -133,22 +133,6 @@ func TestReadmeMarkers(t *testing.T) {
 	}
 }
 
-// numbers collects every number in a JSON document.
-func numbers(v any, out *[]float64) {
-	switch x := v.(type) {
-	case float64:
-		*out = append(*out, x)
-	case []any:
-		for _, e := range x {
-			numbers(e, out)
-		}
-	case map[string]any:
-		for _, e := range x {
-			numbers(e, out)
-		}
-	}
-}
-
 func TestNoHandTypedNumbers(t *testing.T) {
 	in, err := Load(fixtures)
 	if err != nil {
@@ -170,24 +154,79 @@ func TestNoHandTypedNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var doc any
+	var doc struct {
+		Series []struct {
+			Name  string
+			Count int
+			P50   float64
+			P95   float64
+		}
+	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	var nums []float64
-	numbers(doc, &nums)
-	allowed := map[string]bool{}
-	for _, n := range nums {
-		allowed[fmtMS(n)] = true
-		allowed[strconv.FormatFloat(n, 'f', -1, 64)] = true
-	}
-	tok := regexp.MustCompile(`\d+(?:\.\d+)?`)
-	for _, line := range table[2:] {
-		for _, m := range tok.FindAllString(line, -1) {
-			if len(strings.ReplaceAll(m, ".", "")) >= 3 && !allowed[m] {
-				t.Errorf("number %q in %q is not in start.json after formatting", m, line)
+	get := func(name string) (c struct {
+		Name  string
+		Count int
+		P50   float64
+		P95   float64
+	}) {
+		for _, s := range doc.Series {
+			if s.Name == name {
+				return s
 			}
 		}
+		t.Fatalf("series %s not in start.json", name)
+		return
+	}
+	// Each cell must be the exact JSON field it is labelled with, formatted.
+	for i, mode := range []string{"cold", "restore", "warm"} {
+		ready, first := get(mode+"_ready_ms"), get(mode+"_first_result_ms")
+		want := []string{mode, fmtMS(ready.P50), fmtMS(ready.P95), fmtMS(first.P50), fmtMS(first.P95), strconv.Itoa(ready.Count)}
+		var cells []string
+		for _, c := range strings.Split(strings.Trim(table[2+i], "| "), "|") {
+			cells = append(cells, strings.TrimSpace(c))
+		}
+		if strings.Join(cells, "/") != strings.Join(want, "/") {
+			t.Errorf("row %s: got %v, want %v", mode, cells, want)
+		}
+	}
+}
+
+func TestBadValues(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	zero := func(n string) string {
+		return `{"name":"` + n + `","unit":"ms","count":0,"min":0,"mean":0,"p50":0,"p95":0,"p99":0,"max":0}`
+	}
+	write("start.json", `{"name":"start","command":"c","errors":7,"params":{},"scalars":{},"series":[`+
+		zero("cold_ready_ms")+","+zero("cold_first_result_ms")+`]}`)
+	write("throughput.json", `{"name":"throughput","command":"c","errors":3,"params":{},"scalars":{},"series":[`+zero("ready_ms")+`]}`)
+	write("density.json", `{"name":"density","command":"c","errors":1,"params":{},"scalars":{},"series":[],
+		"rows":[{"step":1,"live":5,"start_p50_ms":0,"start_p95_ms":0,"exec_p50_ms":4.5,"exec_p95_ms":6.5,"failed":5}]}`)
+	for _, f := range []string{"grouploss.json", "grouploss-retry.json"} {
+		write(f, `{"name":"grouploss","command":"c","errors":0,"params":{"sched_policy":"spread"},"scalars":{"detection_ms":-1,"recovery_ms":-1}}`)
+	}
+	in, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := Render(in)
+	if strings.Contains(md, "-1") || strings.Contains(md, "0.0 |") || strings.Contains(md, "<nil>") {
+		t.Errorf("output shows a placeholder as a result:\n%s", md)
+	}
+	for _, want := range []string{"no successful run (7 errors)", "no successful run (3 errors)", "not detected", "not recovered", "| 1 | 5 | - | - | 4.5 | 6.5 | 5 |", "Errors: 7"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("output lacks %q:\n%s", want, md)
+		}
+	}
+	sum := Summary(in)
+	if strings.Contains(sum, "-1") || !strings.Contains(sum, "not recovered") || !strings.Contains(sum, "no successful run") {
+		t.Errorf("summary:\n%s", sum)
 	}
 }
 

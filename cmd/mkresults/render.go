@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bench"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bundle"
 )
 
 const notRun = "not run"
@@ -163,6 +164,49 @@ func rowNum(row map[string]any, key string) (float64, bool) {
 	return v, ok
 }
 
+// scalar formats a scalar, or "-" when the run did not record it.
+func scalar(r *bench.Run, key string, f func(float64) string) string {
+	v, ok := r.Scalars[key]
+	if !ok {
+		return "-"
+	}
+	return f(v)
+}
+
+// param formats a parameter, or "-" when the run did not record it.
+func param(r *bench.Run, key string) string {
+	v, ok := r.Params[key]
+	if !ok || v == nil {
+		return "-"
+	}
+	return fmt.Sprint(v)
+}
+
+// fmtEvent formats detection and recovery times; loadgen writes -1 when the event
+// did not happen.
+func fmtEvent(v float64, none string) string {
+	if v < 0 {
+		return none
+	}
+	return fmtMS(v)
+}
+
+func noSamples(r *bench.Run) string {
+	return fmt.Sprintf("no successful run (%d errors)", r.Errors)
+}
+
+// sizeLine states the sandbox size the run recorded.
+func sizeLine(r *bench.Run) string {
+	cpu, mem := "-", "-"
+	if v, ok := r.Params["cpu_millis"].(float64); ok {
+		cpu = fmtInt(v) + " mCPU"
+	}
+	if v, ok := r.Params["memory_mib"].(float64); ok {
+		mem = fmtInt(v) + " MiB"
+	}
+	return "Sandbox size: " + cpu + ", " + mem
+}
+
 func paramString(r *bench.Run, key string) string {
 	s, _ := r.Params[key].(string)
 	return s
@@ -233,7 +277,7 @@ func (h *Hardware) vcpus() (int, bool) {
 	return 0, false
 }
 
-func footer(hw *Hardware, cmds []string, dates []string) string {
+func footer(hw *Hardware, cmds []string, dates []string, extra ...string) string {
 	var items []string
 	for i, c := range cmds {
 		label := "Command"
@@ -242,12 +286,14 @@ func footer(hw *Hardware, cmds []string, dates []string) string {
 		}
 		items = append(items, fmt.Sprintf("%s: `%s`", label, c))
 	}
+	items = append(items, extra...)
 	items = append(items, "Date: "+strings.Join(dates, ", "), "Hardware: "+hw.line())
 	return bullets(items)
 }
 
-func runFooter(hw *Hardware, r *bench.Run) string {
-	return footer(hw, []string{r.Command}, []string{fmtDate(r.StartedAt)})
+func runFooter(hw *Hardware, r *bench.Run, extra ...string) string {
+	extra = append([]string{sizeLine(r), fmt.Sprintf("Errors: %d", r.Errors)}, extra...)
+	return footer(hw, []string{r.Command}, []string{fmtDate(r.StartedAt)}, extra...)
 }
 
 // Render returns the content of docs/results.md.
@@ -326,11 +372,15 @@ func renderStart(in *Inputs) string {
 			rows = append(rows, []string{mode, notRun, notRun, notRun, notRun, notRun})
 			continue
 		}
+		if ready.Count == 0 || first.Count == 0 {
+			rows = append(rows, []string{mode, noSamples(r), "-", "-", "-", "0"})
+			continue
+		}
 		rows = append(rows, []string{mode, fmtMS(ready.P50), fmtMS(ready.P95), fmtMS(first.P50), fmtMS(first.P95), fmt.Sprint(ready.Count)})
 	}
 	return primedSentence(r) + " Times are in milliseconds.\n\n" +
 		table([]string{"Start path", "Ready p50", "Ready p95", "First result p50", "First result p95", "n"}, rows) + "\n" +
-		runFooter(in.Hardware, r)
+		runFooter(in.Hardware, r, "Warm retries: "+scalar(r, "warm_retries", fmtInt))
 }
 
 // primedSentence describes the primed set from the run's params, or names the default.
@@ -340,7 +390,7 @@ func primedSentence(r *bench.Run) string {
 			return "Primed set: " + strings.TrimRight(p, ".") + "."
 		}
 	}
-	return "Primed set: the default set in spec section 7 (numpy and pandas included)."
+	return "Primed set (the node agent's default, `bundle.DefaultPrime`): " + bundle.DefaultPrime + "."
 }
 
 func renderThroughput(in *Inputs) string {
@@ -349,20 +399,22 @@ func renderThroughput(in *Inputs) string {
 		return notRun + "\n"
 	}
 	rows := [][]string{
-		{"Workers", fmt.Sprint(r.Params["workers"])},
-		{"Duration", fmt.Sprint(r.Params["duration"])},
-		{"Sandboxes per second", fmtRate(r.Scalars["sandboxes_per_sec"])},
-		{"Share started warm", fmtFrac(r.Scalars["share_warm"])},
-		{"Share started by restore", fmtFrac(r.Scalars["share_restore"])},
-		{"Share started cold", fmtFrac(r.Scalars["share_cold"])},
+		{"Workers", param(r, "workers")},
+		{"Duration", param(r, "duration")},
+		{"Sandboxes per second", scalar(r, "sandboxes_per_sec", fmtRate)},
+		{"Share started warm", scalar(r, "share_warm", fmtFrac)},
+		{"Share started by restore", scalar(r, "share_restore", fmtFrac)},
+		{"Share started cold", scalar(r, "share_cold", fmtFrac)},
 	}
-	if s, ok := series(r, "ready_ms"); ok {
-		rows = append(rows, []string{"Ready p50 / p95 (ms)", fmtMS(s.P50) + " / " + fmtMS(s.P95)})
+	for _, d := range []struct{ label, name string }{{"Ready p50 / p95 (ms)", "ready_ms"}, {"First result p50 / p95 (ms)", "first_result_ms"}} {
+		if s, ok := series(r, d.name); ok {
+			if s.Count == 0 {
+				rows = append(rows, []string{d.label, noSamples(r)})
+			} else {
+				rows = append(rows, []string{d.label, fmtMS(s.P50) + " / " + fmtMS(s.P95)})
+			}
+		}
 	}
-	if s, ok := series(r, "first_result_ms"); ok {
-		rows = append(rows, []string{"First result p50 / p95 (ms)", fmtMS(s.P50) + " / " + fmtMS(s.P95)})
-	}
-	rows = append(rows, []string{"Errors", fmt.Sprint(r.Errors)})
 	return table([]string{"Metric", "Value"}, rows) + "\n" + runFooter(in.Hardware, r)
 }
 
@@ -377,20 +429,30 @@ func renderDensity(in *Inputs) string {
 		}
 		return "-"
 	}
+	// A latency column of exactly 0 means the step had no successful sample
+	// (bench.Summarize returns zeros for an empty series); loadgen records no count.
+	lat := func(row map[string]any, key, pair string) string {
+		v, ok := rowNum(row, key)
+		w, ok2 := rowNum(row, pair)
+		if !ok || (v == 0 && ok2 && w == 0) {
+			return "-"
+		}
+		return fmtMS(v)
+	}
 	var rows [][]string
 	for _, row := range r.Rows {
 		rows = append(rows, []string{
 			opt(row, "step", fmtInt), opt(row, "live", fmtInt),
-			opt(row, "start_p50_ms", fmtMS), opt(row, "start_p95_ms", fmtMS),
-			opt(row, "exec_p50_ms", fmtMS), opt(row, "exec_p95_ms", fmtMS),
+			lat(row, "start_p50_ms", "start_p95_ms"), lat(row, "start_p95_ms", "start_p50_ms"),
+			lat(row, "exec_p50_ms", "exec_p95_ms"), lat(row, "exec_p95_ms", "exec_p50_ms"),
 			opt(row, "failed", fmtInt), opt(row, "lost", fmtInt), opt(row, "unconfirmed", fmtInt),
 			opt(row, "node_mem_available_mib", fmtInt),
 		})
 	}
 	var b strings.Builder
-	base, max := r.Scalars["baseline_start_p95_ms"], r.Scalars["max_live_within_2x"]
-	if base > 0 {
-		fmt.Fprintf(&b, "Highest step with no failure and a restore-start p95 within 2x the first step's (%s ms): %s live sandboxes.", fmtMS(base), fmtInt(max))
+	base, haveBase := r.Scalars["baseline_start_p95_ms"]
+	if haveBase && base > 0 {
+		fmt.Fprintf(&b, "Highest step with no failure and a restore-start p95 within 2x the first step's (%s ms): %s live sandboxes.", fmtMS(base), scalar(r, "max_live_within_2x", fmtInt))
 	} else {
 		b.WriteString("No baseline: the first step had no successful restore start, so no step counts as within 2x.")
 	}
@@ -465,18 +527,29 @@ func renderGroupLoss(in *Inputs) string {
 		label string
 		f     func(map[string]float64) string
 	}
+	pres := func(k string, f func(float64) string) func(map[string]float64) string {
+		return func(s map[string]float64) string {
+			if v, ok := s[k]; ok {
+				return f(v)
+			}
+			return "-"
+		}
+	}
 	ms := func(k string) func(map[string]float64) string {
-		return func(s map[string]float64) string { return fmtMS(s[k]) }
+		return pres(k, fmtMS)
+	}
+	event := func(k, none string) func(map[string]float64) string {
+		return pres(k, func(v float64) string { return fmtEvent(v, none) })
 	}
 	n := func(k string) func(map[string]float64) string {
-		return func(s map[string]float64) string { return fmtInt(s[k]) }
+		return pres(k, fmtInt)
 	}
 	defs := []row{
 		{"Sessions", n("sessions")},
 		{"Sessions affected", n("affected_sessions")},
 		{"Sessions rescheduled", n("rescheduled")},
-		{"Detection time (ms)", ms("detection_ms")},
-		{"Recovery time (ms)", ms("recovery_ms")},
+		{"Detection time (ms)", event("detection_ms", "not detected")},
+		{"Recovery time (ms)", event("recovery_ms", "not recovered")},
 		{"Requests", n("requests_total")},
 		{"Requests failed after the kill", n("requests_failed")},
 		{"Requests failed before the kill", n("requests_failed_before_kill")},
@@ -499,16 +572,17 @@ func renderGroupLoss(in *Inputs) string {
 	}
 	b.WriteString(table([]string{"Metric", "Without retry", "With retry"}, rows))
 	b.WriteString("\n")
-	var cmds, dates []string
+	var cmds, dates, extra []string
 	for i, r := range runs {
 		name := []string{"without retry", "with retry"}[i]
 		if r == nil {
 			continue
 		}
+		extra = append(extra, fmt.Sprintf("Sandbox size and errors, %s: %s; errors: %d", name, strings.TrimPrefix(sizeLine(r), "Sandbox size: "), r.Errors))
 		cmds = append(cmds, r.Command)
 		dates = append(dates, name+" "+fmtDate(r.StartedAt))
 	}
-	b.WriteString(footer(in.Hardware, cmds, dates))
+	b.WriteString(footer(in.Hardware, cmds, dates, extra...))
 	return b.String()
 }
 
@@ -522,7 +596,7 @@ func renderCaveats(in *Inputs) string {
 		"Nodes are processes in one VM and share " + vcpus + ", so they compete for CPU with each other and with the load generator.",
 		"Node capacities are declared with flags, not measured.",
 		"gVisor runs on the systrap platform only; no other platform was tried.",
-		"The small sandbox size is 192 MiB (spec D31).",
+		"Sandbox sizes are listed under each table; the smallest allowed size is 192 MiB (spec D31).",
 		primedSentence(in.Start) + " The start-latency figures say nothing about other Python code or other packages.",
 		"Observability was off during the runs (spec D25): no OTLP export and no observability container.",
 		"A single run each. There are no repeats and no confidence intervals, so small differences between rows are not evidence.",
@@ -538,18 +612,21 @@ func Summary(in *Inputs) string {
 		if in.Start != nil {
 			if s, ok := series(in.Start, mode+"_ready_ms"); ok {
 				v = fmtMS(s.P50) + " / " + fmtMS(s.P95) + " ms"
+				if s.Count == 0 {
+					v = noSamples(in.Start)
+				}
 			}
 		}
 		add("Start latency, "+mode+" (ready p50 / p95)", v, "start.json")
 	}
 	v := notRun
 	if r := in.Throughput; r != nil {
-		v = fmt.Sprintf("%s sandboxes/s (%v workers, %v)", fmtRate(r.Scalars["sandboxes_per_sec"]), r.Params["workers"], r.Params["duration"])
+		v = fmt.Sprintf("%s sandboxes/s (%s workers, %s)", scalar(r, "sandboxes_per_sec", fmtRate), param(r, "workers"), param(r, "duration"))
 	}
 	add("Throughput (create, Exec, destroy)", v, "throughput.json")
 	v = notRun
 	if r := in.Density; r != nil {
-		v = fmtInt(r.Scalars["max_live_within_2x"]) + " live sandboxes with restore-start p95 within 2x of the first step"
+		v = scalar(r, "max_live_within_2x", fmtInt) + " live sandboxes with restore-start p95 within 2x of the first step"
 	}
 	add("Sandboxes per node", v, "density.json")
 	v = notRun
@@ -567,7 +644,14 @@ func Summary(in *Inputs) string {
 			if r == nil {
 				return label + " " + notRun
 			}
-			return fmtMS(r.Scalars["recovery_ms"]) + " ms " + label
+			rec, ok := r.Scalars["recovery_ms"]
+			switch {
+			case !ok:
+				return "- " + label
+			case rec < 0:
+				return "not recovered " + label
+			}
+			return fmtMS(rec) + " ms " + label
 		}
 		v = part(a, "without retry") + ", " + part(c, "with retry")
 	}

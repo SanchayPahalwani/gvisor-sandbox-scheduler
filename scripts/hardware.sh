@@ -103,11 +103,15 @@ Darwin)
 	elif [[ "$(limactl list --format '{{.Status}}' gss 2>/dev/null || true)" != "Running" ]]; then
 		note="the Lima VM gss was not running, so the VM part was not captured"
 	else
-		if part=$(limactl shell --workdir "$repo" gss -- scripts/hardware.sh --part 2>/dev/null) && [[ "$part" == "{"* ]]; then
+		errf=$(mktemp)
+		if part=$(limactl shell --workdir "$repo" gss -- scripts/hardware.sh --part 2>"$errf") && [[ "$part" == "{"* ]]; then
 			vm=$(printf '%s\n' "$part" | indent)
 		else
 			note="running the capture inside the VM gss failed, so the VM part was not captured"
+			last=$(grep -v '^[[:space:]]*$' "$errf" | tail -n 1 || true)
+			[[ -z "$last" ]] || note="$note: $last"
 		fi
+		rm -f "$errf"
 	fi
 	{
 		echo "{"

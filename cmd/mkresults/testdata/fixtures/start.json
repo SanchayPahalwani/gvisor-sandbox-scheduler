@@ -8,8 +8,7 @@
     "modes": "cold,restore,warm",
     "group": "",
     "cpu_millis": 250,
-    "memory_mib": 256,
-    "primed_set": "numpy, pandas and the standard library; 41 modules in all"
+    "memory_mib": 256
   },
   "series": [
     {
@@ -42,8 +41,8 @@
       "mean": 2002.4400000000003,
       "p50": 1851.1000000000001,
       "p95": 2146.1,
-      "p99": 2525.88,
-      "max": 2736.3700000000003
+      "p99": 2166.4,
+      "max": 2227.0
     },
     {
       "name": "restore_ready_ms",
@@ -75,8 +74,8 @@
       "mean": 233.86,
       "p50": 243.29999999999998,
       "p95": 301.5,
-      "p99": 312.36,
-      "max": 338.39000000000004
+      "p99": 321.8,
+      "max": 382.4
     },
     {
       "name": "warm_ready_ms",
@@ -108,8 +107,8 @@
       "mean": 15.620000000000001,
       "p50": 44.9,
       "p95": 64.0,
-      "p99": 27.36,
-      "max": 29.64
+      "p99": 84.3,
+      "max": 144.9
     }
   ],
   "scalars": {

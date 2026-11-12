@@ -11,7 +11,9 @@
       300
     ],
     "per_step": 20,
-    "start_mode": "restore"
+    "start_mode": "restore",
+    "cpu_millis": 250,
+    "memory_mib": 192
   },
   "series": [],
   "scalars": {

@@ -7,7 +7,9 @@
     "sessions": 12,
     "retry": false,
     "sched_policy": "spread",
-    "lose_group": "b"
+    "lose_group": "b",
+    "cpu_millis": 250,
+    "memory_mib": 192
   },
   "series": [],
   "scalars": {
