@@ -1,0 +1,47 @@
+{
+  "name": "throughput",
+  "command": "bin/loadgen throughput --out results/throughput.json",
+  "started_at": "2026-11-14T10:10:00Z",
+  "seconds": 60.3,
+  "params": {
+    "workers": 8,
+    "duration": "1m0s",
+    "start_mode": "auto",
+    "cpu_millis": 250,
+    "memory_mib": 256
+  },
+  "series": [
+    {
+      "name": "first_result_ms",
+      "unit": "ms",
+      "count": 1873,
+      "min": 10,
+      "mean": 50,
+      "p50": 40.2,
+      "p95": 180.7,
+      "p99": 260,
+      "max": 900
+    },
+    {
+      "name": "ready_ms",
+      "unit": "ms",
+      "count": 1873,
+      "min": 5,
+      "mean": 30,
+      "p50": 25.1,
+      "p95": 150.4,
+      "p99": 200,
+      "max": 800
+    }
+  ],
+  "scalars": {
+    "sandboxes_per_sec": 31.07,
+    "share_warm": 0.912,
+    "share_restore": 0.088,
+    "share_cold": 0
+  },
+  "errors": 0,
+  "notes": [
+    "share_* is the fraction of completed cycles whose sandbox started on that path"
+  ]
+}

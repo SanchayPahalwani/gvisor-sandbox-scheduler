@@ -1,0 +1,30 @@
+{
+  "name": "grouploss",
+  "command": "bin/loadgen grouploss --retry=false --sched-policy spread --out results/grouploss.json",
+  "started_at": "2026-11-14T10:30:00Z",
+  "seconds": 90.2,
+  "params": {
+    "sessions": 12,
+    "retry": false,
+    "sched_policy": "spread",
+    "lose_group": "b"
+  },
+  "series": [],
+  "scalars": {
+    "sessions": 12,
+    "affected_sessions": 6,
+    "detection_ms": 5210,
+    "recovery_ms": 9120,
+    "requests_total": 4300,
+    "requests_failed": 31,
+    "requests_failed_unaffected": 0,
+    "requests_failed_before_kill": 0,
+    "requests_spanning_kill": 34,
+    "max_blocked_exec_ms": 5400.5,
+    "max_request_with_retries_ms": 5400.5,
+    "rescheduled": 6,
+    "lookup_errors": 0
+  },
+  "errors": 0,
+  "notes": []
+}

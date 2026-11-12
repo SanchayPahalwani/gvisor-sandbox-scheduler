@@ -1,0 +1,21 @@
+{
+  "captured_at": "2026-11-14T09:30:00Z",
+  "host": {
+    "model_name": "MacBook Pro",
+    "chip": "Apple M4 Pro",
+    "performance_cores": 10,
+    "efficiency_cores": 4,
+    "memory_gib": 48,
+    "os": "macOS 26.1"
+  },
+  "vm": {
+    "kernel": "6.8.0-90-generic",
+    "distro": "Ubuntu 24.04.3 LTS",
+    "vcpus": 4,
+    "memory_mib": 6144,
+    "runsc": "runsc version release-20261103.0",
+    "go": "go1.27.4",
+    "virtualization": "apple",
+    "nodes_are": "processes in one VM"
+  }
+}

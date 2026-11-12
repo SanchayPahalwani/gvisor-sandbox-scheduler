@@ -1,0 +1,76 @@
+{
+  "name": "density",
+  "command": "bin/loadgen density --out results/density.json",
+  "started_at": "2026-11-14T10:20:00Z",
+  "seconds": 300.5,
+  "params": {
+    "steps": [
+      25,
+      100,
+      200,
+      300
+    ],
+    "per_step": 20,
+    "start_mode": "restore"
+  },
+  "series": [],
+  "scalars": {
+    "baseline_start_p95_ms": 260.2,
+    "max_live_within_2x": 200
+  },
+  "rows": [
+    {
+      "step": 1,
+      "live": 25,
+      "start_p50_ms": 210.5,
+      "start_p95_ms": 260.2,
+      "exec_p50_ms": 4.1,
+      "exec_p95_ms": 6.3,
+      "failed": 0,
+      "lost": 0,
+      "unconfirmed": 0,
+      "node_mem_available_mib": 5100.0
+    },
+    {
+      "step": 2,
+      "live": 100,
+      "start_p50_ms": 225.1,
+      "start_p95_ms": 298.4,
+      "exec_p50_ms": 4.4,
+      "exec_p95_ms": 7.0,
+      "failed": 0,
+      "lost": 0,
+      "unconfirmed": 0,
+      "node_mem_available_mib": 3900.0
+    },
+    {
+      "step": 3,
+      "live": 200,
+      "start_p50_ms": 240.3,
+      "start_p95_ms": 512.6,
+      "exec_p50_ms": 5.2,
+      "exec_p95_ms": 9.9,
+      "failed": 0,
+      "lost": 0,
+      "unconfirmed": 0,
+      "node_mem_available_mib": 2800.0
+    },
+    {
+      "step": 4,
+      "live": 300,
+      "start_p50_ms": 600.9,
+      "start_p95_ms": 1204.3,
+      "exec_p50_ms": 9.7,
+      "exec_p95_ms": 30.2,
+      "failed": 2,
+      "lost": 0,
+      "unconfirmed": 0,
+      "node_mem_available_mib": 1700.0
+    }
+  ],
+  "errors": 2,
+  "notes": [
+    "step 4 (300 live) stopped the ramp: 2 restore starts failed",
+    "max_live_within_2x is the largest live count of a step with no failures and start_p95_ms <= 2 x baseline_start_p95_ms (the first step's)"
+  ]
+}

@@ -9,9 +9,9 @@ RUN ?= .
 FORWARD_VARS := PKG RUN FORCE
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
-LINUX_TARGETS := build test-integration rootfs bench-start bench-throughput bench-density bench-grouploss
+LINUX_TARGETS := build test-integration rootfs bench bench-start bench-throughput bench-density bench-grouploss
 
-.PHONY: vm vm-stop vm-delete proto test lint sim $(LINUX_TARGETS)
+.PHONY: vm vm-stop vm-delete proto test lint sim hardware results $(LINUX_TARGETS)
 
 ifeq ($(UNAME),Darwin)
 $(LINUX_TARGETS):
@@ -82,6 +82,11 @@ bench-density: build
 	bin/loadgen density --out results/density.json
 	$(DENSITY_TOPOLOGY) scripts/cluster.sh down
 
+# Every benchmark in order, stopping at the first failure; does not start the
+# observability container.
+bench:
+	scripts/bench-all.sh
+
 # Local failure-domain test (spec 8.6); the script brings its own clusters up and down.
 bench-grouploss: build
 	@$(BENCH_NO_OTEL)
@@ -105,9 +110,19 @@ test:
 	go test -race ./...
 
 lint:
-	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	@out="$$(gofmt -l $$(git ls-files '*.go'))"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 	go vet ./...
 
 # Runs anywhere; not a Linux target.
 sim:
 	go run ./cmd/schedsim --out results/schedsim.json
+
+# Hardware capture and results rendering run anywhere. On macOS, hardware.sh writes the
+# host part and runs itself in the VM for the rest if the VM is running (it does not
+# start it); on Linux it writes the VM part.
+hardware:
+	scripts/hardware.sh
+
+# Renders docs/results.md and the README table from results/*.json (spec call D26).
+results:
+	go run ./cmd/mkresults --results results --out docs/results.md --readme README.md

@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/sched"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/sim"
@@ -22,6 +24,7 @@ func main() {
 }
 
 func run() error {
+	started := time.Now().UTC()
 	cfg := sim.DefaultConfig()
 	out := flag.String("out", "", "write results as JSON to this file")
 	flag.IntVar(&cfg.Nodes, "nodes", cfg.Nodes, "number of synthetic nodes")
@@ -79,14 +82,16 @@ func run() error {
 		return nil
 	}
 	doc := struct {
-		Config  sim.Config   `json:"config"`
-		Go      string       `json:"go"`
-		GOOS    string       `json:"goos"`
-		GOARCH  string       `json:"goarch"`
-		CPUs    int          `json:"cpus"`
-		Notes   []string     `json:"notes"`
-		Results []sim.Result `json:"results"`
-	}{cfg, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), notes, results}
+		Command   string       `json:"command"`
+		StartedAt time.Time    `json:"started_at"`
+		Config    sim.Config   `json:"config"`
+		Go        string       `json:"go"`
+		GOOS      string       `json:"goos"`
+		GOARCH    string       `json:"goarch"`
+		CPUs      int          `json:"cpus"`
+		Notes     []string     `json:"notes"`
+		Results   []sim.Result `json:"results"`
+	}{"schedsim " + strings.Join(os.Args[1:], " "), started, cfg, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), notes, results}
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

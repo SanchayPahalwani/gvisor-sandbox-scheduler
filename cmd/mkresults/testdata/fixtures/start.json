@@ -1,0 +1,122 @@
+{
+  "name": "start",
+  "command": "bin/loadgen start --out results/start.json",
+  "started_at": "2026-11-14T10:02:11Z",
+  "seconds": 412.7,
+  "params": {
+    "n": 50,
+    "modes": "cold,restore,warm",
+    "group": "",
+    "cpu_millis": 250,
+    "memory_mib": 256,
+    "primed_set": "numpy, pandas and the standard library; 41 modules in all"
+  },
+  "series": [
+    {
+      "name": "cold_ready_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 1456.3200000000002,
+      "mean": 1856.8080000000002,
+      "p50": 1820.4,
+      "p95": 2104.9,
+      "p99": 2315.3900000000003,
+      "max": 2525.88
+    },
+    {
+      "name": "cold_create_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 1,
+      "mean": 2,
+      "p50": 3,
+      "p95": 4,
+      "p99": 5,
+      "max": 6
+    },
+    {
+      "name": "cold_first_result_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 1820.4,
+      "mean": 2002.4400000000003,
+      "p50": 1851.1000000000001,
+      "p95": 2146.1,
+      "p99": 2525.88,
+      "max": 2736.3700000000003
+    },
+    {
+      "name": "restore_ready_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 170.08,
+      "mean": 216.852,
+      "p50": 212.6,
+      "p95": 260.3,
+      "p99": 286.33000000000004,
+      "max": 312.36
+    },
+    {
+      "name": "restore_create_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 1,
+      "mean": 2,
+      "p50": 3,
+      "p95": 4,
+      "p99": 5,
+      "max": 6
+    },
+    {
+      "name": "restore_first_result_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 212.6,
+      "mean": 233.86,
+      "p50": 243.29999999999998,
+      "p95": 301.5,
+      "p99": 312.36,
+      "max": 338.39000000000004
+    },
+    {
+      "name": "warm_ready_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 11.36,
+      "mean": 14.484,
+      "p50": 14.2,
+      "p95": 22.8,
+      "p99": 25.080000000000002,
+      "max": 27.36
+    },
+    {
+      "name": "warm_create_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 1,
+      "mean": 2,
+      "p50": 3,
+      "p95": 4,
+      "p99": 5,
+      "max": 6
+    },
+    {
+      "name": "warm_first_result_ms",
+      "unit": "ms",
+      "count": 49,
+      "min": 14.2,
+      "mean": 15.620000000000001,
+      "p50": 44.9,
+      "p95": 64.0,
+      "p99": 27.36,
+      "max": 29.64
+    }
+  ],
+  "scalars": {
+    "warm_retries": 0
+  },
+  "errors": 0,
+  "notes": [
+    "the first successful cycle of each mode is a warm-up and is not recorded"
+  ]
+}
