@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -125,7 +126,7 @@ func hexHash(s string) string {
 // ever hashed into names, never used directly.
 type names struct {
 	nodeID string
-	table  string // gss_<node id with non-alphanumerics as _>
+	table  string // gss_<node id with - as _>; node ids hold only [A-Za-z0-9-], so this is injective
 	prefix string // "g" + 4 hex of sha256(node id); every host veth starts with it
 }
 
@@ -169,18 +170,48 @@ func (n names) ownsLink(name string) bool {
 	return ok && isHex8(rest)
 }
 
+// tableComment records which node and egress range own a table, so that Init
+// can refuse to replace another node's table or overlap its range.
+func tableComment(n names, cidr netip.Prefix) string {
+	return fmt.Sprintf("gss node %s cidr %s", n.nodeID, cidr)
+}
+
+var commentRE = regexp.MustCompile(`(?m)^\s*comment "gss node (\S+) cidr (\S+)"`)
+
+// parseComment reads the owner comment from `nft -t list table` output.
+func parseComment(listing string) (nodeID string, cidr netip.Prefix, ok bool) {
+	m := commentRE.FindStringSubmatch(listing)
+	if m == nil {
+		return "", netip.Prefix{}, false
+	}
+	p, err := netip.ParsePrefix(m[2])
+	if err != nil {
+		return "", netip.Prefix{}, false
+	}
+	return m[1], p, true
+}
+
 // renderInit is the nft script that replaces this node's table with an empty one.
+//
+// Every flow a sandbox opens carries its sandbox's generation as conntrack
+// mark; "established" is accepted only while (veth, mark) is in @live, so a
+// flow left over from an earlier sandbox on the same /30 is not. Traffic into
+// a sandbox veth that is not part of a live flow is dropped before the
+// allowlist is consulted, so an allowlist covering the node's own range does
+// not reach other sandboxes.
 func renderInit(n names, cidr netip.Prefix) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n", n.table, n.table)
 	fmt.Fprintf(&b, "table inet %s {\n", n.table)
+	fmt.Fprintf(&b, "\tcomment %q\n", tableComment(n, cidr))
 	b.WriteString("\tmap sandbox_out {\n\t\ttype ifname : verdict\n\t}\n")
+	b.WriteString("\tset live {\n\t\ttype ifname . mark\n\t}\n")
 	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tiifname \"%s*\" ct state established,related accept\n", n.prefix)
+	b.WriteString("\t\tiifname . ct mark @live ct state established,related accept\n")
+	b.WriteString("\t\toifname . ct mark @live ct state established,related accept\n")
+	fmt.Fprintf(&b, "\t\toifname \"%s*\" counter drop\n", n.prefix)
 	b.WriteString("\t\tiifname vmap @sandbox_out\n")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" counter drop\n", n.prefix)
-	fmt.Fprintf(&b, "\t\toifname \"%s*\" ct state established,related accept\n", n.prefix)
-	fmt.Fprintf(&b, "\t\toifname \"%s*\" counter drop\n", n.prefix)
 	b.WriteString("\t}\n")
 	b.WriteString("\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" counter drop\n", n.prefix)
@@ -196,24 +227,33 @@ func renderDeleteTable(n names) string {
 	return fmt.Sprintf("add table inet %s\ndelete table inet %s\n", n.table, n.table)
 }
 
-// renderSetup adds the sandbox's chain and maps its veth to it.
-func renderSetup(n names, id string, rules []Rule) string {
+// renderSetup adds the sandbox's chain, marks its live (veth, generation)
+// pair and maps its veth to the chain. Accepted flows get the generation as
+// conntrack mark.
+func renderSetup(n names, id string, gen uint32, rules []Rule) string {
 	var b strings.Builder
-	c := n.chain(id)
+	c, v := n.chain(id), n.veth(id)
 	fmt.Fprintf(&b, "add chain inet %s %s\n", n.table, c)
 	fmt.Fprintf(&b, "flush chain inet %s %s\n", n.table, c)
 	for _, r := range rules {
-		fmt.Fprintf(&b, "add rule inet %s %s ip daddr %s tcp dport %d accept\n", n.table, c, r.Prefix, r.Port)
+		fmt.Fprintf(&b, "add rule inet %s %s ip daddr %s tcp dport %d ct mark set %d accept\n", n.table, c, r.Prefix, r.Port, gen)
 	}
-	fmt.Fprintf(&b, "add element inet %s sandbox_out { \"%s\" : jump %s }\n", n.table, n.veth(id), c)
+	fmt.Fprintf(&b, "add element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
+	fmt.Fprintf(&b, "add element inet %s sandbox_out { \"%s\" : jump %s }\n", n.table, v, c)
 	return b.String()
 }
 
-// renderTeardown removes the sandbox's map element and chain. It first adds
-// both so that it succeeds whether or not they exist (the table must exist).
-func renderTeardown(n names, id string) string {
+// renderTeardown removes the sandbox's live element (first), map element and
+// chain. It adds each before deleting it so that it succeeds whether or not
+// they exist (the table must exist). gen 0 means the generation is unknown
+// and the live element is left alone.
+func renderTeardown(n names, id string, gen uint32) string {
 	var b strings.Builder
 	c, v := n.chain(id), n.veth(id)
+	if gen != 0 {
+		fmt.Fprintf(&b, "add element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
+		fmt.Fprintf(&b, "delete element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
+	}
 	fmt.Fprintf(&b, "add chain inet %s %s\n", n.table, c)
 	fmt.Fprintf(&b, "add element inet %s sandbox_out { \"%s\" : jump %s }\n", n.table, v, c)
 	fmt.Fprintf(&b, "delete element inet %s sandbox_out { \"%s\" }\n", n.table, v)

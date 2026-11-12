@@ -92,16 +92,20 @@ func TestRenderInit(t *testing.T) {
 	want := `add table inet gss_a1
 delete table inet gss_a1
 table inet gss_a1 {
+	comment "gss node a1 cidr 10.200.0.0/20"
 	map sandbox_out {
 		type ifname : verdict
 	}
+	set live {
+		type ifname . mark
+	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		iifname "gf55f*" ct state established,related accept
+		iifname . ct mark @live ct state established,related accept
+		oifname . ct mark @live ct state established,related accept
+		oifname "gf55f*" counter drop
 		iifname vmap @sandbox_out
 		iifname "gf55f*" counter drop
-		oifname "gf55f*" ct state established,related accept
-		oifname "gf55f*" counter drop
 	}
 	chain input {
 		type filter hook input priority filter; policy accept;
@@ -124,19 +128,22 @@ func TestRenderSetup(t *testing.T) {
 		{netip.MustParsePrefix("1.1.1.1/32"), 443},
 		{netip.MustParsePrefix("10.0.0.0/8"), 8080},
 	}
-	got := renderSetup(n, "sb1", rules)
+	got := renderSetup(n, "sb1", 42, rules)
 	want := `add chain inet gss_a1 sb_320983ce
 flush chain inet gss_a1 sb_320983ce
-add rule inet gss_a1 sb_320983ce ip daddr 1.1.1.1/32 tcp dport 443 accept
-add rule inet gss_a1 sb_320983ce ip daddr 10.0.0.0/8 tcp dport 8080 accept
+add rule inet gss_a1 sb_320983ce ip daddr 1.1.1.1/32 tcp dport 443 ct mark set 42 accept
+add rule inet gss_a1 sb_320983ce ip daddr 10.0.0.0/8 tcp dport 8080 ct mark set 42 accept
+add element inet gss_a1 live { "gf55f320983ce" . 42 }
 add element inet gss_a1 sandbox_out { "gf55f320983ce" : jump sb_320983ce }
 `
 	if got != want {
 		t.Errorf("renderSetup:\n%s\nwant:\n%s", got, want)
 	}
 
-	gotTD := renderTeardown(n, "sb1")
-	wantTD := `add chain inet gss_a1 sb_320983ce
+	gotTD := renderTeardown(n, "sb1", 42)
+	wantTD := `add element inet gss_a1 live { "gf55f320983ce" . 42 }
+delete element inet gss_a1 live { "gf55f320983ce" . 42 }
+add chain inet gss_a1 sb_320983ce
 add element inet gss_a1 sandbox_out { "gf55f320983ce" : jump sb_320983ce }
 delete element inet gss_a1 sandbox_out { "gf55f320983ce" }
 flush chain inet gss_a1 sb_320983ce
@@ -144,6 +151,22 @@ delete chain inet gss_a1 sb_320983ce
 `
 	if gotTD != wantTD {
 		t.Errorf("renderTeardown:\n%s\nwant:\n%s", gotTD, wantTD)
+	}
+	// Generation 0 means unknown (a sandbox this Manager did not set up): no live element.
+	if got := renderTeardown(n, "sb1", 0); strings.Contains(got, "live") {
+		t.Errorf("renderTeardown with no generation touches live:\n%s", got)
+	}
+}
+
+func TestParseComment(t *testing.T) {
+	node, cidr, ok := parseComment("table inet gss_a1 {\n\tcomment \"gss node a1 cidr 10.200.0.0/20\"\n\tmap x {\n")
+	if !ok || node != "a1" || cidr != netip.MustParsePrefix("10.200.0.0/20") {
+		t.Errorf("parseComment = %q %v %v", node, cidr, ok)
+	}
+	for _, s := range []string{"table inet gss_a1 {\n}\n", "\tcomment \"gss node a1 cidr nope\"\n", "\tcomment \"something else\"\n"} {
+		if _, _, ok := parseComment(s); ok {
+			t.Errorf("parseComment(%q): want not ok", s)
+		}
 	}
 }
 
@@ -164,9 +187,6 @@ func TestNames(t *testing.T) {
 	}
 	if got := newNames("a-1").table; got != "gss_a_1" {
 		t.Errorf("table for a-1 = %q, want gss_a_1", got)
-	}
-	if got := newNames("a.b_c").table; got != "gss_a_b_c" {
-		t.Errorf("table for a.b_c = %q", got)
 	}
 	// A runsc id with characters that are not allowed in kernel names is only hashed.
 	id := "sb-1a2b3c4d5e6f_1_"

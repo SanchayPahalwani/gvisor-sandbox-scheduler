@@ -3,6 +3,7 @@ package netpolicy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -60,7 +61,10 @@ func TestNew(t *testing.T) {
 		{"a/b", "10.200.0.0/20"},
 		{"a b", "10.200.0.0/20"},
 		{"..", "10.200.0.0/20"},
-		{strings.Repeat("a", 64), "10.200.0.0/20"},
+		{"a_1", "10.200.0.0/20"},
+		{"a.1", "10.200.0.0/20"},
+		{"-a", "10.200.0.0/20"},
+		{strings.Repeat("a", 33), "10.200.0.0/20"},
 		{"a1", "10.200.0.0/31"},
 		{"a1", "2001:db8::/64"},
 	} {
@@ -71,7 +75,7 @@ func TestNew(t *testing.T) {
 	if _, err := New("a1", netip.Prefix{}, r.run); err == nil {
 		t.Error("New with an invalid prefix: want error")
 	}
-	if _, err := New("t-1.x_y", netip.MustParsePrefix("10.200.0.0/30"), nil); err != nil {
+	if _, err := New("t-1x"+strings.Repeat("a", 28), netip.MustParsePrefix("10.200.0.0/30"), nil); err != nil {
 		t.Errorf("New: %v", err)
 	}
 }
@@ -90,8 +94,11 @@ func TestSetupCommands(t *testing.T) {
 		t.Errorf("hosts = %v, want none", hosts)
 	}
 	want := []string{
+		"ip netns list",
+		"ip -o link show",
 		"ip netns add gss-a1-320983ce",
 		"ip link add gf55f320983ce type veth peer name eth0 netns gss-a1-320983ce",
+		"sysctl -w net.ipv4.conf.gf55f320983ce.rp_filter=1",
 		"ip addr add 10.200.0.1/30 dev gf55f320983ce",
 		"ip link set gf55f320983ce up",
 		"ip -n gss-a1-320983ce addr add 10.200.0.2/30 dev eth0",
@@ -103,7 +110,11 @@ func TestSetupCommands(t *testing.T) {
 	if !reflect.DeepEqual(r.cmds, want) {
 		t.Fatalf("commands:\n%s\nwant:\n%s", strings.Join(r.cmds, "\n"), strings.Join(want, "\n"))
 	}
-	wantScript := renderSetup(m.names, "sb1", []Rule{
+	gen := m.sbs["sb1"].gen
+	if gen == 0 {
+		t.Error("generation 0 issued")
+	}
+	wantScript := renderSetup(m.names, "sb1", gen, []Rule{
 		{netip.MustParsePrefix("1.1.1.1/32"), 443},
 		{netip.MustParsePrefix("10.0.0.0/8"), 8080},
 	})
@@ -117,6 +128,9 @@ func TestSetupCommands(t *testing.T) {
 	}
 	if len(hosts) != 1 || hosts[0].IP != "10.9.9.9" || hosts[0].Name != "api.example" {
 		t.Errorf("hosts = %v", hosts)
+	}
+	if g2 := m.sbs["sb2"].gen; g2 == gen || g2 == 0 {
+		t.Errorf("generations %d and %d: want distinct and non-zero", gen, g2)
 	}
 	if _, _, err := m.Setup(context.Background(), "sb2", []string{"1.1.1.1:443"}); status.Code(err) != codes.AlreadyExists {
 		t.Errorf("second Setup of sb2: %v, want AlreadyExists", err)
@@ -224,6 +238,7 @@ func TestTeardownIdempotent(t *testing.T) {
 	if _, _, err := m.Setup(ctx, "sb1", []string{"1.1.1.1:443"}); err != nil {
 		t.Fatal(err)
 	}
+	gen := m.sbs["sb1"].gen
 	r.reset()
 	if err := m.Teardown(ctx, "sb1"); err != nil {
 		t.Fatal(err)
@@ -232,7 +247,7 @@ func TestTeardownIdempotent(t *testing.T) {
 	if !reflect.DeepEqual(r.cmds, want) {
 		t.Errorf("Teardown commands %v, want %v", r.cmds, want)
 	}
-	if r.stdin[0] != renderTeardown(m.names, "sb1") {
+	if r.stdin[0] != renderTeardown(m.names, "sb1", gen) {
 		t.Errorf("Teardown nft script:\n%s", r.stdin[0])
 	}
 
@@ -289,6 +304,7 @@ func TestInitAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
+		"nft list tables",
 		"ip netns list",
 		"ip netns del gss-a1-0123abcd",
 		"ip netns del gss-a1-89abcdef",
@@ -308,10 +324,163 @@ func TestInitAndClose(t *testing.T) {
 	if err := m.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.cmds[0] != "nft -f -" || r.stdin[0] != "add table inet gss_a1\ndelete table inet gss_a1\n" {
-		t.Errorf("Close first command %q stdin %q", r.cmds[0], r.stdin[0])
+	last := len(r.cmds) - 1
+	if r.cmds[last] != "nft -f -" || r.stdin[last] != "add table inet gss_a1\ndelete table inet gss_a1\n" {
+		t.Errorf("Close last command %q stdin %q", r.cmds[last], r.stdin[last])
 	}
-	if !reflect.DeepEqual(r.cmds[1:], want[:5]) {
-		t.Errorf("Close cleanup commands %v", r.cmds[1:])
+	if !reflect.DeepEqual(r.cmds[:last], want[1:6]) {
+		t.Errorf("Close cleanup commands %v, want %v", r.cmds[:last], want[1:6])
+	}
+}
+
+func TestCloseKeepsTableWhenCleanupFails(t *testing.T) {
+	r := &recorder{fail: func(cmd string) error {
+		if cmd == "ip netns list" {
+			return errors.New("ip: boom")
+		}
+		return nil
+	}}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if err := m.Close(context.Background()); err == nil {
+		t.Fatal("Close: want error")
+	}
+	for i, c := range r.cmds {
+		if strings.HasPrefix(c, "nft") || strings.Contains(r.stdin[i], "delete table") {
+			t.Errorf("Close ran %q (stdin %q) after a failed cleanup", c, r.stdin[i])
+		}
+	}
+}
+
+func TestInitRefusesOtherNodes(t *testing.T) {
+	for _, c := range []struct{ name, tables, listing string }{
+		{"same table name, other node", "table inet gss_a1\n",
+			"table inet gss_a1 {\n\tcomment \"gss node other cidr 10.250.0.0/24\"\n}\n"},
+		{"overlapping cidr", "table ip nat\ntable inet gss_b2\n",
+			"table inet gss_b2 {\n\tcomment \"gss node b2 cidr 10.200.8.0/24\"\n}\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			other := strings.Fields(c.tables)[len(strings.Fields(c.tables))-1]
+			r := &recorder{out: map[string]string{
+				"nft list tables":                 c.tables,
+				"nft -t list table inet " + other: c.listing,
+			}}
+			m := newTestManager(t, "10.200.0.0/20", r)
+			if err := m.Init(context.Background()); err == nil {
+				t.Fatal("Init: want error")
+			}
+			want := []string{"nft list tables", "nft -t list table inet " + other}
+			if !reflect.DeepEqual(r.cmds, want) {
+				t.Errorf("Init commands %v, want only %v", r.cmds, want)
+			}
+		})
+	}
+	// Our own old table, another node's disjoint table, and a non-gss table are fine.
+	r := &recorder{out: map[string]string{
+		"nft list tables":               "table ip nat\ntable inet gss_a1\ntable inet gss_b2\ntable inet other\n",
+		"nft -t list table inet gss_a1": "table inet gss_a1 {\n\tcomment \"gss node a1 cidr 10.201.0.0/20\"\n}\n",
+		"nft -t list table inet gss_b2": "table inet gss_b2 {\n\tcomment \"gss node b2 cidr 10.200.16.0/20\"\n}\n",
+	}}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if err := m.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+}
+
+func TestSetupRefusesExistingNames(t *testing.T) {
+	for _, out := range []map[string]string{
+		{"ip netns list": "gss-a1-320983ce (id: 4)\n"},
+		{"ip -o link show": "9: gf55f320983ce@if2: <BROADCAST> mtu 1500\n"},
+	} {
+		r := &recorder{out: out}
+		m := newTestManager(t, "10.200.0.0/30", r)
+		if _, _, err := m.Setup(context.Background(), "sb1", []string{"1.1.1.1:443"}); err == nil {
+			t.Fatalf("Setup with %v: want error", out)
+		}
+		for _, c := range r.cmds {
+			if c != "ip netns list" && c != "ip -o link show" {
+				t.Errorf("Setup with an existing name ran %q", c)
+			}
+		}
+		// The only /30 is free again.
+		delete(out, "ip netns list")
+		delete(out, "ip -o link show")
+		if _, _, err := m.Setup(context.Background(), "sb1", []string{"1.1.1.1:443"}); err != nil {
+			t.Errorf("Setup after the names are gone: %v", err)
+		}
+	}
+}
+
+func TestRollbackFailureKeepsSubnet(t *testing.T) {
+	r := &recorder{fail: func(cmd string) error {
+		if strings.HasPrefix(cmd, "nft -f") || strings.HasPrefix(cmd, "ip link del") {
+			return errors.New("Operation not permitted")
+		}
+		return nil
+	}}
+	m := newTestManager(t, "10.200.0.0/30", r)
+	ctx := context.Background()
+	if _, _, err := m.Setup(ctx, "sb1", []string{"1.1.1.1:443"}); err == nil {
+		t.Fatal("Setup: want error")
+	}
+	r.fail = nil
+	if _, _, err := m.Setup(ctx, "sb2", []string{"1.1.1.1:443"}); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("Setup after a failed rollback: %v, want ResourceExhausted", err)
+	}
+	if err := m.Teardown(ctx, "sb1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Setup(ctx, "sb2", []string{"1.1.1.1:443"}); err != nil {
+		t.Errorf("Setup after Teardown: %v", err)
+	}
+}
+
+func TestGenerationSkipsZero(t *testing.T) {
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	m.gen = 0xffffffff
+	if _, _, err := m.Setup(context.Background(), "sb1", []string{"1.1.1.1:443"}); err != nil {
+		t.Fatal(err)
+	}
+	if g := m.sbs["sb1"].gen; g != 1 {
+		t.Errorf("generation after 0xffffffff = %d, want 1", g)
+	}
+}
+
+func TestResolverErrors(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		err  error
+		want codes.Code
+	}{
+		{&net.DNSError{Err: "server misbehaving", Name: "h.example", IsTemporary: true}, codes.Unavailable},
+		{&net.DNSError{Err: "i/o timeout", Name: "h.example", IsTimeout: true}, codes.Unavailable},
+		{&net.DNSError{Err: "no such host", Name: "h.example", IsNotFound: true}, codes.InvalidArgument},
+		{errors.New("other"), codes.InvalidArgument},
+	} {
+		r := &recorder{}
+		m := newTestManager(t, "10.200.0.0/20", r)
+		m.SetResolver(func(ctx context.Context, host string) ([]netip.Addr, error) { return nil, c.err })
+		if _, _, err := m.Setup(ctx, "sb1", []string{"h.example:443"}); status.Code(err) != c.want {
+			t.Errorf("resolver error %v: Setup error %v, want %v", c.err, err, c.want)
+		}
+	}
+	for _, cerr := range []error{context.Canceled, context.DeadlineExceeded,
+		&net.DNSError{Err: "lookup cancelled", Name: "h.example", UnwrapErr: context.Canceled}} {
+		r := &recorder{}
+		m := newTestManager(t, "10.200.0.0/20", r)
+		m.SetResolver(func(ctx context.Context, host string) ([]netip.Addr, error) { return nil, cerr })
+		_, _, err := m.Setup(ctx, "sb1", []string{"h.example:443"})
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("resolver error %v: Setup error %v, want the context error", cerr, err)
+		}
+		if _, ok := status.FromError(err); ok {
+			t.Errorf("context error became a status: %v", err)
+		}
+	}
+	// A too-short IPv4 answer (only IPv6) is a bad entry, not a transient failure.
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if _, _, err := m.Setup(ctx, "sb1", []string{"v6only.example:443"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("v6-only host: %v, want InvalidArgument", err)
 	}
 }
