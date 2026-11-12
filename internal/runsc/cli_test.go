@@ -145,20 +145,16 @@ func TestTailWriter(t *testing.T) {
 func TestClassifyExecDiag(t *testing.T) {
 	tests := []struct {
 		stderr string
-		want   error // nil: not a runsc diagnostic
 		diag   bool
 	}{
-		{`executing processes for container: cannot execute in container "a" in state stopped`, ErrNotRunning, true},
-		// After the quoted argv: State decides, not the text.
-		{`executing processes for container: executing command "true" in sandbox: connecting to control server at PID 18316: connection refused`, nil, true},
-		{`executing processes for container: executing command "echo in state stopped" in sandbox: failed to load echo in state stopped: no such file or directory`, nil, true},
-		{`executing processes for container: executing command "cat loading container: file does not exist" in sandbox: failed to load x`, nil, true},
-		{`executing processes for container: executing command "/no/such/binary" in sandbox: failed to load /no/such/binary: no such file or directory`, nil, true},
-		{`executing processes for container: executing command "true" in sandbox: failed to find initial working directory "/nope": no such file or directory`, nil, true},
-		{"exec [command options] <container-id> <command> [command options] || --process process.json <container-id>\n...\nparsing process spec: both a container-id and command are required", nil, true},
-		{"FetchSpec failed: loading container: file does not exist", ErrNotFound, true},
-		{"", nil, false},
-		{"Traceback (most recent call last):\n  ...", nil, false},
+		{`executing processes for container: cannot execute in container "a" in state stopped`, true},
+		{`executing processes for container: executing command "true" in sandbox: connecting to control server at PID 18316: connection refused`, true},
+		{`executing processes for container: executing command "/no/such/binary" in sandbox: failed to load /no/such/binary: no such file or directory`, true},
+		{`executing processes for container: executing command "true" in sandbox: failed to find initial working directory "/nope": no such file or directory`, true},
+		{"exec [command options] <container-id> <command> [command options] || --process process.json <container-id>\n...\nparsing process spec: both a container-id and command are required", true},
+		{"FetchSpec failed: loading container: file does not exist", true},
+		{"", false},
+		{"Traceback (most recent call last):\n  ...", false},
 	}
 	for _, tt := range tests {
 		if got := isExecDiag(tt.stderr); got != tt.diag {
@@ -167,12 +163,10 @@ func TestClassifyExecDiag(t *testing.T) {
 		if !tt.diag {
 			continue
 		}
+		// Sentinels come from State, never from the text.
 		err := diagError(errors.New("exit status 128"), tt.stderr)
-		if tt.want != nil && !errors.Is(err, tt.want) {
-			t.Errorf("diagError(%q) = %v, want %v", tt.stderr, err, tt.want)
-		}
-		if tt.want == nil && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotRunning)) {
-			t.Errorf("diagError(%q) = %v, want no sentinel", tt.stderr, err)
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotRunning) || !strings.Contains(err.Error(), "exit status 128") {
+			t.Errorf("diagError(%q) = %v, want a plain error", tt.stderr, err)
 		}
 	}
 }
@@ -218,6 +212,7 @@ state)
 	ab) echo '{"id":"abc","status":"running","pid":7}';;
 	deadsb) echo 'FetchSpec failed: loading container: file does not exist' >&2; exit 128;;
 	stoppedsb) echo '{"id":"stoppedsb","status":"stopped","pid":-1}';;
+	statefail) echo 'something unrelated broke' >&2; exit 1;;
 	ckpt)
 		# "running" for the first two calls after the checkpoint, then "stopped".
 		n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"
@@ -248,6 +243,7 @@ case "$last" in
 diesmid) echo started >&2; echo 'waiting on pid 4: waiting on PID 4 in sandbox "x": urpc method "containerManager.WaitPID" failed: EOF' >&2; exit 128;;
 pidfilefail) echo hello >&2; echo 'writing internal pid file: open /x/y: no such file or directory' >&2; exit 128;;
 bgclean) sleep 3 & exit 0;;
+racyclean) sleep 0.18; echo done; exit 0;;
 heldkill) printf 'FetchSpec' >&2; exec sleep 30;;
 exit3) echo out; echo err >&2; exit 3;;
 exit128) echo user-out; echo user-err >&2; exit 128;;
@@ -287,14 +283,15 @@ func TestExecExitMapping(t *testing.T) {
 	if code, _, _, err := run("quiet128"); code != 128 || err != nil {
 		t.Errorf("quiet128: %d %v", code, err)
 	}
-	if code, _, errOut, err := run("stopped"); !errors.Is(err, ErrNotRunning) || code != -1 || errOut != "" {
-		t.Errorf("stopped: %d %v, stderr forwarded %q", code, err, errOut)
+	// sb1 is running per State: the diagnostic is an error without a sentinel.
+	if code, _, errOut, err := run("stopped"); err == nil || errors.Is(err, ErrNotRunning) || code != -1 || errOut != "" {
+		t.Errorf("stopped text, running: %d %v, stderr forwarded %q", code, err, errOut)
 	}
 	if _, _, errOut, err := run("nobin"); err == nil || !strings.Contains(err.Error(), "/no/such") || errOut != "" {
 		t.Errorf("nobin: %v, stderr forwarded %q", err, errOut)
 	}
-	if _, _, _, err := run("gone"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("gone: %v", err)
+	if _, _, _, err := run("gone"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("gone text, running: %v", err)
 	}
 }
 
@@ -409,6 +406,16 @@ func TestExec128AsksState(t *testing.T) {
 	if code, _, err := exec1("sb1", "quiet128"); code != 128 || err != nil {
 		t.Errorf("quiet, running: %d, %v", code, err)
 	}
+	// State fails for an unrelated reason: the exit was not confirmed.
+	if code, _, err := exec1("statefail", "quiet128"); code != -1 || !errors.Is(err, ErrNotRunning) ||
+		errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "something unrelated broke") {
+		t.Errorf("quiet, state fails: %d, %v", code, err)
+	}
+	// Running, and the text looks like not-found: a plain error, no sentinel.
+	if code, errOut, err := exec1("sb1", "gone"); code != -1 || err == nil || errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrNotRunning) || errOut != "" {
+		t.Errorf("not-found text, running: %d, %v, stderr forwarded %q", code, err, errOut)
+	}
 }
 
 func TestExecHoldScalesWithArgs(t *testing.T) {
@@ -443,14 +450,25 @@ func TestExecCancelFlushesHeld(t *testing.T) {
 
 func TestExecCleanExitRacingCancel(t *testing.T) {
 	c := fakeRunsc(t)
-	// The process exits 0 at once; a child holds stdout past the deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	var out bytes.Buffer
-	code, err := c.Exec(ctx, Ref{ID: "sb1", Network: NetworkNone}, ExecSpec{Args: []string{"bgclean"}, Stdout: &out})
-	if code != 0 || err != nil {
-		t.Errorf("Exec = %d, %v; want 0, nil", code, err)
+	// The stub exits 0 right at the deadline (0.18 s sleep plus shell start
+	// against a 200 ms deadline): each run is either a seen exit or a ctx
+	// error, never an exit with an output error.
+	var exits, cancels int
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		var out bytes.Buffer
+		code, err := c.Exec(ctx, Ref{ID: "sb1", Network: NetworkNone}, ExecSpec{Args: []string{"racyclean"}, Stdout: &out})
+		cancel()
+		switch {
+		case code == 0 && err == nil:
+			exits++
+		case code == -1 && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
+			cancels++
+		default:
+			t.Errorf("run %d: Exec = %d, %v; want (0, nil) or a ctx error", i, code, err)
+		}
 	}
+	t.Logf("%d seen exits, %d ctx errors", exits, cancels)
 }
 
 func TestRunWrapsContext(t *testing.T) {

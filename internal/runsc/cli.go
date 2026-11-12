@@ -257,9 +257,14 @@ func (c *CLI) execFailure(ref Ref, runErr error, diag *diagWriter) error {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return fmt.Errorf("runsc exec %s: exit not seen: %w: %w: %s", ref.ID, ErrNotRunning, ErrNotFound, last)
-	case err == nil && st.Status != "running":
+	case err != nil:
+		// Nothing confirmed the exit (a timeout, a Delete holding the lock).
+		return fmt.Errorf("runsc exec %s: exit not seen, state unknown: %w: %w: %s", ref.ID, ErrNotRunning, err, last)
+	case st.Status != "running":
 		return fmt.Errorf("runsc exec %s: exit not seen, container is %s: %w: %s", ref.ID, st.Status, ErrNotRunning, last)
 	}
+	// The container is running, so no sentinel: whatever the text says, it
+	// is not "not found" or "not running".
 	if diag.isDiag() {
 		return diagError(runErr, string(diag.held))
 	}
@@ -269,18 +274,11 @@ func (c *CLI) execFailure(ref Ref, runErr error, diag *diagWriter) error {
 	return nil
 }
 
-// diagError turns a runsc exec diagnostic into an error. The sentinels come
-// only from runsc's own words, not from the argv it quotes.
+// diagError turns a runsc exec diagnostic into a plain error. It carries no
+// sentinel: it is used only once State said the container is running, and
+// the text may quote the user's argv.
 func diagError(runErr error, diag string) error {
-	own := runscPart(diag)
-	diag = tail([]byte(diag))
-	switch {
-	case isNotFound(own):
-		return fmt.Errorf("runsc exec: %w: %w: %s", ErrNotFound, runErr, diag)
-	case strings.Contains(own, "in state stopped"):
-		return fmt.Errorf("runsc exec: %w: %w: %s", ErrNotRunning, runErr, diag)
-	}
-	return fmt.Errorf("runsc exec: %w: %s", runErr, diag)
+	return fmt.Errorf("runsc exec: %w: %s", runErr, tail([]byte(diag)))
 }
 
 // maxHeldFor sizes the diagnostic hold: runsc quotes the whole argv (and
@@ -294,15 +292,6 @@ func maxHeldFor(spec ExecSpec) int {
 		n += len(e)
 	}
 	return maxHeldDiag + 4*n
-}
-
-// runscPart returns the part of a runsc exec diagnostic before the quoted
-// argv ("executing command \"...").
-func runscPart(s string) string {
-	if i := strings.Index(s, `executing command "`); i >= 0 {
-		return s[:i]
-	}
-	return s
 }
 
 // lastLine returns the last non-empty line of s.

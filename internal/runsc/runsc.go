@@ -51,8 +51,11 @@ type State struct {
 // ErrNotFound is returned when the named container does not exist under the root.
 var ErrNotFound = errors.New("runsc: no such container")
 
-// ErrNotRunning is returned by Exec when the container exists but cannot run
-// a process: it was checkpointed, or its init process exited.
+// ErrNotRunning is returned by Exec when the process's exit was not seen
+// because the container cannot run processes: it was checkpointed, its init
+// process exited, the sandbox died during the Exec, or the container is gone
+// (then wrapped together with ErrNotFound). It is also returned when runsc
+// exec failed and the container's state could not be read to tell.
 var ErrNotRunning = errors.New("runsc: container is not running")
 
 // Runtime is the set of runsc operations the node agent uses.
