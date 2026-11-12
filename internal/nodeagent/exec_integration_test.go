@@ -256,6 +256,21 @@ func startedExec(t *testing.T, ctx context.Context, m *Manager, req *gssv1.ExecR
 	return res
 }
 
+// pgrep returns "pid cmdline" for each process whose command line matches
+// pattern.
+func pgrep(t *testing.T, pattern string) []string {
+	t.Helper()
+	out, err := exec.Command("pgrep", "-a", "-f", "--", pattern).Output()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return nil // no match
+	}
+	if err != nil {
+		t.Fatalf("pgrep -f %q: %v", pattern, err)
+	}
+	return strings.Split(strings.TrimSpace(string(out)), "\n")
+}
+
 func TestRealExecCancel(t *testing.T) {
 	n, m := execSandbox(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -265,6 +280,12 @@ func TestRealExecCancel(t *testing.T) {
 	ectx, ecancel := context.WithCancel(ctx)
 	defer ecancel()
 	res := startedExec(t, ectx, m, pyReq("sb-1", `import time; print("started", flush=True); time.sleep(60)`))
+	// The pattern finds this root's runsc exec client while the Exec runs,
+	// so "nothing found" afterwards is not vacuous.
+	pattern := "runsc --root " + regexp.QuoteMeta(n.rt.Root) + " .* exec "
+	if clients := pgrep(t, pattern); len(clients) != 1 {
+		t.Errorf("pgrep -f %q during the Exec = %q, want the one runsc exec client", pattern, clients)
+	}
 	time.Sleep(300 * time.Millisecond)
 	ecancel()
 	start := time.Now()
@@ -287,11 +308,8 @@ func TestRealExecCancel(t *testing.T) {
 	}
 
 	// No runsc exec client is left for this root.
-	pattern := "runsc --root " + regexp.QuoteMeta(n.rt.Root) + " --network=[a-z]+ --overlay2=none exec "
-	out, err := exec.Command("pgrep", "-a", "-f", "--", pattern).Output()
-	var exitErr *exec.ExitError
-	if !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1) {
-		t.Errorf("pgrep -f %q = %v, %q; want no process", pattern, err, out)
+	if clients := pgrep(t, pattern); len(clients) != 0 {
+		t.Errorf("pgrep -f %q after the cancel = %q, want no process", pattern, clients)
 	}
 
 	// The worker is gone: the sandbox holds as many processes as before
@@ -459,6 +477,9 @@ func TestRealDestroyDuringExec(t *testing.T) {
 	}
 	if _, err := os.Stat(n.cgroupDir(rid)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("cgroup dir after Destroy: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(n.state, "execs", rid)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("exec pid dir after Destroy: %v", err)
 	}
 	if got := n.listContainers(t); len(got) != 0 {
 		t.Errorf("runsc list after Destroy = %q", got)

@@ -183,8 +183,8 @@ func TestExecArgv(t *testing.T) {
 	if stdin != "IN" {
 		t.Errorf("stdin = %q", stdin)
 	}
-	if dir := filepath.Dir(got.InternalPIDFile); dir != e.bundleDir("sb-1_1_") {
-		t.Errorf("pid file %q is not in the bundle dir", got.InternalPIDFile)
+	if dir := filepath.Dir(got.InternalPIDFile); dir != e.execDir("sb-1_1_") {
+		t.Errorf("pid file %q is not in %s", got.InternalPIDFile, e.execDir("sb-1_1_"))
 	}
 	if exists(got.InternalPIDFile) {
 		t.Error("pid file left after the Exec")
@@ -513,7 +513,7 @@ func TestExecDuringDestroy(t *testing.T) {
 		close(release)
 		t.Fatal("Destroy waited for the Exec")
 	}
-	if e.inTable("sb-1") || len(e.rt.Containers()) != 0 || exists(e.bundleDir("sb-1_1_")) {
+	if e.inTable("sb-1") || len(e.rt.Containers()) != 0 || exists(e.bundleDir("sb-1_1_")) || exists(e.execDir("sb-1_1_")) {
 		t.Errorf("not torn down: containers %v", e.rt.Containers())
 	}
 	close(release)
@@ -526,6 +526,136 @@ func TestExecDuringDestroy(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Exec did not return after Destroy")
 	}
+	if exists(e.execDir("sb-1_1_")) {
+		t.Error("the Exec left its pid directory behind")
+	}
+}
+
+// An Exec that arrives once a destroy has started gets NotFound (spec D34).
+func TestExecWhileDestroying(t *testing.T) {
+	e := readyEnv(t, nil)
+	e.rt.Delay["Delete"] = 300 * time.Millisecond
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- e.m.Destroy(context.Background(), "sb-1", 0) }()
+	eventually(t, "the destroy to reach runsc delete", func() bool {
+		return slices.Contains(e.rt.Calls(), "Delete id=sb-1_1_ net=none")
+	})
+	sent := 0
+	err := e.m.Exec(context.Background(), argvReq("sb-1", "true"), func(*gssv1.ExecEvent) error { sent++; return nil })
+	wantCode(t, err, codes.NotFound, "Exec during the teardown")
+	if sent != 0 {
+		t.Errorf("send called %d times", sent)
+	}
+	if err := recv(t, destroyed, "Destroy"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The timeout does not depend on the output stream: while send is blocked
+// (a client that stopped reading but stays connected) the timer still
+// kills the process and ends the runsc client.
+func TestExecTimeoutWhileSendBlocked(t *testing.T) {
+	var rec *killRecorder
+	e := readyEnv(t, withKills(&rec))
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		fmt.Fprint(s.Stdout, "first")
+		waitCtx(t, ctx)
+		return -1, ctx.Err()
+	}
+	release := make(chan struct{})
+	var c collector
+	send := func(ev *gssv1.ExecEvent) error {
+		if ev.GetStdout() != nil {
+			select {
+			case <-release:
+			case <-time.After(10 * time.Second):
+				return errors.New("never released")
+			}
+		}
+		return c.send(ev)
+	}
+	req := argvReq("sb-1", "yes")
+	req.Timeout = durationpb.New(50 * time.Millisecond)
+	errc := make(chan error, 1)
+	go func() { errc <- e.m.Exec(context.Background(), req, send) }()
+	eventually(t, "the kill while send is blocked", func() bool { return len(rec.Kills()) == 1 })
+	select {
+	case err := <-errc:
+		t.Fatalf("Exec returned while send was blocked: %v", err)
+	default:
+	}
+	close(release)
+	if err := recv(t, errc, "the Exec to return once send was released"); err != nil {
+		t.Fatal(err)
+	}
+	if exit := c.exit(t); exit.GetCode() != 137 || !exit.GetTimedOut() {
+		t.Errorf("exit = %v, want 137 timed_out", exit)
+	}
+	if got := rec.Kills(); len(got) != 1 || !strings.HasSuffix(got[0], " <nil>") {
+		t.Errorf("kills = %q, want one successful kill", got)
+	}
+}
+
+func TestWaitPID(t *testing.T) {
+	dir := t.TempDir()
+	never := make(chan struct{})
+	empty := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	late := empty("late.pid")
+	time.AfterFunc(100*time.Millisecond, func() { os.WriteFile(late, []byte("42"), 0o644) })
+	start := time.Now()
+	if pid, ok := waitPID(late, never, time.Second); !ok || pid != 42 {
+		t.Errorf("late pid: %d, %v; want 42", pid, ok)
+	}
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Errorf("late pid returned after %v, before it was written", d)
+	}
+
+	// The runtime call returned without a pid: stop waiting at once.
+	finished := make(chan struct{})
+	time.AfterFunc(50*time.Millisecond, func() { close(finished) })
+	start = time.Now()
+	if pid, ok := waitPID(empty("finished.pid"), finished, 5*time.Second); ok {
+		t.Errorf("no pid, call finished: got %d", pid)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("waited %v after the call finished", d)
+	}
+
+	// Still running and no pid: give up after the wait.
+	start = time.Now()
+	if pid, ok := waitPID(empty("never.pid"), never, 100*time.Millisecond); ok {
+		t.Errorf("no pid: got %d", pid)
+	}
+	if d := time.Since(start); d < 100*time.Millisecond || d > time.Second {
+		t.Errorf("gave up after %v, want about 100ms", d)
+	}
+}
+
+// An exit 128 with oom_kill risen can be the sentry dying (runsc exec's own
+// failure code): the manager checks the sandbox and reports Unavailable
+// when it is gone.
+func TestExecOOMExit128SandboxGone(t *testing.T) {
+	e := readyEnv(t, func(_ *Config, d *Deps) {
+		d.Cgroups = &oomCgroups{fakeCgroups: d.Cgroups.(*fakeCgroups), counts: []uint64{0, 1}}
+	})
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		time.AfterFunc(150*time.Millisecond, func() { e.rt.Delete(context.Background(), ref) })
+		return 128, nil
+	}
+	err := e.m.Exec(context.Background(), pyReq("sb-1", "x = bytearray(1 << 30)"), (&collector{}).send)
+	wantCode(t, err, codes.Unavailable, "exit 128 with the sandbox OOM-killed")
+	if e.inTable("sb-1") {
+		t.Error("the dead sandbox is still in the table")
+	}
+	err = e.m.Exec(context.Background(), argvReq("sb-1", "true"), (&collector{}).send)
+	wantCode(t, err, codes.NotFound, "Exec after the sandbox died")
 }
 
 // ErrNotRunning from the runtime means the sandbox died under the Exec: the
@@ -543,7 +673,7 @@ func TestExecSandboxDied(t *testing.T) {
 	if e.inTable("sb-1") {
 		t.Error("the dead sandbox is still in the table")
 	}
-	if e.cg.count("Remove /gss/n1/sb-1_1_") != 1 || exists(e.bundleDir("sb-1_1_")) {
+	if e.cg.count("Remove /gss/n1/sb-1_1_") != 1 || exists(e.bundleDir("sb-1_1_")) || exists(e.execDir("sb-1_1_")) {
 		t.Errorf("dead sandbox not cleaned up: cgroups %q", e.cg.Calls())
 	}
 	err = e.m.Exec(context.Background(), argvReq("sb-1", "true"), (&collector{}).send)

@@ -8,9 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
@@ -42,12 +44,18 @@ const (
 	killTimeout = 5 * time.Second
 	// stateTimeout bounds the runsc state that checks a sandbox after an Exec.
 	stateTimeout = 5 * time.Second
+	// pidWait and pidPoll: how long and how often a kill that is due waits
+	// for runsc to write the process's pid.
+	pidWait = time.Second
+	pidPoll = 10 * time.Millisecond
 	// goneWait and goneInterval: how long and how often the check of a
 	// sandbox that seems to have died is repeated.
 	goneWait     = 2 * time.Second
 	goneInterval = 50 * time.Millisecond
 	// exitKilled is the exit code of a process killed by SIGKILL (128 + 9).
 	exitKilled = 137
+	// exitRunscFailed is what runsc exec exits with when it fails itself.
+	exitRunscFailed = 128
 )
 
 // execRun is one Exec in flight, registered on its entry so that a destroy
@@ -94,6 +102,10 @@ func (m *Manager) Exec(ctx context.Context, req *gssv1.ExecRequest, send func(*g
 	}
 	out, err := m.execIn(ctx, rctx, cancel, e, p, send)
 	if m.unregisterExec(e, run) {
+		// This Exec may have made its pid directory after the teardown
+		// removed it; the last Exec out removes it (rmdir fails while
+		// another Exec still has a file there).
+		os.Remove(m.execDir(e))
 		// A destroy may also surface as exit 137 with no error; either way
 		// the sandbox is going away.
 		return status.Errorf(codes.Unavailable, "sandbox %s destroyed", e.id)
@@ -265,11 +277,14 @@ type execOutcome struct {
 // execIn runs the Exec. Its loop is the one goroutine that calls send: the
 // runtime's stdout and stderr writers hand it their chunks over an
 // unbuffered channel, so output is held one chunk at a time and each stream
-// keeps its order. cancel ends the runsc exec client (rctx); it is called
-// only after the process inside the sandbox was sent a kill. It returns
-// after Runtime.Exec has returned.
+// keeps its order. The timeout runs on its own timer, not in the loop, so a
+// send that blocks (a client that stopped reading) cannot hold it off.
+// Stopping the Exec (timeout, cancel, failed send) kills the process inside
+// the sandbox and then calls cancel, which ends the runsc exec client
+// (rctx). execIn returns after Runtime.Exec has returned and any stop has
+// finished.
 func (m *Manager) execIn(ctx, rctx context.Context, cancel context.CancelFunc, e *sandbox, p *execPlan, send func(*gssv1.ExecEvent) error) (out execOutcome, err error) {
-	pidFile, err := newPIDFile(e.bundleDir)
+	pidFile, err := newPIDFile(m.execDir(e))
 	if err != nil {
 		return out, status.Errorf(codes.Internal, "exec in %s: %v", e.ref.ID, err)
 	}
@@ -285,28 +300,45 @@ func (m *Manager) execIn(ctx, rctx context.Context, cancel context.CancelFunc, e
 		Stderr:          &streamWriter{events: events, ended: ended, stderr: true},
 		InternalPIDFile: pidFile,
 	}
-	type result struct {
+	var res struct {
 		code int
 		err  error
 	}
-	finished := make(chan result, 1)
+	runDone := make(chan struct{}) // closed once Runtime.Exec has returned and res is set
 	began := time.Now()
 	go func() {
-		code, err := m.rt.Exec(rctx, e.ref, spec)
-		finished <- result{code, err}
+		defer close(runDone)
+		res.code, res.err = m.rt.Exec(rctx, e.ref, spec)
 	}()
 
-	timer := time.NewTimer(p.kill)
-	defer timer.Stop()
-	done := ctx.Done()
-	stopped, killSent := false, false
-	stop := func() {
-		if !stopped {
-			stopped = true
-			killSent = m.killExec(ctx, e, pidFile)
-			cancel()
+	// The first stop wins; it runs in its own goroutine, so neither the
+	// timer nor the loop waits for runsc kill.
+	var (
+		mu                 sync.Mutex
+		stopped, over      bool // a stop started; the runtime call has returned
+		timedOut, killSent bool
+		killed             = make(chan struct{}) // the stop's kill and cancel are done
+	)
+	stop := func(timeout bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped || over {
+			return
 		}
+		stopped, timedOut = true, timeout
+		go func() {
+			defer close(killed)
+			sent := m.killExec(ctx, e, pidFile, runDone)
+			mu.Lock()
+			killSent = sent
+			mu.Unlock()
+			cancel()
+		}()
 	}
+	timer := time.AfterFunc(p.kill, func() { stop(true) })
+	defer timer.Stop()
+
+	done := ctx.Done()
 	for {
 		select {
 		case ev := <-events:
@@ -315,25 +347,32 @@ func (m *Manager) execIn(ctx, rctx context.Context, cancel context.CancelFunc, e
 			if out.sendErr == nil && !out.cancelled {
 				if err := send(ev); err != nil {
 					out.sendErr = err
-					stop()
+					stop(false)
 				}
-			}
-		case <-timer.C:
-			if !stopped {
-				out.timedOut = true
-				stop()
 			}
 		case <-done:
 			done = nil
 			out.cancelled = true
-			stop()
-		case r := <-finished:
+			stop(false)
+		case <-runDone:
 			// Every Write returned before Runtime.Exec did, and each one
 			// waited for this loop to take its chunk: nothing is pending.
-			out.code, out.err, out.elapsed = r.code, r.err, time.Since(began)
-			if stopped && !killSent {
-				// runsc had not written the pid yet when the kill was due.
-				m.killExec(ctx, e, pidFile)
+			out.code, out.err, out.elapsed = res.code, res.err, time.Since(began)
+			timer.Stop()
+			mu.Lock()
+			over = true
+			wasStopped := stopped
+			mu.Unlock()
+			if wasStopped {
+				<-killed
+			}
+			mu.Lock()
+			out.timedOut = timedOut
+			retry := wasStopped && !killSent
+			mu.Unlock()
+			if retry {
+				// runsc wrote the pid only after the kill gave up waiting.
+				m.killExec(ctx, e, pidFile, runDone)
 			}
 			return out, nil
 		}
@@ -362,6 +401,14 @@ func (m *Manager) exitStatus(ctx context.Context, e *sandbox, p *execPlan, out e
 		return nil, status.Errorf(codes.Internal, "exec in %s: %v", e.ref.ID, out.err)
 	}
 	exit := &gssv1.ExitStatus{Code: int32(out.code)}
+	if out.code == exitRunscFailed && m.oomRose(e, out) {
+		// runsc exec's own failure code, with the OOM killer active: it can
+		// be the sentry dying, which the wrapper did not recognise.
+		if m.removeIfGone(ctx, e, true) {
+			return nil, status.Errorf(codes.Unavailable, "sandbox %s stopped during the exec (exit 128 after an OOM kill)", e.id)
+		}
+		return exit, nil
+	}
 	if out.code != exitKilled {
 		return exit, nil
 	}
@@ -423,14 +470,12 @@ func (m *Manager) sandboxGone(ctx context.Context, e *sandbox) bool {
 }
 
 // killExec sends SIGKILL to the Exec's process inside the sandbox, by the
-// pid runsc wrote to pidFile. It reports false if there was no pid yet.
-func (m *Manager) killExec(ctx context.Context, e *sandbox, pidFile string) bool {
-	b, err := os.ReadFile(pidFile)
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil || pid <= 0 {
+// pid runsc writes to pidFile. If the pid is not there yet it waits for it,
+// up to pidWait or until the runtime call has returned (runDone). It
+// reports false if there was no pid to kill.
+func (m *Manager) killExec(ctx context.Context, e *sandbox, pidFile string, runDone <-chan struct{}) bool {
+	pid, ok := waitPID(pidFile, runDone, pidWait)
+	if !ok {
 		return false
 	}
 	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTimeout)
@@ -442,8 +487,49 @@ func (m *Manager) killExec(ctx context.Context, e *sandbox, pidFile string) bool
 	return true
 }
 
-// newPIDFile creates an empty file in dir for runsc's --internal-pid-file.
+// waitPID returns the pid in pidFile, checking every pidPoll for up to max
+// while runDone is open. Once runDone is closed it reads the file once more
+// and stops.
+func waitPID(pidFile string, runDone <-chan struct{}, max time.Duration) (int, bool) {
+	deadline := time.Now().Add(max)
+	for {
+		if pid, ok := readPID(pidFile); ok {
+			return pid, true
+		}
+		if !time.Now().Before(deadline) {
+			return 0, false
+		}
+		select {
+		case <-runDone:
+			return readPID(pidFile)
+		case <-time.After(pidPoll):
+		}
+	}
+}
+
+// readPID reads a positive pid from pidFile; an empty file has none yet.
+func readPID(pidFile string) (int, bool) {
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	return pid, err == nil && pid > 0
+}
+
+// execDir holds the pid files of e's Execs. It is apart from the bundle
+// directory so that creating one never races the bundle's removal; teardown
+// removes it after the bundle.
+func (m *Manager) execDir(e *sandbox) string { return filepath.Join(m.execsDir(), e.ref.ID) }
+
+func (m *Manager) execsDir() string { return filepath.Join(m.cfg.StateDir, "execs") }
+
+// newPIDFile creates dir if needed and an empty file in it for runsc's
+// --internal-pid-file.
 func newPIDFile(dir string) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
 	f, err := os.CreateTemp(dir, "exec-*.pid")
 	if err != nil {
 		return "", err

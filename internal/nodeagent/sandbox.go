@@ -226,11 +226,12 @@ func (m *Manager) remove(ctx context.Context, e *sandbox) error {
 }
 
 // teardown undoes the steps recorded in e: runsc delete, network teardown,
-// bundle directory, cgroup. Each step is idempotent and is forgotten once it
-// succeeded. If the delete fails the container may still be running, so the
-// host-side pieces it uses are left for the next attempt. After the delete,
-// every process left in the sandbox's cgroup is killed: one runsc no longer
-// tracks would otherwise keep the cgroup busy for good.
+// bundle directory, exec pid directory, cgroup. Each step is idempotent and
+// is forgotten once it succeeded. If the delete fails the container may
+// still be running, so the host-side pieces it uses are left for the next
+// attempt. After the delete, every process left in the sandbox's cgroup is
+// killed: one runsc no longer tracks would otherwise keep the cgroup busy for
+// good.
 //
 // It never runs with a cancelled ctx: the caller's may have ended (a
 // cancelled Create), and runsc fails at once on a done context.
@@ -258,6 +259,10 @@ func (m *Manager) teardown(ctx context.Context, e *sandbox) error {
 		} else {
 			e.bundleWritten = false
 		}
+	}
+	// The Execs' pid files; the directory exists only if an Exec ran.
+	if err := os.RemoveAll(m.execDir(e)); err != nil {
+		errs = append(errs, fmt.Errorf("remove exec pid files: %w", err))
 	}
 	if e.containerMade {
 		// A failed kill matters only if the cgroup then cannot be removed.

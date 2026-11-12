@@ -13,8 +13,8 @@ import (
 // removeLeftovers deletes what an earlier agent with this node ID left
 // behind (call D13: the agent keeps no state across restarts): every
 // container under the runsc root, every process and cgroup below the node's
-// cgroup, and every bundle directory. Network leftovers belong to the
-// network policy's own start-up.
+// cgroup, and every bundle and exec pid directory. Network leftovers belong
+// to the network policy's own start-up.
 func (m *Manager) removeLeftovers(ctx context.Context) error {
 	ids, err := m.rt.List(ctx)
 	if err != nil {
@@ -38,6 +38,9 @@ func (m *Manager) removeLeftovers(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	if err := clearDir(m.bundlesDir()); err != nil {
+		errs = append(errs, err)
+	}
+	if err := clearDir(m.execsDir()); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

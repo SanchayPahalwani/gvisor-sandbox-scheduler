@@ -181,6 +181,9 @@ func (e *env) mustCreate(t *testing.T, id string, inc int32, s *gssv1.SandboxSpe
 
 func (e *env) bundleDir(rid string) string { return filepath.Join(e.state, "bundles", rid) }
 
+// execDir is where the Execs of sandbox rid keep their pid files.
+func (e *env) execDir(rid string) string { return filepath.Join(e.state, "execs", rid) }
+
 // listed returns "id/incarnation" for every listed sandbox.
 func (e *env) listed() []string {
 	var out []string
@@ -574,7 +577,13 @@ func TestDestroyIdempotent(t *testing.T) {
 		t.Errorf("cgroup Remove called %d times: %q", n, e.cg.Calls())
 	}
 	// Processes runsc no longer tracks are killed before the cgroup is removed.
-	if got, want := e.cg.Calls()[2:], []string{"KillTree /gss/n1/sb-1_1_", "Remove /gss/n1/sb-1_1_"}; !slices.Equal(got, want) {
+	var teardown []string
+	for _, call := range e.cg.Calls() {
+		if strings.HasPrefix(call, "KillTree /gss/n1/sb-1_1_") || strings.HasPrefix(call, "Remove /gss/n1/sb-1_1_") {
+			teardown = append(teardown, call)
+		}
+	}
+	if got, want := teardown, []string{"KillTree /gss/n1/sb-1_1_", "Remove /gss/n1/sb-1_1_"}; !slices.Equal(got, want) {
 		t.Errorf("teardown cgroup calls = %q, want %q", got, want)
 	}
 	if exists(e.bundleDir("sb-1_1_")) {
@@ -752,6 +761,13 @@ func TestStartRemovesLeftovers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stale, "config.json"), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	staleExec := e.execDir("old1_3_")
+	if err := os.MkdirAll(staleExec, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staleExec, "exec-1.pid"), []byte("7"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	e.start(t)
 	if got := e.rt.Containers(); len(got) != 0 {
 		t.Errorf("containers after Start = %v", got)
@@ -759,6 +775,9 @@ func TestStartRemovesLeftovers(t *testing.T) {
 	ents, err := os.ReadDir(filepath.Join(e.state, "bundles"))
 	if err != nil || len(ents) != 0 {
 		t.Errorf("bundles after Start: %v, %v", ents, err)
+	}
+	if ents, err := os.ReadDir(filepath.Join(e.state, "execs")); err != nil || len(ents) != 0 {
+		t.Errorf("exec dirs after Start: %v, %v", ents, err)
 	}
 	// The node's cgroup exists before any runsc create: a cgroup directory
 	// runsc creates is one it removes again when that container is deleted.
