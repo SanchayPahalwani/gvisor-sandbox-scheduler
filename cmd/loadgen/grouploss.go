@@ -31,7 +31,7 @@ const (
 
 type groupLossConfig struct {
 	Sessions     int
-	Interval     time.Duration // between the starts of one session's Execs
+	Interval     time.Duration // between the starts of one session's requests
 	Warmup       time.Duration // sessions run this long before the kill
 	Observe      time.Duration // sessions run this long after the kill
 	KillCmd      string        // recorded in the params; Kill runs it
@@ -40,6 +40,7 @@ type groupLossConfig struct {
 	Retry        bool          // retry a failed Exec on Unavailable or DeadlineExceeded
 	RetryBackoff time.Duration // pause before the first retry, doubled before each next one
 	ExecDeadline time.Duration // deadline of each Exec try
+	SchedPolicy  string        // placement policy the scheduler was started with, as told by the caller
 }
 
 func newGroupLossConfig() groupLossConfig {
@@ -59,12 +60,13 @@ func groupLossCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs, cf := newFlagSet("grouploss", stderr)
 	cfg := newGroupLossConfig()
 	fs.IntVar(&cfg.Sessions, "sessions", cfg.Sessions, "long-lived sandboxes, each running one Exec per interval")
-	fs.DurationVar(&cfg.Interval, "interval", cfg.Interval, "time between the starts of one session's Execs")
+	fs.DurationVar(&cfg.Interval, "interval", cfg.Interval, "time between the starts of one session's requests")
 	fs.DurationVar(&cfg.Warmup, "warmup", cfg.Warmup, "how long sessions run before the kill")
 	fs.DurationVar(&cfg.Observe, "observe", cfg.Observe, "how long sessions run after the kill")
 	fs.StringVar(&cfg.KillCmd, "kill-cmd", cfg.KillCmd, "shell command that kills every node of --lose-group")
 	fs.StringVar(&cfg.LoseGroup, "lose-group", cfg.LoseGroup, "node group the kill command takes down")
 	fs.BoolVar(&cfg.Retry, "retry", cfg.Retry, fmt.Sprintf("retry a failed Exec up to %d times on Unavailable or DeadlineExceeded", groupLossRetries))
+	fs.StringVar(&cfg.SchedPolicy, "sched-policy", "", "placement policy the scheduler was started with, recorded in the results (group-loss.sh: spread, spec D35)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -92,30 +94,45 @@ func groupLossSpec() *gssv1.SandboxSpec {
 	}
 }
 
-// glSession is one long-lived sandbox and the Execs run in it.
+// policyNote says which placement policy the run used and, for spread, why (spec D35).
+func policyNote(policy, loseGroup string) string {
+	switch policy {
+	case "":
+		return "the scheduler's placement policy was not recorded (--sched-policy not given)"
+	case "spread":
+		return fmt.Sprintf("the scheduler ran with --policy spread (spec D35) so the sessions land on both groups: "+
+			"under bin-packing all sessions fit on one node, and losing group %s would affect none of them", loseGroup)
+	}
+	return "the scheduler ran with --policy " + policy
+}
+
+// execRecord is one request: an Exec, with its retries.
+type execRecord struct {
+	start, end  time.Time       // first try sent; outcome of the last try
+	tries       []time.Duration // each try, sent -> outcome, in order; the last one decided the request
+	ok          bool
+	incarnation int32 // from GetSandbox right after the request; 0 when not looked up
+}
+
+// sessionResult is what the figures are computed from for one session.
+type sessionResult struct {
+	affected  bool  // on the lost group at the kill
+	incAtKill int32 // incarnation at the kill
+	finalInc  int32 // incarnation after the run; 0 when it could not be read
+	records   []execRecord
+}
+
+// glSession is one long-lived sandbox and the requests run in it.
 type glSession struct {
 	id string
 	// From the create response.
 	node, group string
 	inc         int32
-	// Placement at the kill; written under groupLoss.mu before the kill, read under it.
+	// Placement at the kill. affected and incAtKill are written under groupLoss.mu before
+	// the kill and read under it by the session; records belong to the session's
+	// goroutine until it ends; finalInc is set after the sessions stopped.
 	nodeAtKill, groupAtKill string
-	incAtKill               int32
-	affected                bool
-	// Owned by the session's goroutine until it ends.
-	records     []execRecord
-	recoveredAt time.Time // end of the first successful Exec on a new incarnation after the kill
-	// Set after the sessions stopped.
-	finalInc int32
-}
-
-// execRecord is one Exec request, with its retries.
-type execRecord struct {
-	at          time.Time
-	incarnation int32 // from GetSandbox after a failed try; 0 when not looked up
-	ok          bool
-	latency     time.Duration // first try sent -> outcome of the last try
-	tries       int
+	sessionResult
 }
 
 type groupLoss struct {
@@ -123,8 +140,15 @@ type groupLoss struct {
 	cfg  groupLossConfig
 	stop chan struct{}
 
-	mu     sync.Mutex
-	killAt time.Time
+	mu      sync.Mutex
+	killAt  time.Time
+	lookups errorTally // failed GetSandbox and ListNodes calls
+}
+
+func (g *groupLoss) lookupFailed(what string, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.lookups.add(what, err)
 }
 
 // runGroupLoss is the local failure-domain test of spec 8.6: sessions run Execs while
@@ -162,6 +186,7 @@ func runGroupLoss(ctx context.Context, c gssv1.SandboxServiceClient, cfg groupLo
 		"retry":         cfg.Retry,
 		"retry_backoff": fmt.Sprintf("%v doubling, at most %d retries", cfg.RetryBackoff, groupLossRetries),
 		"exec_deadline": cfg.ExecDeadline.String(),
+		"sched_policy":  cfg.SchedPolicy,
 		"cpu_millis":    densityCPUMillis,
 		"memory_mib":    densityMemBytes >> 20,
 		"ttl":           densityTTL.String(),
@@ -198,7 +223,7 @@ func runGroupLoss(ctx context.Context, c gssv1.SandboxServiceClient, cfg groupLo
 	}
 	fmt.Fprintf(log, "grouploss: %d sessions, per group %v; warm-up %v\n", cfg.Sessions, perGroup, cfg.Warmup)
 
-	// Each session runs one Exec per interval until stop.
+	// Each session runs one request per interval until stop.
 	var wg sync.WaitGroup
 	for _, s := range sessions {
 		wg.Go(func() { g.runSession(ctx, s) })
@@ -239,8 +264,9 @@ func runGroupLoss(ctx context.Context, c gssv1.SandboxServiceClient, cfg groupLo
 	killAt := g.killAt
 	g.mu.Unlock()
 
-	// Detection: poll ListNodes from the kill on until every node of the group is DEAD.
-	pollCtx, stopPoll := context.WithCancel(ctx)
+	// Detection: poll ListNodes from the kill until every node of the group is DEAD, for
+	// at most the observe window.
+	pollCtx, stopPoll := context.WithDeadline(ctx, killAt.Add(cfg.Observe))
 	detected := make(chan time.Time, 1)
 	go g.pollDetection(pollCtx, lose, detected)
 	fmt.Fprintf(log, "grouploss: running %q\n", cfg.KillCmd)
@@ -264,111 +290,92 @@ func runGroupLoss(ctx context.Context, c gssv1.SandboxServiceClient, cfg groupLo
 		destroyAll()
 		return nil, ctx.Err()
 	}
-	finalFailed := 0
 	for _, s := range sessions {
 		if sb, err := getSandbox(ctx, c, s.id); err == nil {
 			s.finalInc = sb.GetIncarnation()
 		} else {
-			finalFailed++
-			cleanup.add("final GetSandbox "+s.id, err)
+			g.lookupFailed("GetSandbox "+s.id+" after the run", err)
 		}
 	}
 	destroyAll()
 	r.Seconds = time.Since(began).Seconds()
 
-	// Figures.
-	var (
-		affected, rescheduled, recovered int
-		total, failed, failedUnaffected  int
-		maxBlocked, lastRecovery         time.Duration
-		before, after                    []float64
-	)
-	for _, s := range sessions {
-		if s.affected {
-			affected++
-			if s.finalInc > s.incAtKill {
-				rescheduled++
-			}
-			if !s.recoveredAt.IsZero() {
-				recovered++
-				lastRecovery = max(lastRecovery, s.recoveredAt.Sub(killAt))
-			}
-		}
-		for _, rec := range s.records {
-			total++
-			maxBlocked = max(maxBlocked, rec.latency)
-			switch {
-			case !rec.ok:
-				failed++
-				if !s.affected {
-					failedUnaffected++
-				}
-			case rec.at.Before(killAt):
-				before = append(before, ms(rec.latency))
-			default:
-				after = append(after, ms(rec.latency))
-			}
-		}
-		r.Rows = append(r.Rows, s.row(killAt))
+	results := make([]sessionResult, len(sessions))
+	for i, s := range sessions {
+		results[i] = s.sessionResult
+		r.Rows = append(r.Rows, s.row(killAt, cfg.Observe))
 	}
+	f := groupLossMetrics(results, killAt, detectedAt, cfg.Observe)
 	detectionMS, recoveryMS := -1.0, -1.0
-	if !detectedAt.IsZero() {
-		detectionMS = ms(detectedAt.Sub(killAt))
+	if f.detectionOK {
+		detectionMS = ms(f.detection)
 	} else {
 		notes = append(notes, fmt.Sprintf("the scheduler did not list every node of group %s as DEAD within %v of the kill: detection_ms is -1", cfg.LoseGroup, cfg.Observe))
 	}
 	switch {
-	case affected == 0:
+	case f.affected == 0:
 		notes = append(notes, fmt.Sprintf("no session was on group %s at the kill: recovery_ms is -1", cfg.LoseGroup))
-	case recovered < affected:
-		notes = append(notes, fmt.Sprintf("%d of %d affected sessions had no successful Exec on a new incarnation within %v of the kill: recovery_ms is -1",
-			affected-recovered, affected, cfg.Observe))
+	case !f.recoveryOK:
+		notes = append(notes, fmt.Sprintf("%d of %d affected sessions had no successful request on a new incarnation within %v of the kill: recovery_ms is -1",
+			f.affected-f.recovered, f.affected, cfg.Observe))
 	default:
-		recoveryMS = ms(lastRecovery)
+		recoveryMS = ms(f.recovery)
 	}
-	if failedUnaffected > 0 {
-		notes = append(notes, fmt.Sprintf("requests_failed_unaffected is %d, not 0: sessions outside group %s lost requests, so this run is not valid", failedUnaffected, cfg.LoseGroup))
+	if f.failedUnaffected > 0 {
+		notes = append(notes, fmt.Sprintf("requests_failed_unaffected is %d, not 0: sessions outside group %s lost requests, so this run is not valid", f.failedUnaffected, cfg.LoseGroup))
 	}
-	if finalFailed > 0 {
-		notes = append(notes, fmt.Sprintf("GetSandbox after the run failed for %d sessions; they do not count as rescheduled", finalFailed))
+	if f.failedBeforeKill > 0 {
+		notes = append(notes, fmt.Sprintf("%d requests failed before the kill, so the cluster was not steady when it came", f.failedBeforeKill))
+	}
+	if g.lookups.n > 0 {
+		notes = append(notes, fmt.Sprintf("%d lookup calls failed (GetSandbox, ListNodes); each leaves an incarnation unknown or a detection poll empty, and the first are listed below", g.lookups.n))
 	}
 	r.Scalars = map[string]float64{
-		"sessions":                   float64(cfg.Sessions),
-		"affected_sessions":          float64(affected),
-		"detection_ms":               detectionMS,
-		"recovery_ms":                recoveryMS,
-		"requests_total":             float64(total),
-		"requests_failed":            float64(failed),
-		"requests_failed_unaffected": float64(failedUnaffected),
-		"max_blocked_exec_ms":        ms(maxBlocked),
-		"rescheduled":                float64(rescheduled),
+		"sessions":                    float64(cfg.Sessions),
+		"affected_sessions":           float64(f.affected),
+		"detection_ms":                detectionMS,
+		"recovery_ms":                 recoveryMS,
+		"requests_total":              float64(f.total),
+		"requests_failed":             float64(f.failed),
+		"requests_failed_before_kill": float64(f.failedBeforeKill),
+		"requests_failed_unaffected":  float64(f.failedUnaffected),
+		"requests_spanning_kill":      float64(f.spanning),
+		"max_blocked_exec_ms":         ms(f.maxTry),
+		"max_request_with_retries_ms": ms(f.maxRequest),
+		"rescheduled":                 float64(f.rescheduled),
+		"lookup_errors":               float64(g.lookups.n),
 	}
-	r.Series = append(r.Series, bench.Summarize("exec_before_ms", "ms", before), bench.Summarize("exec_after_ms", "ms", after))
-	r.Errors = failedUnaffected + cleanup.n
-	retryNote := "requests are not retried: a request fails when its one Exec fails"
+	r.Series = append(r.Series, bench.Summarize("exec_before_ms", "ms", f.before), bench.Summarize("exec_after_ms", "ms", f.after))
+	r.Errors = f.failedUnaffected + g.lookups.n + cleanup.n
+	retryNote := "requests are not retried: a request is one Exec try"
 	if cfg.Retry {
 		retryNote = fmt.Sprintf("a request is retried up to %d times on Unavailable or DeadlineExceeded, after %v and then twice the previous pause, and fails only if every try fails",
 			groupLossRetries, cfg.RetryBackoff)
 	}
 	r.Notes = append([]string{
 		localFailureDomain,
+		policyNote(cfg.SchedPolicy, cfg.LoseGroup),
 		fmt.Sprintf("kill command: %s; affected sessions are those whose sandbox was on group %s at the kill (ListSandboxes just before it)", cfg.KillCmd, cfg.LoseGroup),
-		fmt.Sprintf("detection_ms is the kill -> the first ListNodes (polled every %v) that lists every node of group %s as DEAD", detectionPoll, cfg.LoseGroup),
-		"recovery_ms is the kill -> the end of the last affected session's first successful Exec on a new incarnation (GetSandbox right after the Exec shows an incarnation above the one at the kill)",
-		fmt.Sprintf("each session starts one Exec of %s every %v (later if the previous one took longer), each try with a %v deadline; a request counts as failed when its stream ends with a gRPC status, without an exit event, or with a non-zero exit", groupLossCode, cfg.Interval, cfg.ExecDeadline),
+		fmt.Sprintf("detection_ms is the kill -> the first ListNodes (polled every %v until the observe window ends) that lists every node of group %s as DEAD", detectionPoll, cfg.LoseGroup),
+		"recovery_ms is the kill -> the end of the last affected session's first successful request on a new incarnation (GetSandbox right after it shows an incarnation above the one at the kill), within the observe window",
+		fmt.Sprintf("each session starts one request, an Exec of %s, every %v (later if the previous one took longer), each try with a %v deadline; a try fails when its stream ends with a gRPC status, without an exit event, or with a non-zero exit", groupLossCode, cfg.Interval, cfg.ExecDeadline),
 		retryNote,
-		"requests_failed_unaffected counts failed requests of sessions not on the lost group; it must be 0 for a valid run",
-		"max_blocked_exec_ms is the longest request (first try sent -> final outcome); exec_before_ms and exec_after_ms are successful requests started before and after the kill",
+		"requests_failed counts failed requests that did not end before the kill; requests_failed_before_kill counts those that did",
+		"requests_failed_unaffected counts failed requests, before or after the kill, of sessions not on the lost group; it must be 0 for a valid run",
+		"max_blocked_exec_ms is the longest single Exec try; max_request_with_retries_ms is the longest request from its first try to its final outcome, retry pauses included",
+		"exec_before_ms holds successful requests that ended before the kill and exec_after_ms those that started after it, each as the latency of the try that succeeded; requests_spanning_kill counts requests that started before the kill and ended after it, which are in neither series",
 		"rescheduled counts affected sessions whose incarnation after the run is above the one at the kill",
-		"errors counts failed requests of unaffected sessions and failed GetSandbox or destroy calls after the run",
+		"lookup_errors counts failed GetSandbox and ListNodes calls; errors counts failed requests of unaffected sessions, lookup errors and failed destroys",
 	}, notes...)
+	r.Notes = append(r.Notes, g.lookups.notes()...)
 	r.Notes = append(r.Notes, cleanup.notes()...)
 	return r, nil
 }
 
-// runSession runs one Exec per interval in s until stop. A request that is in flight
-// when stop closes runs to its outcome and is recorded.
+// runSession runs one request per interval in s until stop. A request that is in
+// flight when stop closes runs to its outcome and is recorded.
 func (g *groupLoss) runSession(ctx context.Context, s *glSession) {
+	recoverySeen := false
 	for {
 		select {
 		case <-g.stop:
@@ -381,28 +388,24 @@ func (g *groupLoss) runSession(ctx context.Context, s *glSession) {
 		if ctx.Err() != nil {
 			return // cut off by Ctrl-C: not an outcome
 		}
-		rec := execRecord{at: start, ok: err == nil, latency: end.Sub(start), tries: tries}
-		if err != nil || tries > 1 {
-			if sb, gerr := getSandbox(ctx, g.c, s.id); gerr == nil {
-				rec.incarnation = sb.GetIncarnation()
-			}
-		}
+		rec := execRecord{start: start, end: end, tries: tries, ok: err == nil}
 		g.mu.Lock()
 		killAt, affected, incAtKill := g.killAt, s.affected, s.incAtKill
 		g.mu.Unlock()
-		if rec.ok && affected && s.recoveredAt.IsZero() && !killAt.IsZero() && end.After(killAt) {
-			// The Exec ran on a new incarnation if the sandbox is past the one at the kill
-			// right after it: an old incarnation cannot answer once its node is dead, and
-			// the move to a new one comes seconds after that.
-			inc := rec.incarnation
-			if inc == 0 {
-				if sb, gerr := getSandbox(ctx, g.c, s.id); gerr == nil {
-					inc = sb.GetIncarnation()
-				}
+		// After a failed or retried request, and after each success of an affected
+		// session until one runs on a new incarnation, look the incarnation up. A success
+		// followed by an incarnation above the one at the kill ran on the new incarnation:
+		// the old one cannot answer once its node is dead, and the move comes seconds later.
+		checkRecovery := rec.ok && affected && !recoverySeen && !killAt.IsZero() && end.After(killAt)
+		if !rec.ok || len(tries) > 1 || checkRecovery {
+			if sb, gerr := getSandbox(ctx, g.c, s.id); gerr == nil {
+				rec.incarnation = sb.GetIncarnation()
+			} else if ctx.Err() == nil {
+				g.lookupFailed("GetSandbox "+s.id, gerr)
 			}
-			if inc > incAtKill {
-				s.recoveredAt = end
-			}
+		}
+		if checkRecovery && rec.incarnation > incAtKill {
+			recoverySeen = true
 		}
 		s.records = append(s.records, rec)
 		if wait := time.Until(start.Add(g.cfg.Interval)); wait > 0 {
@@ -421,12 +424,18 @@ func (g *groupLoss) runSession(ctx context.Context, s *glSession) {
 }
 
 // request runs one Exec of groupLossCode in id, retried when the config says so. It
-// returns the number of tries and the error of the last one.
-func (g *groupLoss) request(ctx context.Context, id string) (int, error) {
+// returns how long each try took and the error of the last one.
+func (g *groupLoss) request(ctx context.Context, id string) ([]time.Duration, error) {
 	pause := g.cfg.RetryBackoff
-	for tries := 1; ; tries++ {
-		_, err := execCode(ctx, g.c, id, groupLossCode, g.cfg.ExecDeadline)
-		if err == nil || !g.cfg.Retry || tries > groupLossRetries {
+	var tries []time.Duration
+	for {
+		sent := time.Now()
+		exitAt, err := execCode(ctx, g.c, id, groupLossCode, g.cfg.ExecDeadline)
+		if err != nil {
+			exitAt = time.Now()
+		}
+		tries = append(tries, exitAt.Sub(sent))
+		if err == nil || !g.cfg.Retry || len(tries) > groupLossRetries {
 			return tries, err
 		}
 		if code := status.Code(err); code != codes.Unavailable && code != codes.DeadlineExceeded {
@@ -447,9 +456,13 @@ func (g *groupLoss) pollDetection(ctx context.Context, lose []string, out chan<-
 	tick := time.NewTicker(detectionPoll)
 	defer tick.Stop()
 	for {
-		if nodes, err := listNodes(ctx, g.c); err == nil && allDead(nodes, lose) {
+		nodes, err := listNodes(ctx, g.c)
+		if err == nil && allDead(nodes, lose) {
 			at = time.Now()
 			return
+		}
+		if err != nil && ctx.Err() == nil {
+			g.lookupFailed("ListNodes", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -469,19 +482,109 @@ func allDead(nodes []*gssv1.Node, ids []string) bool {
 	return true
 }
 
+// groupLossFigures are the measured figures of one run.
+type groupLossFigures struct {
+	affected, rescheduled, recovered int
+	total, failed, failedBeforeKill  int
+	failedUnaffected, spanning       int
+	maxTry, maxRequest               time.Duration
+	recovery                         time.Duration // valid when recoveryOK
+	recoveryOK                       bool          // every affected session recovered within observe, and there was one
+	detection                        time.Duration // valid when detectionOK
+	detectionOK                      bool
+	before, after                    []float64 // ms, latency of the try that succeeded
+}
+
+// groupLossMetrics computes the figures from the session records alone. A request that
+// ended before killAt is "before", one that started after it is "after", and one that
+// started before and ended after spans the kill. Detection and recovery count only
+// within observe of killAt.
+func groupLossMetrics(sessions []sessionResult, killAt, detectedAt time.Time, observe time.Duration) groupLossFigures {
+	var f groupLossFigures
+	window := killAt.Add(observe)
+	if !detectedAt.IsZero() && !detectedAt.After(window) {
+		f.detection, f.detectionOK = detectedAt.Sub(killAt), true
+	}
+	for _, s := range sessions {
+		if s.affected {
+			f.affected++
+			if s.finalInc > s.incAtKill {
+				f.rescheduled++
+			}
+			if d, ok := sessionRecovery(s, killAt, observe); ok {
+				f.recovered++
+				f.recovery = max(f.recovery, d)
+			}
+		}
+		for _, rec := range s.records {
+			f.total++
+			for _, t := range rec.tries {
+				f.maxTry = max(f.maxTry, t)
+			}
+			f.maxRequest = max(f.maxRequest, rec.end.Sub(rec.start))
+			if !rec.ok && !s.affected {
+				f.failedUnaffected++
+			}
+			var last float64
+			if len(rec.tries) > 0 {
+				last = ms(rec.tries[len(rec.tries)-1])
+			}
+			switch {
+			case rec.end.Before(killAt):
+				if rec.ok {
+					f.before = append(f.before, last)
+				} else {
+					f.failedBeforeKill++
+				}
+			case rec.start.After(killAt):
+				if rec.ok {
+					f.after = append(f.after, last)
+				} else {
+					f.failed++
+				}
+			default:
+				f.spanning++
+				if !rec.ok {
+					f.failed++
+				}
+			}
+		}
+	}
+	f.recoveryOK = f.affected > 0 && f.recovered == f.affected
+	if !f.recoveryOK {
+		f.recovery = 0
+	}
+	return f
+}
+
+// sessionRecovery returns killAt -> the end of s's first successful request after the
+// kill that ran on a new incarnation, if that end is within observe.
+func sessionRecovery(s sessionResult, killAt time.Time, observe time.Duration) (time.Duration, bool) {
+	for _, rec := range s.records {
+		if rec.ok && rec.end.After(killAt) && rec.incarnation > s.incAtKill {
+			d := rec.end.Sub(killAt)
+			return d, d <= observe
+		}
+	}
+	return 0, false
+}
+
 // row is the session's line in the results file.
-func (s *glSession) row(killAt time.Time) map[string]any {
+func (s *glSession) row(killAt time.Time, observe time.Duration) map[string]any {
 	failed := 0
-	var maxLatency time.Duration
+	var maxTry, maxRequest time.Duration
 	for _, rec := range s.records {
 		if !rec.ok {
 			failed++
 		}
-		maxLatency = max(maxLatency, rec.latency)
+		for _, t := range rec.tries {
+			maxTry = max(maxTry, t)
+		}
+		maxRequest = max(maxRequest, rec.end.Sub(rec.start))
 	}
 	recovery := -1.0
-	if !s.recoveredAt.IsZero() {
-		recovery = ms(s.recoveredAt.Sub(killAt))
+	if d, ok := sessionRecovery(s.sessionResult, killAt, observe); ok {
+		recovery = ms(d)
 	}
 	return map[string]any{
 		"sandbox":             s.id,
@@ -493,7 +596,8 @@ func (s *glSession) row(killAt time.Time) map[string]any {
 		"requests":            len(s.records),
 		"failed":              failed,
 		"recovery_ms":         recovery,
-		"max_request_ms":      ms(maxLatency),
+		"max_try_ms":          ms(maxTry),
+		"max_request_ms":      ms(maxRequest),
 	}
 }
 
@@ -508,21 +612,26 @@ func printGroupLoss(w io.Writer, r *bench.Run, out string) error {
 			after = x
 		}
 	}
+	policy, _ := r.Params["sched_policy"].(string)
+	lose, _ := r.Params["lose_group"].(string)
 	_, err := fmt.Fprintf(w, `%s
+%s
 retry: %v
 sessions: %.0f, affected: %.0f, rescheduled: %.0f
 detection_ms: %.0f
 recovery_ms: %.0f
-requests: %.0f, failed: %.0f, failed on unaffected sessions: %.0f
-max_blocked_exec_ms: %.0f
+requests: %.0f, failed after the kill: %.0f, failed before it: %.0f, failed on unaffected sessions: %.0f, spanning the kill: %.0f
+max_blocked_exec_ms (longest single try): %.0f; max_request_with_retries_ms: %.0f
 exec before the kill: n %d, p50 %.1f ms, p95 %.1f ms; after: n %d, p50 %.1f ms, p95 %.1f ms
+lookup errors: %.0f
 wrote %s
-`, localFailureDomain, r.Params["retry"],
+`, localFailureDomain, policyNote(policy, lose), r.Params["retry"],
 		s["sessions"], s["affected_sessions"], s["rescheduled"],
 		s["detection_ms"], s["recovery_ms"],
-		s["requests_total"], s["requests_failed"], s["requests_failed_unaffected"],
-		s["max_blocked_exec_ms"],
-		before.Count, before.P50, before.P95, after.Count, after.P50, after.P95, out)
+		s["requests_total"], s["requests_failed"], s["requests_failed_before_kill"], s["requests_failed_unaffected"], s["requests_spanning_kill"],
+		s["max_blocked_exec_ms"], s["max_request_with_retries_ms"],
+		before.Count, before.P50, before.P95, after.Count, after.P50, after.P95,
+		s["lookup_errors"], out)
 	if err != nil {
 		return err
 	}

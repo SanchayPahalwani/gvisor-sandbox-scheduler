@@ -95,6 +95,7 @@ func runStart(ctx context.Context, c gssv1.SandboxServiceClient, cfg startConfig
 		}
 		var readyMS, createMS, firstMS []float64
 		failed := 0
+		warmedUp := false
 		for i := range cfg.N {
 			if mode == gssv1.StartMode_START_MODE_WARM {
 				if err := waitWarm(ctx, c, cfg.Group, cfg.WarmWait); err != nil {
@@ -111,13 +112,17 @@ func runStart(ctx context.Context, c gssv1.SandboxServiceClient, cfg startConfig
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			if res.cleanupErr != nil {
+				tally.add(fmt.Sprintf("%s cycle %d", name, i), res.cleanupErr)
+			}
 			if err != nil {
 				tally.add(fmt.Sprintf("%s cycle %d", name, i), err)
 				failed++
 				continue
 			}
-			if i == 0 {
-				continue // warm-up
+			if !warmedUp {
+				warmedUp = true // the first successful cycle is the warm-up
+				continue
 			}
 			readyMS = append(readyMS, res.readyMS)
 			createMS = append(createMS, res.createMS)
@@ -133,11 +138,11 @@ func runStart(ctx context.Context, c gssv1.SandboxServiceClient, cfg startConfig
 	r.Errors = tally.n
 	r.Scalars["warm_retries"] = float64(retries)
 	r.Notes = append([]string{
-		"the first cycle of each mode is a warm-up and is not recorded",
+		"the first successful cycle of each mode is a warm-up and is not recorded, so with no errors each series has n-1 samples",
 		"<mode>_ready_ms is the start_latency in the CreateSandbox response: node agent receives Create -> sandbox ready",
 		"<mode>_create_ms is the client-side CreateSandbox round trip",
 		`<mode>_first_result_ms is CreateSandbox sent -> exit event of the Exec of print("hello")`,
-		"a cycle with any failed call (create, Exec, destroy) or a start path other than the forced one counts in errors and gives no sample",
+		"a cycle with any failed call (create, Exec, destroy) or a start path other than the forced one counts in errors and gives no sample; a destroy that fails after such a failure counts as one more error",
 		"warm_retries counts forced-warm creates retried after FailedPrecondition (stale warm count); a retried attempt is not a sample and its successor's clock starts at its own Create",
 	}, tally.notes()...)
 	return r, nil

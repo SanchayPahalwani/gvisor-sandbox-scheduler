@@ -55,6 +55,13 @@ type fake struct {
 	place func(n int) (node, group string)
 	// execErr fails an Exec on a live sandbox.
 	execErr func(sb *gssv1.Sandbox) error
+	// execDelayFor replaces execDelay for one Exec; the delay comes before an error too,
+	// so an Exec can block and then fail.
+	execDelayFor func(sb *gssv1.Sandbox) time.Duration
+	// destroyErr fails a DestroySandbox; the sandbox stays live.
+	destroyErr func(id string) error
+	// getErr fails a GetSandbox.
+	getErr func(id string) error
 }
 
 func newFake(t *testing.T) (*fake, gssv1.SandboxServiceClient) {
@@ -151,11 +158,14 @@ func (f *fake) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[gs
 		err = f.execErr(sb)
 	}
 	delay := f.execDelay
+	if sb != nil && f.execDelayFor != nil {
+		delay = f.execDelayFor(sb)
+	}
 	f.mu.Unlock()
+	time.Sleep(delay)
 	if err != nil {
 		return err
 	}
-	time.Sleep(delay)
 	if err := stream.Send(&gssv1.ExecEvent{Event: &gssv1.ExecEvent_Stdout{Stdout: []byte("hello\n")}}); err != nil {
 		return err
 	}
@@ -168,6 +178,11 @@ func (f *fake) DestroySandbox(_ context.Context, req *gssv1.DestroySandboxReques
 	if _, ok := f.live[req.GetSandboxId()]; !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %s not found", req.GetSandboxId())
 	}
+	if f.destroyErr != nil {
+		if err := f.destroyErr(req.GetSandboxId()); err != nil {
+			return nil, err
+		}
+	}
 	delete(f.live, req.GetSandboxId())
 	f.destroyed++
 	return &gssv1.DestroySandboxResponse{}, nil
@@ -176,6 +191,11 @@ func (f *fake) DestroySandbox(_ context.Context, req *gssv1.DestroySandboxReques
 func (f *fake) GetSandbox(_ context.Context, req *gssv1.GetSandboxRequest) (*gssv1.Sandbox, error) {
 	f.lockTick()
 	defer f.mu.Unlock()
+	if f.getErr != nil {
+		if err := f.getErr(req.GetSandboxId()); err != nil {
+			return nil, err
+		}
+	}
 	sb, ok := f.live[req.GetSandboxId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %s not found", req.GetSandboxId())
@@ -358,6 +378,83 @@ func TestThroughputShares(t *testing.T) {
 	}
 }
 
+// The warm-up is the first cycle that succeeds, not the first cycle tried.
+func TestStartWarmUpIsFirstSuccess(t *testing.T) {
+	f, c := newFake(t)
+	f.nodes = []*gssv1.Node{node("a1", "a", gssv1.NodeState_NODE_STATE_READY, 2)}
+	f.createErr = func(n, _ int, _ *gssv1.SandboxSpec) error {
+		if n == 0 {
+			return status.Error(codes.Unavailable, "scheduler not ready")
+		}
+		return nil
+	}
+	run, err := runStart(context.Background(), c, newStartConfig(3, []gssv1.StartMode{cold}, "a"), io.Discard)
+	if err != nil {
+		t.Fatalf("runStart: %v", err)
+	}
+	if run.Errors != 1 {
+		t.Errorf("errors = %d, want 1 (the failed first cycle)", run.Errors)
+	}
+	if s := seriesByName(t, run, "cold_ready_ms"); s.Count != 1 {
+		t.Errorf("cold_ready_ms count = %d, want 1: cycle 0 failed, cycle 1 is the warm-up, cycle 2 is recorded", s.Count)
+	}
+}
+
+// A destroy that fails after a failed cycle is an error of its own.
+func TestStartCountsCleanupFailure(t *testing.T) {
+	f, c := newFake(t)
+	f.nodes = []*gssv1.Node{node("a1", "a", gssv1.NodeState_NODE_STATE_READY, 2)}
+	f.execErr = func(sb *gssv1.Sandbox) error {
+		if sb.Id == "sb-1" {
+			return status.Error(codes.Internal, "exec broke")
+		}
+		return nil
+	}
+	f.destroyErr = func(id string) error {
+		if id == "sb-1" {
+			return status.Error(codes.Unavailable, "destroy failed")
+		}
+		return nil
+	}
+	run, err := runStart(context.Background(), c, newStartConfig(3, []gssv1.StartMode{cold}, "a"), io.Discard)
+	if err != nil {
+		t.Fatalf("runStart: %v", err)
+	}
+	if run.Errors != 2 {
+		t.Errorf("errors = %d, want 2 (the failed Exec and the failed destroy after it); notes %q", run.Errors, run.Notes)
+	}
+	if !strings.Contains(strings.Join(run.Notes, "\n"), "destroy failed") {
+		t.Errorf("notes do not list the failed destroy: %q", run.Notes)
+	}
+	if s := seriesByName(t, run, "cold_ready_ms"); s.Count != 1 {
+		t.Errorf("cold_ready_ms count = %d, want 1", s.Count)
+	}
+}
+
+func TestThroughputCountsCleanupFailure(t *testing.T) {
+	f, c := newFake(t)
+	f.nodes = []*gssv1.Node{node("a1", "a", gssv1.NodeState_NODE_STATE_READY, 2)}
+	f.execErr = func(sb *gssv1.Sandbox) error {
+		if sb.Id == "sb-0" {
+			return status.Error(codes.Internal, "exec broke")
+		}
+		return nil
+	}
+	f.destroyErr = func(id string) error {
+		if id == "sb-0" {
+			return status.Error(codes.Unavailable, "destroy failed")
+		}
+		return nil
+	}
+	run, err := runThroughput(context.Background(), c, throughputConfig{Workers: 1, Duration: 150 * time.Millisecond}, io.Discard)
+	if err != nil {
+		t.Fatalf("runThroughput: %v", err)
+	}
+	if run.Errors != 2 {
+		t.Errorf("errors = %d, want 2 (the failed cycle and the failed destroy after it); notes %q", run.Errors, run.Notes)
+	}
+}
+
 func densityFake(t *testing.T) (*fake, gssv1.SandboxServiceClient) {
 	f, c := newFake(t)
 	f.nodes = []*gssv1.Node{node("a1", "a", gssv1.NodeState_NODE_STATE_READY, 0)}
@@ -469,6 +566,68 @@ func TestDensityNeedsOneNode(t *testing.T) {
 	}
 	if f.creates != 0 {
 		t.Errorf("%d creates before the check failed", f.creates)
+	}
+}
+
+// A kept sandbox that the scheduler restarted (a new incarnation) is lost even though
+// Execs on it keep working: the step fails and the ramp stops.
+func TestDensityCountsLostSandbox(t *testing.T) {
+	f, c := densityFake(t)
+	bumped := false
+	f.tick = func(f *fake) {
+		// Step 10's first restore start makes 11 live: then sb-0 (kept since step 5)
+		// is restarted, as after an OOM-killed sentry.
+		if sb := f.live["sb-0"]; sb != nil && len(f.live) >= 11 && !bumped {
+			bumped = true
+			sb.Incarnation++
+		}
+	}
+	run, err := runDensity(context.Background(), c, densityConfigFor([]int{5, 10, 20}, 3), io.Discard)
+	if err != nil {
+		t.Fatalf("runDensity: %v", err)
+	}
+	if len(run.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (step 10 lost a sandbox and stopped the ramp): %v", len(run.Rows), run.Rows)
+	}
+	if run.Rows[0]["lost"] != 0 || run.Rows[0]["failed"] != 0 {
+		t.Errorf("step 5 row = %v, want lost 0 and failed 0", run.Rows[0])
+	}
+	if run.Rows[1]["lost"] != 1 || run.Rows[1]["failed"] != 1 {
+		t.Errorf("step 10 row = %v, want lost 1 and failed 1", run.Rows[1])
+	}
+	if got := run.Scalars["max_live_within_2x"]; got != 5 {
+		t.Errorf("max_live_within_2x = %v, want 5", got)
+	}
+	if notes := strings.Join(run.Notes, "\n"); !strings.Contains(notes, "step 10") || !strings.Contains(notes, "lost") {
+		t.Errorf("notes do not say step 10 lost a sandbox: %q", run.Notes)
+	}
+	if f.liveCount() != 0 {
+		t.Errorf("%d sandboxes left live after the run", f.liveCount())
+	}
+}
+
+func TestDensityVerdict(t *testing.T) {
+	ok := func(step int, p95 float64) densityStep {
+		return densityStep{step: step, live: step, start: bench.Series{Count: 3, P95: p95}}
+	}
+	// The first step failed but its restore starts worked: a baseline, no qualifying step.
+	failedFirst := ok(5, 10)
+	failedFirst.failed = 2
+	base, maxLive, notes := densityVerdict([]densityStep{failedFirst})
+	text := strings.Join(notes, "\n")
+	if base != 10 || maxLive != 0 || !strings.Contains(text, "first step had 2 failures") || strings.Contains(text, "no successful restore start") {
+		t.Errorf("failed first step: baseline %v max %d notes %q", base, maxLive, notes)
+	}
+	// The first step had no successful restore start: no baseline at all.
+	noStarts := densityStep{step: 5, live: 5, failed: 3}
+	base, maxLive, notes = densityVerdict([]densityStep{noStarts})
+	if base != 0 || maxLive != 0 || !strings.Contains(strings.Join(notes, "\n"), "no successful restore start") {
+		t.Errorf("no starts: baseline %v max %d notes %q", base, maxLive, notes)
+	}
+	// A step over 2x, then one back within it: the largest qualifying step, and a note.
+	base, maxLive, notes = densityVerdict([]densityStep{ok(5, 10), ok(10, 25), ok(20, 18)})
+	if base != 10 || maxLive != 20 || !strings.Contains(strings.Join(notes, "\n"), "above 2 x baseline at steps [10]") {
+		t.Errorf("over then within: baseline %v max %d notes %q", base, maxLive, notes)
 	}
 }
 

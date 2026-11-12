@@ -88,6 +88,9 @@ func runThroughput(ctx context.Context, c gssv1.SandboxServiceClient, cfg throug
 					return
 				}
 				mu.Lock()
+				if res.cleanupErr != nil {
+					tally.add(fmt.Sprintf("worker %d", w), res.cleanupErr)
+				}
 				if err != nil {
 					tally.add(fmt.Sprintf("worker %d", w), err)
 				} else {
@@ -125,7 +128,7 @@ func runThroughput(ctx context.Context, c gssv1.SandboxServiceClient, cfg throug
 		"sandboxes_per_sec is completed create -> Exec -> destroy cycles divided by the wall time from the first create to the end of the last cycle",
 		"share_* is the fraction of completed cycles whose sandbox started on that path (started_as)",
 		`first_result_ms is CreateSandbox sent -> exit event of print("hello"); ready_ms is the start_latency in the response`,
-		"a cycle with any failed call counts in errors and in no other figure",
+		"a cycle with any failed call counts in errors and in no other figure; a destroy that fails after such a failure counts as one more error",
 	}
 	if other := ok - started[gssv1.StartMode_START_MODE_WARM] - started[gssv1.StartMode_START_MODE_RESTORE] - started[gssv1.StartMode_START_MODE_COLD]; other > 0 {
 		r.Notes = append(r.Notes, fmt.Sprintf("%d completed cycles reported no start path, so the shares sum to less than 1", other))

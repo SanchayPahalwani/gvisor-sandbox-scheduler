@@ -133,6 +133,9 @@ type cycle struct {
 	readyMS       float64 // start_latency in the response: node agent receives Create -> ready
 	firstResultMS float64 // Create sent -> exit event of the Exec
 	retries       int     // forced-warm creates retried after FailedPrecondition
+	// cleanupErr is a destroy that failed after the cycle had already failed; it is an
+	// error of its own (a sandbox may be left behind).
+	cleanupErr error
 }
 
 // runCycle creates a sandbox from spec, runs code in it and destroys it. A cycle with
@@ -163,7 +166,9 @@ func runCycle(ctx context.Context, c gssv1.SandboxServiceClient, spec func() *gs
 	}
 	res.sb = sb
 	fail := func(err error) (cycle, error) {
-		_ = destroySandbox(cleanupCtx(ctx), c, sb.GetId())
+		if derr := destroySandbox(cleanupCtx(ctx), c, sb.GetId()); derr != nil {
+			res.cleanupErr = fmt.Errorf("destroy %s after the failure: %w", sb.GetId(), derr)
+		}
 		return res, err
 	}
 	if forced := s.GetStartMode(); forced != gssv1.StartMode_START_MODE_AUTO && sb.GetStartedAs() != forced {

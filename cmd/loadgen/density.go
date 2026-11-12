@@ -96,28 +96,30 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 	})
 	began := time.Now()
 	rng := rand.New(rand.NewPCG(1, 1)) // fixed seed: which live sandbox each Exec hits
+	type keptSandbox struct {
+		id  string
+		inc int32 // incarnation at creation
+	}
 	var (
-		kept    []string // IDs of the sandboxes held live
+		kept    []keptSandbox
+		steps   []densityStep
 		tally   errorTally
 		memNote string
 		stopped string
 	)
-	destroyKept := func() int {
-		failed := 0
-		for _, id := range kept {
-			if err := destroySandbox(cleanupCtx(ctx), c, id); err != nil {
-				tally.add("destroy "+id, err)
-				failed++
+	destroyKept := func() {
+		for _, k := range kept {
+			if err := destroySandbox(cleanupCtx(ctx), c, k.id); err != nil {
+				tally.add("destroy "+k.id, err)
 			}
 		}
 		kept = nil
-		return failed
 	}
 	for _, step := range cfg.Steps {
-		failed := 0
+		st := densityStep{step: step}
 		var firstErr string
 		fail := func(what string, err error) {
-			failed++
+			st.failed++
 			if firstErr == "" {
 				firstErr = fmt.Sprintf("%s: %v", what, err)
 			}
@@ -133,11 +135,11 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 				fail(fmt.Sprintf("create of live sandbox %d", len(kept)+1), err)
 				break
 			}
-			kept = append(kept, sb.GetId())
+			kept = append(kept, keptSandbox{id: sb.GetId(), inc: sb.GetIncarnation()})
 		}
-		row := map[string]any{"step": step, "live": len(kept)}
+		st.live = len(kept)
 		if mem, err := cfg.MemAvailableMiB(); err == nil {
-			row["node_mem_available_mib"] = mem
+			st.memMiB, st.memOK = mem, true
 		} else if memNote == "" {
 			memNote = fmt.Sprintf("node_mem_available_mib is not recorded: %v", err)
 		}
@@ -147,6 +149,9 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 			if ctx.Err() != nil {
 				destroyKept()
 				return nil, ctx.Err()
+			}
+			if res.cleanupErr != nil {
+				tally.add(fmt.Sprintf("step %d restore start", step), res.cleanupErr)
 			}
 			if err != nil {
 				fail("restore start", err)
@@ -158,7 +163,7 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 			if len(kept) == 0 {
 				break
 			}
-			id := kept[rng.IntN(len(kept))]
+			id := kept[rng.IntN(len(kept))].id
 			sent := time.Now()
 			exitAt, err := execCode(ctx, c, id, helloCode, execTimeout)
 			if ctx.Err() != nil {
@@ -171,14 +176,34 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 			}
 			execMS = append(execMS, ms(exitAt.Sub(sent)))
 		}
-		st, ex := bench.Summarize("start", "ms", startMS), bench.Summarize("exec", "ms", execMS)
-		row["start_p50_ms"], row["start_p95_ms"] = st.P50, st.P95
-		row["exec_p50_ms"], row["exec_p95_ms"] = ex.P50, ex.P95
-		row["failed"] = failed
-		r.Rows = append(r.Rows, row)
-		fmt.Fprintf(log, "density step %d: live %d, start p95 %.1f ms, exec p95 %.1f ms, failed %d\n", step, len(kept), st.P95, ex.P95, failed)
-		if failed > 0 {
-			stopped = fmt.Sprintf("the ramp stopped at step %d (%d live) after %d failures; first: %s", step, len(kept), failed, firstErr)
+		// A kept sandbox that the scheduler restarted (its sentry OOM-killed, say) answers
+		// Execs again once the new incarnation is READY, so Exec success does not show the
+		// loss. Each kept sandbox must still be READY at the incarnation it was created at.
+		for _, k := range kept {
+			sb, err := getSandbox(ctx, c, k.id)
+			if ctx.Err() != nil {
+				destroyKept()
+				return nil, ctx.Err()
+			}
+			if err == nil && (sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY || sb.GetIncarnation() != k.inc) {
+				err = fmt.Errorf("%s at incarnation %d, created at incarnation %d", sb.GetState(), sb.GetIncarnation(), k.inc)
+			}
+			if err != nil {
+				st.lost++
+				fail("live sandbox "+k.id+" lost", err)
+			}
+		}
+		st.start, st.exec = bench.Summarize("start", "ms", startMS), bench.Summarize("exec", "ms", execMS)
+		steps = append(steps, st)
+		r.Rows = append(r.Rows, st.row())
+		fmt.Fprintf(log, "density step %d: live %d, start p95 %.1f ms, exec p95 %.1f ms, lost %d, failed %d\n",
+			step, st.live, st.start.P95, st.exec.P95, st.lost, st.failed)
+		if st.failed > 0 {
+			stopped = fmt.Sprintf("the ramp stopped at step %d (%d live) after %d failures", step, st.live, st.failed)
+			if st.lost > 0 {
+				stopped += fmt.Sprintf(", %d of them live sandboxes lost (not READY at the incarnation they were created at)", st.lost)
+			}
+			stopped += "; first: " + firstErr
 			break
 		}
 	}
@@ -189,23 +214,20 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 	r.Seconds = time.Since(began).Seconds()
 	r.Errors = tally.n
 
-	baseline, maxLive, over := densityVerdict(r.Rows)
+	baseline, maxLive, verdictNotes := densityVerdict(steps)
 	r.Scalars["baseline_start_p95_ms"] = baseline
 	r.Scalars["max_live_within_2x"] = float64(maxLive)
 	r.Notes = []string{
 		stopped,
 		"start_* is the start_latency in the CreateSandbox response of a forced restore (node agent receives Create -> ready), from per_step create -> Exec -> destroy cycles run while the step's sandboxes are live",
 		`exec_* is Exec sent -> exit event of print("hello") in a live sandbox picked at random`,
-		"live is the number of sandboxes this run created and kept at that step; failed counts failed creates, restore starts and Execs at that step",
+		"live is the number of sandboxes this run created and kept at that step",
+		"lost counts kept sandboxes that GetSandbox, after the step's measurements, did not show READY at the incarnation they were created at; a restarted sandbox answers Execs again, so Exec success alone would hide it",
+		"failed counts failed creates, restore starts and Execs at that step, and each lost sandbox",
 		"max_live_within_2x is the largest live count of a step with no failures and start_p95_ms <= 2 x baseline_start_p95_ms (the first step's)",
 		"node_mem_available_mib is MemAvailable from /proc/meminfo on the machine loadgen runs on (the VM that runs the node), read after the step's sandboxes were created",
 	}
-	if len(over) > 0 {
-		r.Notes = append(r.Notes, fmt.Sprintf("start_p95_ms was above 2 x baseline at steps %v", over))
-	}
-	if baseline == 0 {
-		r.Notes = append(r.Notes, "the first step has no successful restore start, so there is no baseline and max_live_within_2x is 0")
-	}
+	r.Notes = append(r.Notes, verdictNotes...)
 	if memNote != "" {
 		r.Notes = append(r.Notes, memNote)
 	}
@@ -213,28 +235,56 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 	return r, nil
 }
 
-// densityVerdict returns the first step's start p95, the largest live count of a step
-// with no failures and start p95 within 2x of it, and the failure-free steps that
-// went over 2x.
-func densityVerdict(rows []map[string]any) (baseline float64, maxLive int, over []int) {
-	if len(rows) == 0 || rows[0]["failed"] != 0 {
+// densityStep is one step of the ramp.
+type densityStep struct {
+	step, live, lost, failed int
+	start, exec              bench.Series // restore-start ready latency; Exec latency
+	memMiB                   float64
+	memOK                    bool
+}
+
+func (s densityStep) row() map[string]any {
+	row := map[string]any{
+		"step": s.step, "live": s.live, "lost": s.lost, "failed": s.failed,
+		"start_p50_ms": s.start.P50, "start_p95_ms": s.start.P95,
+		"exec_p50_ms": s.exec.P50, "exec_p95_ms": s.exec.P95,
+	}
+	if s.memOK {
+		row["node_mem_available_mib"] = s.memMiB
+	}
+	return row
+}
+
+// densityVerdict returns the first step's start p95 (the baseline), the largest live
+// count of a step with no failures and start p95 within 2x of it, and notes on how
+// the verdict came out.
+func densityVerdict(steps []densityStep) (baseline float64, maxLive int, notes []string) {
+	if len(steps) == 0 {
 		return 0, 0, nil
 	}
-	baseline = rows[0]["start_p95_ms"].(float64)
-	if baseline == 0 {
-		return 0, 0, nil
+	first := steps[0]
+	if first.start.Count == 0 {
+		return 0, 0, []string{"the first step has no successful restore start, so there is no baseline: baseline_start_p95_ms and max_live_within_2x are 0"}
 	}
-	for _, row := range rows {
-		if row["failed"] != 0 {
+	baseline = first.start.P95
+	if first.failed > 0 {
+		return baseline, 0, []string{fmt.Sprintf("the first step had %d failures; its restore starts give the baseline, but no step qualifies, so max_live_within_2x is 0", first.failed)}
+	}
+	var over []int
+	for _, s := range steps {
+		if s.failed > 0 || s.start.Count == 0 {
 			continue
 		}
-		if row["start_p95_ms"].(float64) > 2*baseline {
-			over = append(over, row["step"].(int))
+		if s.start.P95 > 2*baseline {
+			over = append(over, s.step)
 			continue
 		}
-		maxLive = max(maxLive, row["live"].(int))
+		maxLive = max(maxLive, s.live)
 	}
-	return baseline, maxLive, over
+	if len(over) > 0 {
+		notes = append(notes, fmt.Sprintf("start_p95_ms was above 2 x baseline at steps %v", over))
+	}
+	return baseline, maxLive, notes
 }
 
 func readMemAvailableMiB() (float64, error) {
@@ -263,14 +313,14 @@ func parseMemAvailableMiB(data []byte) (float64, error) {
 
 func printDensity(w io.Writer, r *bench.Run, out string) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "STEP\tLIVE\tSTART P50\tSTART P95\tEXEC P50\tEXEC P95\tFAILED\tMEM AVAILABLE MIB")
+	fmt.Fprintln(tw, "STEP\tLIVE\tSTART P50\tSTART P95\tEXEC P50\tEXEC P95\tLOST\tFAILED\tMEM AVAILABLE MIB")
 	for _, row := range r.Rows {
 		mem := "-"
 		if v, ok := row["node_mem_available_mib"].(float64); ok {
 			mem = fmt.Sprintf("%.0f", v)
 		}
-		fmt.Fprintf(tw, "%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%s\n", row["step"], row["live"],
-			row["start_p50_ms"], row["start_p95_ms"], row["exec_p50_ms"], row["exec_p95_ms"], row["failed"], mem)
+		fmt.Fprintf(tw, "%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%d\t%s\n", row["step"], row["live"],
+			row["start_p50_ms"], row["start_p95_ms"], row["exec_p50_ms"], row["exec_p95_ms"], row["lost"], row["failed"], mem)
 	}
 	if err := tw.Flush(); err != nil {
 		return err

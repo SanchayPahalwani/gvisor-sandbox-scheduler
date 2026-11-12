@@ -49,10 +49,13 @@ rootfs:
 	scripts/build-rootfs.sh
 
 # Benchmarks (spec section 10). Each one starts from a fresh cluster so runs do not
-# share state, and refuses to run with OTLP export on (spec call D25). start and
-# throughput use the default four nodes; density uses one large node with no warm pool.
+# share state, and refuses to run with OTLP export on or the gss-obs observability
+# container running (spec call D25). start and throughput use the default four nodes;
+# density uses one large node with no warm pool.
 BENCH_NO_OTEL = if [ -n "$${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then \
-	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2; exit 1; fi
+	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2; exit 1; fi; \
+	if command -v nerdctl >/dev/null 2>&1 && nerdctl ps --format '{{.Names}}' 2>/dev/null | grep -qx gss-obs; then \
+	echo "the gss-obs observability container is running; benchmarks run with observability off (spec call D25): make obs-down" >&2; exit 1; fi
 DEFAULT_TOPOLOGY := env -u GSS_NODES -u GSS_NODE_CPU -u GSS_NODE_MEM -u GSS_NODE_MAX -u GSS_POOL
 DENSITY_TOPOLOGY := env GSS_NODES="a1:a:7101" GSS_NODE_CPU=64000 GSS_NODE_MEM=65536 GSS_NODE_MAX=200 GSS_POOL=0
 
