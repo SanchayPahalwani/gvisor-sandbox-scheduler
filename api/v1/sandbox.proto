@@ -53,7 +53,8 @@ message Sandbox {
   google.protobuf.Timestamp created_at = 11; google.protobuf.Timestamp expires_at = 12;
 }
 message CreateSandboxRequest { SandboxSpec spec = 1; }
-message DestroySandboxRequest { string sandbox_id = 1; }
+// incarnation 0 destroys whatever is live; otherwise only an incarnation <= it.
+message DestroySandboxRequest { string sandbox_id = 1; int32 incarnation = 2; }
 message DestroySandboxResponse {}
 message GetSandboxRequest { string sandbox_id = 1; }
 message ListSandboxesRequest {}

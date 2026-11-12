@@ -1,0 +1,600 @@
+// Package nodeagent is the node agent: it runs sandboxes as runsc containers
+// on one node (spec section 6).
+package nodeagent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"sync"
+	"time"
+
+	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bundle"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
+)
+
+// Config describes one node. Zero Prime, ReadyTimeout and TTLGrace take
+// their defaults.
+type Config struct {
+	NodeID, Group string
+	CPUMillis     int64 // declared capacity
+	MemoryBytes   int64
+	MaxSandboxes  int
+	RootFS        string
+	StateDir      string        // bundles live in StateDir/bundles/<runsc-id>
+	CheckpointDir string        // "" disables checkpoint/restore
+	WarmPoolSize  int           // 0 disables the pool
+	Prime         string        // default bundle.DefaultPrime
+	ReadyTimeout  time.Duration // default 30s
+	TTLGrace      time.Duration // default 10s: the node reaps at ttl + grace
+}
+
+// NetPolicy is implemented by internal/netpolicy. A nil NetPolicy makes any
+// request with egress_allow fail with FAILED_PRECONDITION.
+type NetPolicy interface {
+	Setup(ctx context.Context, id string, allow []string) (netnsPath string, hosts []bundle.HostEntry, err error)
+	Teardown(ctx context.Context, id string) error
+}
+
+// Deps are the manager's connections to the host.
+type Deps struct {
+	Runtime runsc.Runtime
+	Cgroups Cgroups
+	Net     NetPolicy
+	Now     func() time.Time // default time.Now
+}
+
+const (
+	defaultReadyTimeout = 30 * time.Second
+	defaultTTLGrace     = 10 * time.Second
+
+	reapInterval     = time.Second
+	livenessInterval = 2 * time.Second
+
+	// cleanupTimeout bounds one teardown (runsc delete, network, files, cgroup).
+	cleanupTimeout = 30 * time.Second
+	// loopLockWait bounds how long a background destroy waits for the
+	// lifecycle lock of a sandbox.
+	loopLockWait = time.Minute
+)
+
+// nodeIDRE is what the bundle accepts as a node ID; it also keeps the
+// cgroup path /gss/<node> one level deep.
+var nodeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
+
+// Manager owns the sandboxes of one node: the table of entries, admission
+// against the node's capacity, the start and teardown steps, the TTL reaper
+// and the liveness check.
+//
+// Locking: mu guards the table and each entry's state and pid. Each entry
+// also has a lifecycle lock (sandbox.op) held for the whole of a Create or a
+// destroy, so those never run at once on one entry; mu is never held while
+// waiting for that lock or while calling runsc.
+type Manager struct {
+	cfg Config
+	rt  runsc.Runtime // every call is traced as runsc.<method>
+	cg  Cgroups
+	net NetPolicy
+	now func() time.Time
+
+	// Test hooks, set before Start.
+	processAlive         func(pid int) bool
+	reapEvery, liveEvery time.Duration
+
+	mu        sync.Mutex
+	sandboxes map[string]*sandbox // by sandbox ID
+	serving   bool                // Start finished; Create is open
+	started   bool
+	closed    bool
+
+	stop     chan struct{}
+	stopOnce sync.Once
+	loops    sync.WaitGroup
+}
+
+// NewManager checks cfg and returns a manager that serves nothing until Start.
+func NewManager(cfg Config, deps Deps) (*Manager, error) {
+	switch {
+	case deps.Runtime == nil:
+		return nil, errors.New("nodeagent: Deps.Runtime is required")
+	case deps.Cgroups == nil:
+		return nil, errors.New("nodeagent: Deps.Cgroups is required")
+	case !nodeIDRE.MatchString(cfg.NodeID):
+		return nil, fmt.Errorf("nodeagent: node ID %q must match %s", cfg.NodeID, nodeIDRE)
+	case cfg.CPUMillis <= 0 || cfg.MemoryBytes <= 0 || cfg.MaxSandboxes <= 0:
+		return nil, fmt.Errorf("nodeagent: capacity must be positive, got %dm, %d bytes, %d sandboxes",
+			cfg.CPUMillis, cfg.MemoryBytes, cfg.MaxSandboxes)
+	case !filepath.IsAbs(cfg.RootFS) || !filepath.IsAbs(cfg.StateDir):
+		return nil, fmt.Errorf("nodeagent: RootFS %q and StateDir %q must be absolute paths", cfg.RootFS, cfg.StateDir)
+	}
+	if cfg.Prime == "" {
+		cfg.Prime = bundle.DefaultPrime
+	}
+	if cfg.ReadyTimeout <= 0 {
+		cfg.ReadyTimeout = defaultReadyTimeout
+	}
+	if cfg.TTLGrace <= 0 {
+		cfg.TTLGrace = defaultTTLGrace
+	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &Manager{
+		cfg: cfg, rt: tracedRuntime{deps.Runtime}, cg: deps.Cgroups, net: deps.Net, now: now,
+		processAlive: pidAlive,
+		reapEvery:    reapInterval, liveEvery: livenessInterval,
+		sandboxes: map[string]*sandbox{},
+		stop:      make(chan struct{}),
+	}, nil
+}
+
+// Start removes what an earlier agent with this node ID left behind, then
+// starts the reaper and the liveness loop, which run until Close. Create is
+// refused until Start has succeeded: the leftover sweep deletes every
+// container under the runsc root.
+func (m *Manager) Start(ctx context.Context) error {
+	m.mu.Lock()
+	if m.started || m.closed {
+		m.mu.Unlock()
+		return errors.New("nodeagent: Start called twice or after Close")
+	}
+	m.started = true
+	m.mu.Unlock()
+
+	if err := m.removeLeftovers(ctx); err != nil {
+		return fmt.Errorf("nodeagent: remove leftovers: %w", err)
+	}
+	m.loops.Add(2)
+	go m.loop(m.reapEvery, m.reapExpired)
+	go m.loop(m.liveEvery, m.checkLiveness)
+	m.mu.Lock()
+	m.serving = !m.closed
+	m.mu.Unlock()
+	return nil
+}
+
+// Create starts a sandbox and returns when it is ready (spec 7.3; only the
+// cold path exists so far).
+func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (resp *gssv1.NodeCreateResponse, err error) {
+	begin := time.Now() // ready_latency is a measurement: real time, not Deps.Now
+	ctx, span := startSpan(ctx, "node.create",
+		attribute.String("sandbox.id", req.GetSandboxId()),
+		attribute.Int("sandbox.incarnation", int(req.GetIncarnation())))
+	defer func() { endSpan(span, err) }()
+
+	id, inc := req.GetSandboxId(), req.GetIncarnation()
+	if err := validateSandboxID(id); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if inc < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "incarnation %d is negative", inc)
+	}
+	spec := &gssv1.SandboxSpec{}
+	if req.GetSpec() != nil {
+		spec = proto.Clone(req.GetSpec()).(*gssv1.SandboxSpec)
+	}
+	gssv1.ApplyDefaults(spec)
+	if err := gssv1.ValidateSpec(spec); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	mode, err := startMode(spec.GetStartMode())
+	if err != nil {
+		return nil, err
+	}
+	if len(spec.GetEgressAllow()) > 0 && m.net == nil {
+		return nil, status.Error(codes.FailedPrecondition, "egress_allow needs a network policy, and this node has none")
+	}
+	span.SetAttributes(attribute.String("start.mode", modeName(mode)))
+
+	e, err := m.reserve(ctx, id, inc, spec, mode)
+	if err != nil {
+		return nil, err
+	}
+	defer e.unlock()
+	step, err := m.startCold(ctx, e)
+	latency := time.Since(begin)
+	if err == nil {
+		step, err = "runsc.state", m.recordPID(ctx, e)
+	}
+	if err != nil {
+		m.mu.Lock()
+		e.state = stateDestroying
+		m.mu.Unlock()
+		if rerr := m.remove(ctx, e); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "create %s: %s: %v (cleanup failed: %v)", e.ref.ID, step, err, rerr)
+		}
+		return nil, status.Errorf(codes.Internal, "create %s: %s: %v", e.ref.ID, step, err)
+	}
+	m.mu.Lock()
+	e.state = stateReady
+	m.mu.Unlock()
+	return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(latency)}, nil
+}
+
+// startMode picks the start path. Until the warm pool and checkpoint images
+// exist, forcing either fails rather than measuring a different path.
+func startMode(requested gssv1.StartMode) (gssv1.StartMode, error) {
+	switch requested {
+	case gssv1.StartMode_START_MODE_AUTO, gssv1.StartMode_START_MODE_COLD:
+		return gssv1.StartMode_START_MODE_COLD, nil
+	case gssv1.StartMode_START_MODE_WARM:
+		return 0, status.Error(codes.FailedPrecondition, "warm pool empty")
+	case gssv1.StartMode_START_MODE_RESTORE:
+		return 0, status.Error(codes.FailedPrecondition, "no checkpoint image")
+	}
+	return 0, status.Errorf(codes.InvalidArgument, "unknown start_mode %d", requested)
+}
+
+func modeName(mode gssv1.StartMode) string {
+	switch mode {
+	case gssv1.StartMode_START_MODE_COLD:
+		return "cold"
+	case gssv1.StartMode_START_MODE_RESTORE:
+		return "restore"
+	case gssv1.StartMode_START_MODE_WARM:
+		return "warm"
+	}
+	return "auto"
+}
+
+// reserve puts a new starting entry for (id, inc) in the table, with its
+// lifecycle lock held by the caller. A live entry at the same or a higher
+// incarnation is AlreadyExists. Any other entry with that ID (a live older
+// incarnation the scheduler has moved on from, or one being destroyed) is
+// destroyed first.
+func (m *Manager) reserve(ctx context.Context, id string, inc int32, spec *gssv1.SandboxSpec, mode gssv1.StartMode) (*sandbox, error) {
+	for {
+		m.mu.Lock()
+		if !m.serving {
+			m.mu.Unlock()
+			return nil, status.Error(codes.Unavailable, "node agent is not serving (starting or shutting down)")
+		}
+		old := m.sandboxes[id]
+		if old == nil {
+			if err := m.admitLocked(spec); err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
+			e := m.newSandbox(id, inc, spec, mode)
+			m.sandboxes[id] = e
+			m.mu.Unlock()
+			return e, nil
+		}
+		live := old.state == stateStarting || old.state == stateReady
+		if live && old.incarnation >= inc {
+			m.mu.Unlock()
+			return nil, status.Errorf(codes.AlreadyExists, "sandbox %s is live at incarnation %d", id, old.incarnation)
+		}
+		m.mu.Unlock()
+		if err := m.destroyFor(ctx, old, "replaced"); err != nil {
+			if ctx.Err() != nil {
+				return nil, status.FromContextError(ctx.Err()).Err()
+			}
+			return nil, status.Errorf(codes.Internal, "create %s: remove incarnation %d: %v", id, old.incarnation, err)
+		}
+	}
+}
+
+// admitLocked checks that spec fits next to every entry in the table
+// (including ones still being torn down: they hold their resources until
+// they are gone). Call with mu held.
+func (m *Manager) admitLocked(spec *gssv1.SandboxSpec) error {
+	if len(m.sandboxes) >= m.cfg.MaxSandboxes {
+		return status.Errorf(codes.ResourceExhausted, "node %s holds %d sandboxes, its maximum", m.cfg.NodeID, len(m.sandboxes))
+	}
+	var cpu, mem int64
+	for _, e := range m.sandboxes {
+		cpu += e.spec.GetResources().GetCpuMillis()
+		mem += e.spec.GetResources().GetMemoryBytes()
+	}
+	// Used never exceeds capacity, so capacity - used cannot overflow.
+	if c := spec.GetResources().GetCpuMillis(); c > m.cfg.CPUMillis-cpu {
+		return status.Errorf(codes.ResourceExhausted, "node %s: %dm CPU requested, %dm of %dm free", m.cfg.NodeID, c, m.cfg.CPUMillis-cpu, m.cfg.CPUMillis)
+	}
+	if b := spec.GetResources().GetMemoryBytes(); b > m.cfg.MemoryBytes-mem {
+		return status.Errorf(codes.ResourceExhausted, "node %s: %d bytes of memory requested, %d of %d free", m.cfg.NodeID, b, m.cfg.MemoryBytes-mem, m.cfg.MemoryBytes)
+	}
+	return nil
+}
+
+// newSandbox returns a starting entry whose lifecycle lock is held.
+func (m *Manager) newSandbox(id string, inc int32, spec *gssv1.SandboxSpec, mode gssv1.StartMode) *sandbox {
+	rid := runscID(id, inc)
+	network := runsc.NetworkNone
+	if len(spec.GetEgressAllow()) > 0 {
+		network = runsc.NetworkSandbox
+	}
+	e := &sandbox{
+		id: id, incarnation: inc, spec: spec, startedAs: mode,
+		ref:       runsc.Ref{ID: rid, Network: network},
+		bundleDir: filepath.Join(m.bundlesDir(), rid),
+		cgroup:    bundle.CgroupPath(m.cfg.NodeID, rid),
+		expires:   m.now().Add(spec.GetTtl().AsDuration() + m.cfg.TTLGrace),
+		op:        make(chan struct{}, 1),
+		state:     stateStarting,
+	}
+	e.op <- struct{}{}
+	return e
+}
+
+func (m *Manager) bundlesDir() string { return filepath.Join(m.cfg.StateDir, "bundles") }
+
+// Destroy removes a sandbox. incarnation 0 means whatever is live; otherwise
+// only a live incarnation <= incarnation is destroyed, so an instruction about
+// an old copy cannot remove a newer one. An unknown ID is not an error. A
+// Destroy during a Create of the same sandbox waits for the Create to finish.
+func (m *Manager) Destroy(ctx context.Context, sandboxID string, incarnation int32) (err error) {
+	ctx, span := startSpan(ctx, "node.destroy",
+		attribute.String("sandbox.id", sandboxID),
+		attribute.Int("sandbox.incarnation", int(incarnation)),
+		attribute.String("destroy.reason", "request"))
+	defer func() { endSpan(span, err) }()
+
+	m.mu.Lock()
+	e := m.sandboxes[sandboxID]
+	m.mu.Unlock()
+	if e == nil || (incarnation != 0 && e.incarnation > incarnation) {
+		return nil
+	}
+	if err := m.destroyEntry(ctx, e); err != nil {
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		return status.Errorf(codes.Internal, "destroy %s: %v", e.ref.ID, err)
+	}
+	return nil
+}
+
+// destroyFor is a destroy the manager starts itself, traced as node.destroy
+// with the reason (ttl, exited, retry, replaced, close).
+func (m *Manager) destroyFor(ctx context.Context, e *sandbox, reason string) (err error) {
+	ctx, span := startSpan(ctx, "node.destroy",
+		attribute.String("sandbox.id", e.id),
+		attribute.Int("sandbox.incarnation", int(e.incarnation)),
+		attribute.String("destroy.reason", reason))
+	defer func() { endSpan(span, err) }()
+	return m.destroyEntry(ctx, e)
+}
+
+// List returns the live sandboxes (starting or ready), sorted by ID.
+func (m *Manager) List() []*gssv1.NodeSandbox {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*gssv1.NodeSandbox, 0, len(m.sandboxes))
+	for _, e := range m.sandboxes {
+		if e.state != stateStarting && e.state != stateReady {
+			continue
+		}
+		out = append(out, &gssv1.NodeSandbox{
+			Id:          e.id,
+			Spec:        proto.Clone(e.spec).(*gssv1.SandboxSpec),
+			Incarnation: e.incarnation,
+			StartedAs:   e.startedAs,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Id < out[j].Id })
+	return out
+}
+
+// Close refuses new Creates, stops the loops and destroys every sandbox,
+// waiting (bounded by ctx) for Creates in flight. A second Close returns nil.
+func (m *Manager) Close(ctx context.Context) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed, m.serving = true, false
+	entries := make([]*sandbox, 0, len(m.sandboxes))
+	for _, e := range m.sandboxes {
+		entries = append(entries, e)
+	}
+	m.mu.Unlock()
+
+	m.stopLoops()
+	errs := make([]error, len(entries))
+	var wg sync.WaitGroup
+	for i, e := range entries {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.destroyFor(ctx, e, "close"); err != nil {
+				errs[i] = fmt.Errorf("destroy %s: %w", e.ref.ID, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// stopLoops stops the reaper and the liveness loop and waits for them.
+func (m *Manager) stopLoops() {
+	m.stopOnce.Do(func() { close(m.stop) })
+	m.loops.Wait()
+}
+
+func (m *Manager) loop(every time.Duration, fn func()) {
+	defer m.loops.Done()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-t.C:
+			fn()
+		}
+	}
+}
+
+// reapExpired destroys ready sandboxes whose ttl + TTLGrace has passed. The
+// scheduler expires sandboxes at their TTL; this is the backstop for a node
+// that lost contact with it (spec 6.6).
+func (m *Manager) reapExpired() {
+	now := m.now()
+	m.mu.Lock()
+	var expired []*sandbox
+	for _, e := range m.sandboxes {
+		if e.state == stateReady && now.After(e.expires) {
+			expired = append(expired, e)
+		}
+	}
+	m.mu.Unlock()
+	for _, e := range expired {
+		m.backgroundDestroy(e, "ttl")
+	}
+}
+
+// checkLiveness removes ready sandboxes whose runsc sandbox process is gone
+// (the scheduler notices them missing from heartbeats), and retries the
+// teardown of broken ones.
+func (m *Manager) checkLiveness() {
+	type check struct {
+		e   *sandbox
+		pid int
+	}
+	var checks []check
+	var broken []*sandbox
+	m.mu.Lock()
+	for _, e := range m.sandboxes {
+		switch e.state {
+		case stateReady:
+			checks = append(checks, check{e, e.pid})
+		case stateBroken:
+			broken = append(broken, e)
+		}
+	}
+	m.mu.Unlock()
+	for _, c := range checks {
+		if !m.processAlive(c.pid) {
+			m.backgroundDestroy(c.e, "exited")
+		}
+	}
+	for _, e := range broken {
+		m.backgroundDestroy(e, "retry")
+	}
+}
+
+func (m *Manager) backgroundDestroy(e *sandbox, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), loopLockWait)
+	defer cancel()
+	if err := m.destroyFor(ctx, e, reason); err != nil {
+		slog.Warn("destroy failed", "sandbox", e.id, "runsc_id", e.ref.ID, "reason", reason, "err", err)
+	}
+}
+
+func startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	// The global tracer is looked up on each use so a provider set later
+	// (internal/telemetry, or a test) takes effect.
+	return otel.Tracer("gss").Start(ctx, name, trace.WithAttributes(attrs...))
+}
+
+// endSpan records err, if any, on the span and ends it.
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+	}
+	span.End()
+}
+
+// tracedRuntime wraps every Runtime call in a span named runsc.<method>.
+type tracedRuntime struct{ rt runsc.Runtime }
+
+var _ runsc.Runtime = tracedRuntime{}
+
+func refSpan(ctx context.Context, method string, ref runsc.Ref) (context.Context, trace.Span) {
+	return startSpan(ctx, "runsc."+method, attribute.String("runsc.id", ref.ID))
+}
+
+func (t tracedRuntime) Create(ctx context.Context, ref runsc.Ref, bundleDir, logPath string) error {
+	ctx, span := refSpan(ctx, "create", ref)
+	err := t.rt.Create(ctx, ref, bundleDir, logPath)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) Start(ctx context.Context, ref runsc.Ref) error {
+	ctx, span := refSpan(ctx, "start", ref)
+	err := t.rt.Start(ctx, ref)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) Restore(ctx context.Context, ref runsc.Ref, bundleDir, imagePath string) error {
+	ctx, span := refSpan(ctx, "restore", ref)
+	err := t.rt.Restore(ctx, ref, bundleDir, imagePath)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) Checkpoint(ctx context.Context, ref runsc.Ref, imagePath string) error {
+	ctx, span := refSpan(ctx, "checkpoint", ref)
+	err := t.rt.Checkpoint(ctx, ref, imagePath)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) Exec(ctx context.Context, ref runsc.Ref, spec runsc.ExecSpec) (int, error) {
+	ctx, span := refSpan(ctx, "exec", ref)
+	code, err := t.rt.Exec(ctx, ref, spec)
+	span.SetAttributes(attribute.Int("exec.exit_code", code))
+	endSpan(span, err)
+	return code, err
+}
+
+func (t tracedRuntime) KillProcess(ctx context.Context, ref runsc.Ref, internalPID int) error {
+	ctx, span := refSpan(ctx, "kill_process", ref)
+	err := t.rt.KillProcess(ctx, ref, internalPID)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) Delete(ctx context.Context, ref runsc.Ref) error {
+	ctx, span := refSpan(ctx, "delete", ref)
+	err := t.rt.Delete(ctx, ref)
+	endSpan(span, err)
+	return err
+}
+
+func (t tracedRuntime) State(ctx context.Context, ref runsc.Ref) (runsc.State, error) {
+	ctx, span := refSpan(ctx, "state", ref)
+	st, err := t.rt.State(ctx, ref)
+	endSpan(span, err)
+	return st, err
+}
+
+func (t tracedRuntime) List(ctx context.Context) ([]string, error) {
+	ctx, span := startSpan(ctx, "runsc.list")
+	ids, err := t.rt.List(ctx)
+	endSpan(span, err)
+	return ids, err
+}
+
+func (t tracedRuntime) Version(ctx context.Context) (string, error) {
+	ctx, span := startSpan(ctx, "runsc.version")
+	v, err := t.rt.Version(ctx)
+	endSpan(span, err)
+	return v, err
+}
+
+func (t tracedRuntime) RemoveRoot(ctx context.Context) error {
+	ctx, span := startSpan(ctx, "runsc.remove_root")
+	err := t.rt.RemoveRoot(ctx)
+	endSpan(span, err)
+	return err
+}

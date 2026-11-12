@@ -16,6 +16,8 @@ const (
 	DefaultMemoryBytes int64 = 256 << 20
 	MinCPUMillis       int64 = 100
 	MinMemoryBytes     int64 = 128 << 20
+	MaxCPUMillis       int64 = 256000
+	MaxMemoryBytes     int64 = 1 << 40
 
 	DefaultTTL = 10 * time.Minute
 	MaxTTL     = 60 * time.Minute
@@ -51,9 +53,15 @@ func ValidateSpec(s *SandboxSpec) error {
 	if cpu < MinCPUMillis {
 		return fmt.Errorf("cpu_millis %d is below the minimum %d", cpu, MinCPUMillis)
 	}
+	if cpu > MaxCPUMillis {
+		return fmt.Errorf("cpu_millis %d exceeds the maximum %d", cpu, MaxCPUMillis)
+	}
 	mem := s.GetResources().GetMemoryBytes()
 	if mem < MinMemoryBytes {
 		return fmt.Errorf("memory_bytes %d is below the minimum %d (128 MiB)", mem, MinMemoryBytes)
+	}
+	if mem > MaxMemoryBytes {
+		return fmt.Errorf("memory_bytes %d exceeds the maximum %d (1 TiB)", mem, MaxMemoryBytes)
 	}
 	if s.Ttl != nil {
 		if err := s.Ttl.CheckValid(); err != nil {

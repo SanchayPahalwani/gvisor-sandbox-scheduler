@@ -619,9 +619,11 @@ func (x *CreateSandboxRequest) GetSpec() *SandboxSpec {
 	return nil
 }
 
+// incarnation 0 destroys whatever is live; otherwise only an incarnation <= it.
 type DestroySandboxRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	Incarnation   int32                  `protobuf:"varint,2,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -661,6 +663,13 @@ func (x *DestroySandboxRequest) GetSandboxId() string {
 		return x.SandboxId
 	}
 	return ""
+}
+
+func (x *DestroySandboxRequest) GetIncarnation() int32 {
+	if x != nil {
+		return x.Incarnation
+	}
+	return 0
 }
 
 type DestroySandboxResponse struct {
@@ -1808,10 +1817,11 @@ const file_api_v1_sandbox_proto_rawDesc = "" +
 	"\n" +
 	"expires_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"?\n" +
 	"\x14CreateSandboxRequest\x12'\n" +
-	"\x04spec\x18\x01 \x01(\v2\x13.gss.v1.SandboxSpecR\x04spec\"6\n" +
+	"\x04spec\x18\x01 \x01(\v2\x13.gss.v1.SandboxSpecR\x04spec\"X\n" +
 	"\x15DestroySandboxRequest\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x18\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12 \n" +
+	"\vincarnation\x18\x02 \x01(\x05R\vincarnation\"\x18\n" +
 	"\x16DestroySandboxResponse\"2\n" +
 	"\x11GetSandboxRequest\x12\x1d\n" +
 	"\n" +
