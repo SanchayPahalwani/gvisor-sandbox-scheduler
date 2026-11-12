@@ -5,8 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
-	"os"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -34,15 +32,6 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" {
 		t.Errorf("checkpoint dir %q, pool %d, listen %q", o.checkpointDir, o.warmPoolSize, o.listen)
 	}
-
-	// The lock file sits next to the root, so the root is kept clean.
-	o, err = parseFlags([]string{"--node-id=n1", "--runsc-root=/run/gss/other/"}, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if o.runscRoot != "/run/gss/other" {
-		t.Errorf("runsc root %q, want /run/gss/other", o.runscRoot)
-	}
 }
 
 func TestParseFlagsRejects(t *testing.T) {
@@ -63,10 +52,7 @@ func TestParseFlagsRejects(t *testing.T) {
 		{[]string{"--node-id", "n1", "--max-sandboxes", "0"}, "positive"},
 		{[]string{"--node-id", "n1", "--warm-pool-size", "-1"}, "--warm-pool-size"},
 		{[]string{"--node-id", "n1", "--state-dir", "rel/dir"}, "--state-dir"},
-		{[]string{"--node-id", "n1", "--runsc-root", "/"}, "--runsc-root"},
-		{[]string{"--node-id", "n1", "--runsc-root", "/var/lib/gss"}, "under /run/"}, // a clean shutdown removes it
-		{[]string{"--node-id", "n1", "--runsc-root", "/run"}, "under /run/"},
-		{[]string{"--node-id", "n1", "--runsc-root", "/run/../var/lib"}, "under /run/"},
+		{[]string{"--node-id", "n1", "--runsc-root", "/run/gss/x"}, "not defined"}, // always /run/gss/<node-id>
 		{[]string{"--node-id", "n1", "--egress-cidr", "10.200.0.0"}, "--egress-cidr"},
 		{[]string{"--node-id", "n1", "extra"}, "unexpected arguments"},
 	} {
@@ -82,48 +68,41 @@ func TestParseFlagsRejects(t *testing.T) {
 	}
 }
 
-func TestRunRefusesWithoutLinuxOrRoot(t *testing.T) {
-	o, err := parseFlags([]string{"--node-id", "n1"}, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var want string
-	switch {
-	case runtime.GOOS != "linux":
-		want = "runs only on Linux"
-	case os.Geteuid() != 0:
-		want = "must run as root"
-	default:
-		t.Skip("running as root on Linux")
-	}
-	stopped := false
-	err = run(context.Background(), func() { stopped = true }, o)
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("run = %v, want an error saying it %s", err, want)
-	}
-	if !stopped {
-		t.Error("a failed start did not restore the default signal handling")
-	}
-}
-
-// TestRunStoppedDuringStartUp: a signal during start-up is a clean stop.
-func TestRunStoppedDuringStartUp(t *testing.T) {
-	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		t.Skip("as root on Linux the start-up would touch the host")
-	}
-	o, err := parseFlags([]string{"--node-id", "n1"}, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var logs strings.Builder
+// TestAgentExitStatus drives the agent as main does, with a stop that
+// cancels the context as signal.NotifyContext's stop does. --runsc points
+// nowhere, so the start-up fails before it touches the host on any system
+// (off Linux, without root, or at the runsc lookup).
+func TestAgentExitStatus(t *testing.T) {
 	defer slog.SetDefault(slog.Default())
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := run(ctx, func() {}, o); err != nil {
-		t.Errorf("run with the signal context done = %v, want nil (exit 0)", err)
-	}
-	if !strings.Contains(logs.String(), `msg="node agent stopped during start-up"`) {
-		t.Errorf("log %q has no stopped-during-start-up line", logs.String())
+	args := []string{"--node-id", "n1", "--runsc", "/nonexistent/runsc"}
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		signal   bool // a signal arrived during start-up
+		want     int
+		wantLine string
+	}{
+		{"failed start-up", args, false, 1, `level=ERROR msg="node agent failed" node=n1 err=`},
+		{"signal during start-up", args, true, 0, `level=INFO msg="node agent stopped during start-up" node=n1`},
+		{"bad flag", []string{"--node-id", "n_1"}, false, 2, `nodeagent: --node-id "n_1"`},
+		{"help", []string{"-h"}, false, 0, "Usage of nodeagent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			if tc.signal {
+				stop()
+			}
+			var out strings.Builder
+			if got := agent(ctx, stop, tc.args, &out); got != tc.want {
+				t.Errorf("exit status %d, want %d; output:\n%s", got, tc.want, out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantLine) {
+				t.Errorf("output has no %q:\n%s", tc.wantLine, out.String())
+			}
+			if tc.want == 1 && ctx.Err() == nil {
+				t.Error("a failed start did not restore the default signal handling")
+			}
+		})
 	}
 }

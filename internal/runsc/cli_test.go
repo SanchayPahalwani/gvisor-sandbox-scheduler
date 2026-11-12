@@ -567,7 +567,8 @@ func TestRemoveRoot(t *testing.T) {
 	}
 	makeEntries(t, c.Root,
 		"a_sandbox:a.state", "a_sandbox:a.lock", "runsc.lock", "null-netns",
-		"a/", "a/x", // named after the container of a state file
+		"runsc-a.sock", // a sandbox's control socket, left by a sandbox that died
+		"a/", "a/x",    // named after the container of a state file
 		"listed-1/", "listed-1/y", "made-1/") // named after containers this CLI listed or created
 	if err := c.RemoveRoot(ctx); err != nil {
 		t.Fatal(err)
@@ -585,17 +586,17 @@ func TestRemoveRoot(t *testing.T) {
 func TestRemoveRootKeepsForeignEntries(t *testing.T) {
 	fakeUmount(t)
 	c := NewCLI("", t.TempDir())
-	makeEntries(t, c.Root, "a_sandbox:a.state", "notes.txt", "data/", "data/f", "x.state/", "x.state/f")
+	makeEntries(t, c.Root, "a_sandbox:a.state", "notes.txt", "data/", "data/f", "x.state/", "x.state/f", "other.sock")
 	err := c.RemoveRoot(context.Background())
 	if err == nil {
 		t.Fatal("RemoveRoot of a root with foreign entries: want error")
 	}
-	for _, name := range []string{"notes.txt", "data", "x.state"} {
+	for _, name := range []string{"notes.txt", "data", "x.state", "other.sock"} {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("error %q does not name %s", err, name)
 		}
 	}
-	if got, want := entryNames(t, c.Root), []string{"data", "notes.txt", "x.state"}; !reflect.DeepEqual(got, want) {
+	if got, want := entryNames(t, c.Root), []string{"data", "notes.txt", "other.sock", "x.state"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("root holds %q after RemoveRoot, want %q", got, want)
 	}
 	if got := entryNames(t, filepath.Join(c.Root, "data")); !reflect.DeepEqual(got, []string{"f"}) {
@@ -611,27 +612,5 @@ func TestRemoveRootMissingOrRefused(t *testing.T) {
 		if err := NewCLI("", root).RemoveRoot(context.Background()); err == nil {
 			t.Errorf("RemoveRoot of %q: want error", root)
 		}
-	}
-}
-
-func TestCheckRoot(t *testing.T) {
-	missing := NewCLI("", filepath.Join(t.TempDir(), "none"))
-	if err := missing.CheckRoot(); err != nil {
-		t.Errorf("CheckRoot of a missing root = %v, want nil", err)
-	}
-	c := NewCLI("", t.TempDir())
-	makeEntries(t, c.Root, "a_sandbox:a.state", "a_sandbox:a.lock", "runsc.lock", "null-netns", "a/")
-	if err := c.CheckRoot(); err != nil {
-		t.Errorf("CheckRoot of runsc's own entries = %v, want nil", err)
-	}
-	makeEntries(t, c.Root, "notes.txt", "b/")
-	err := c.CheckRoot()
-	if err == nil || !strings.Contains(err.Error(), `"b"`) || !strings.Contains(err.Error(), `"notes.txt"`) {
-		t.Errorf("CheckRoot with foreign entries = %v, want an error naming b and notes.txt", err)
-	}
-	file := filepath.Join(t.TempDir(), "file")
-	makeEntries(t, filepath.Dir(file), "file")
-	if err := NewCLI("", file).CheckRoot(); err == nil {
-		t.Error("CheckRoot of a root that is a file: want error")
 	}
 }

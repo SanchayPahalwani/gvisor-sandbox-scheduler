@@ -3,9 +3,9 @@
 // root; on any other system, or without root, runsc or the sandbox rootfs,
 // it exits at once with a message saying why.
 //
-// One agent runs per state directory and per runsc root: each is locked
-// (<state-dir>/agent.lock, <runsc-root>.lock) before anything is touched.
-// The runsc root must be under /run/ and hold nothing runsc does not make.
+// The runsc root is always /run/gss/<node-id>. One agent runs per state
+// directory and per node ID on a host: <state-dir>/agent.lock and
+// /run/gss/<node-id>.lock are locked before anything is touched.
 //
 // SIGINT or SIGTERM stops it: no new RPCs, every sandbox destroyed, the
 // node's network table removed, the runsc root and the node's cgroup
@@ -29,7 +29,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -49,6 +48,11 @@ var nodeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,31}$`)
 
 const (
 	cgroupRoot = "/sys/fs/cgroup"
+	// runscRoots holds the runsc root of every node, /run/gss/<node-id>,
+	// and next to it the root's lock file, /run/gss/<node-id>.lock. Fixed
+	// paths make one lock per node ID per host, and no root can be inside
+	// another.
+	runscRoots = "/run/gss"
 	// startTimeout bounds the start-up: runsc --version, the network
 	// policy's and the manager's removal of an earlier agent's leftovers.
 	startTimeout = 2 * time.Minute
@@ -71,27 +75,38 @@ type options struct {
 	maxSandboxes      int
 	warmPoolSize      int
 	rootfs, stateDir  string
-	runscRoot         string
+	runscRoot         string // /run/gss/<node-id>, not a flag
 	checkpointDir     string // "" disables checkpoint/restore
 	egressCIDR        netip.Prefix
 	runsc             string
 }
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	o, err := parseFlags(os.Args[1:], os.Stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := agent(ctx, stop, os.Args[1:], os.Stderr)
+	stop()
+	os.Exit(code)
+}
+
+// agent runs the node agent with the command-line arguments args, logging
+// to stderr, and returns the exit status: 0 after a clean stop (a signal,
+// also one during start-up) or for -h, 1 when the agent fails, 2 for bad
+// flags. ctx ends with the first SIGINT or SIGTERM; stop restores the
+// default signal handling, and cancels ctx as well.
+func agent(ctx context.Context, stop context.CancelFunc, args []string, stderr io.Writer) int {
+	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, nil)))
+	o, err := parseFlags(args, stderr)
 	if errors.Is(err, flag.ErrHelp) {
-		os.Exit(0)
+		return 0
 	}
 	if err != nil {
-		os.Exit(2) // parseFlags printed the error
+		return 2 // parseFlags printed the error
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if err := run(ctx, stop, o); err != nil {
 		slog.Error("node agent failed", "node", o.nodeID, "err", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // parseFlags parses and checks the command line and fills in the defaults
@@ -114,7 +129,6 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	fs.IntVar(&o.warmPoolSize, "warm-pool-size", 2, "warm sandboxes kept ready (0 disables the pool)")
 	fs.StringVar(&o.rootfs, "rootfs", "/var/lib/gss/rootfs/python", "sandbox root filesystem, built by `make rootfs`")
 	fs.StringVar(&o.stateDir, "state-dir", "", "state directory (default /var/lib/gss/nodes/<node-id>)")
-	fs.StringVar(&o.runscRoot, "runsc-root", "", "runsc --root directory (default /run/gss/<node-id>)")
 	fs.StringVar(&o.checkpointDir, "checkpoint-dir", "/var/lib/gss/checkpoints", "checkpoint image directory (empty disables restore)")
 	fs.StringVar(&egress, "egress-cidr", "10.200.0.0/20", "IPv4 range the node hands out /30s from for egress sandboxes")
 	fs.StringVar(&o.runsc, "runsc", "runsc", "runsc binary (a name looked up on PATH, or a path)")
@@ -162,12 +176,9 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	if o.stateDir == "" {
 		o.stateDir = "/var/lib/gss/nodes/" + o.nodeID
 	}
-	if o.runscRoot == "" {
-		o.runscRoot = "/run/gss/" + o.nodeID
-	}
-	o.runscRoot = filepath.Clean(o.runscRoot)
+	o.runscRoot = filepath.Join(runscRoots, o.nodeID)
 	for _, p := range []struct{ flag, path string }{
-		{"--rootfs", o.rootfs}, {"--state-dir", o.stateDir}, {"--runsc-root", o.runscRoot}, {"--checkpoint-dir", o.checkpointDir},
+		{"--rootfs", o.rootfs}, {"--state-dir", o.stateDir}, {"--checkpoint-dir", o.checkpointDir},
 	} {
 		if p.flag == "--checkpoint-dir" && p.path == "" {
 			continue
@@ -175,11 +186,6 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) == "/" {
 			return fail("%s %q must be an absolute path other than /", p.flag, p.path)
 		}
-	}
-	// Start-up deletes every container under the runsc root and a clean
-	// shutdown removes it: keep it to a runtime directory.
-	if !strings.HasPrefix(o.runscRoot, "/run/") {
-		return fail("--runsc-root %q must be under /run/", o.runscRoot)
 	}
 	cidr, err := netip.ParsePrefix(egress)
 	if err != nil {
@@ -206,9 +212,9 @@ type node struct {
 // fails, then shuts the node down. stop restores the default signal
 // handling, so that a second signal ends the process.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
-	n, err := start(ctx, stop, o)
+	n, signalled, err := start(ctx, stop, o)
 	if err != nil {
-		if ctx.Err() != nil {
+		if signalled {
 			slog.Info("node agent stopped during start-up", "node", o.nodeID, "err", err)
 			return nil
 		}
@@ -240,15 +246,18 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 	return nil
 }
 
-// start brings the node up to the point of serving. On failure it restores
-// the default signal handling (stop), so that a second signal ends the
-// process, and undoes what it did, last step first.
-func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, err error) {
+// start brings the node up to the point of serving. On failure it reports
+// whether a signal had arrived (ctx ended), then restores the default signal
+// handling (stop), so that a second signal ends the process, and undoes
+// what it did, last step first.
+func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, signalled bool, err error) {
 	var undo []func() error
 	defer func() {
 		if err == nil {
 			return
 		}
+		// Before stop: it cancels ctx too.
+		signalled = ctx.Err() != nil
 		stop()
 		for i := len(undo) - 1; i >= 0; i-- {
 			err = errors.Join(err, undo[i]())
@@ -256,24 +265,24 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, e
 	}()
 
 	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("the node agent runs only on Linux (gVisor needs a Linux kernel), not on %s", runtime.GOOS)
+		return nil, false, fmt.Errorf("the node agent runs only on Linux (gVisor needs a Linux kernel), not on %s", runtime.GOOS)
 	}
 	if os.Geteuid() != 0 {
-		return nil, errors.New("the node agent must run as root: runsc needs it for cgroups and namespaces")
+		return nil, false, errors.New("the node agent must run as root: runsc needs it for cgroups and namespaces")
 	}
 	runscPath, err := exec.LookPath(o.runsc)
 	if err != nil {
-		return nil, fmt.Errorf("runsc not found (--runsc %q): %w", o.runsc, err)
+		return nil, false, fmt.Errorf("runsc not found (--runsc %q): %w", o.runsc, err)
 	}
 	if err := checkRootfs(o.rootfs); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Building the runtime, the network policy and the manager touches
 	// nothing on the host, so a configuration they refuse leaves no trace.
 	n := &node{o: o, rt: runsc.NewCLI(runscPath, o.runscRoot), cg: nodeagent.NewCgroupFS(cgroupRoot)}
 	if n.np, err = netpolicy.New(o.nodeID, o.egressCIDR, nil); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	n.m, err = nodeagent.NewManager(nodeagent.Config{
 		NodeID: o.nodeID, Group: o.group,
@@ -282,32 +291,27 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, e
 		WarmPoolSize: o.warmPoolSize,
 	}, nodeagent.Deps{Runtime: n.rt, Cgroups: n.cg, Net: n.np})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// One agent per state directory and per runsc root, before anything
-	// else is touched.
+	// One agent per state directory and per node ID, before anything else
+	// is touched.
 	for _, path := range []string{filepath.Join(o.stateDir, "agent.lock"), o.runscRoot + ".lock"} {
 		f, lerr := lockFile(path)
 		if lerr != nil {
-			return nil, lerr
+			return nil, false, lerr
 		}
 		n.locks = append(n.locks, f)
 		undo = append(undo, f.Close)
-	}
-	// The manager's start deletes every container under the runsc root and
-	// a clean shutdown removes the root: it must be runsc's own.
-	if err := n.rt.CheckRoot(); err != nil {
-		return nil, fmt.Errorf("--runsc-root: %w", err)
 	}
 
 	sctx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
 	if n.version, err = n.rt.Version(sctx); err != nil {
-		return nil, fmt.Errorf("runsc %s does not run: %w", runscPath, err)
+		return nil, false, fmt.Errorf("runsc %s does not run: %w", runscPath, err)
 	}
 	if n.lis, err = net.Listen("tcp", o.listen); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	undo = append(undo, func() error {
 		n.lis.Close()
@@ -318,7 +322,7 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, e
 		// The port actually listened on, also when --listen asked for port 0.
 		_, port, err := net.SplitHostPort(n.lis.Addr().String())
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		n.advertise = net.JoinHostPort("127.0.0.1", port)
 	}
@@ -327,7 +331,7 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, e
 	// before the manager starts sandboxes; it refuses to start when another
 	// node on this host owns the table or an overlapping range.
 	if err := n.np.Init(sctx); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	undo = append(undo, func() error { return closeNet(n.np) })
 	// After a failed Start leftover containers may still be under the runsc
@@ -338,9 +342,9 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, e
 		return n.m.Close(cctx)
 	})
 	if err := n.m.Start(sctx); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return n, nil
+	return n, false, nil
 }
 
 func (n *node) unlock() {

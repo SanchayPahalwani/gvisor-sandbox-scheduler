@@ -420,47 +420,28 @@ func (c *CLI) containers(ents []os.DirEntry) map[string]bool {
 }
 
 // runscEntry reports whether e, an entry of the root, is one runsc makes
-// there: null-netns, a "*.state" or "*.lock" file, or a directory named
-// after a container in containers.
+// there: null-netns, a "*.state" or "*.lock" file, a sandbox's control
+// socket, or a directory named after a container in containers.
+//
+// The control socket is "runsc-<sandbox-id>.sock" (controlSocketName in
+// gVisor's runsc/sandbox/sandbox.go, created in the root when the path
+// fits). It stays when a sandbox dies without runsc deleting it.
 func runscEntry(e os.DirEntry, containers map[string]bool) bool {
 	name := e.Name()
 	if e.IsDir() {
 		return containers[name]
 	}
-	return name == nullNetns || strings.HasSuffix(name, ".state") || strings.HasSuffix(name, ".lock")
-}
-
-// CheckRoot returns an error naming every entry of the root that runsc does
-// not make there (see runscEntry), so that a root that is the wrong
-// directory is neither used nor removed. A missing root is fine.
-func (c *CLI) CheckRoot() error {
-	ents, err := os.ReadDir(c.Root)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("runsc: root %s: %w", c.Root, err)
-	}
-	known := c.containers(ents)
-	var foreign []string
-	for _, e := range ents {
-		if !runscEntry(e, known) {
-			foreign = append(foreign, e.Name())
-		}
-	}
-	if len(foreign) > 0 {
-		return fmt.Errorf("runsc: root %s holds entries runsc does not make: %q", c.Root, foreign)
-	}
-	return nil
+	return name == nullNetns || strings.HasSuffix(name, ".state") || strings.HasSuffix(name, ".lock") ||
+		strings.HasPrefix(name, "runsc-") && strings.HasSuffix(name, ".sock")
 }
 
 // RemoveRoot removes the root directory and what runsc keeps in it, and
 // nothing else: it unmounts and removes null-netns, removes the "*.state"
-// and "*.lock" files and the directories named after a container (one this
-// CLI created or listed, or one a state file names), and then removes the
-// directory itself, which fails, naming what is left, if anything else is
-// in it. A missing root is not an error. Call it only after every
-// container under the root was deleted.
+// and "*.lock" files, the control sockets and the directories named after a
+// container (one this CLI created or listed, or one a state file names),
+// and then removes the directory itself, which fails, naming what is left,
+// if anything else is in it. A missing root is not an error. Call it only
+// after every container under the root was deleted.
 func (c *CLI) RemoveRoot(ctx context.Context) error {
 	if c.Root == "" || filepath.Clean(c.Root) == "/" {
 		return fmt.Errorf("runsc: refusing to remove root %q", c.Root)
