@@ -197,8 +197,10 @@ func parseComment(listing string) (nodeID string, cidr netip.Prefix, ok bool) {
 // mark; "established" is accepted only while (veth, mark) is in @live, so a
 // flow left over from an earlier sandbox on the same /30 is not. Traffic into
 // a sandbox veth that is not part of a live flow is dropped before the
-// allowlist is consulted, so an allowlist covering the node's own range does
-// not reach other sandboxes.
+// allowlist is consulted, and nothing passes from one sandbox veth to another,
+// so an allowlist covering the node's own range does not reach other
+// sandboxes. Prerouting (priority raw, before conntrack) drops IPv6 and any
+// packet whose source is not the guest address of the veth it arrived on.
 func renderInit(n names, cidr netip.Prefix) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n", n.table, n.table)
@@ -206,7 +208,13 @@ func renderInit(n names, cidr netip.Prefix) string {
 	fmt.Fprintf(&b, "\tcomment %q\n", tableComment(n, cidr))
 	b.WriteString("\tmap sandbox_out {\n\t\ttype ifname : verdict\n\t}\n")
 	b.WriteString("\tset live {\n\t\ttype ifname . mark\n\t}\n")
+	b.WriteString("\tset src_ok {\n\t\ttype ifname . ipv4_addr\n\t}\n")
+	b.WriteString("\tchain prerouting {\n\t\ttype filter hook prerouting priority raw; policy accept;\n")
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" meta nfproto ipv6 counter drop\n", n.prefix)
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" iifname . ip saddr != @src_ok counter drop\n", n.prefix)
+	b.WriteString("\t}\n")
 	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n")
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" oifname \"%s*\" counter drop\n", n.prefix, n.prefix)
 	b.WriteString("\t\tiifname . ct mark @live ct state established,related accept\n")
 	b.WriteString("\t\toifname . ct mark @live ct state established,related accept\n")
 	fmt.Fprintf(&b, "\t\toifname \"%s*\" counter drop\n", n.prefix)
@@ -230,7 +238,7 @@ func renderDeleteTable(n names) string {
 // renderSetup adds the sandbox's chain, marks its live (veth, generation)
 // pair and maps its veth to the chain. Accepted flows get the generation as
 // conntrack mark.
-func renderSetup(n names, id string, gen uint32, rules []Rule) string {
+func renderSetup(n names, id string, gen uint32, guest netip.Addr, rules []Rule) string {
 	var b strings.Builder
 	c, v := n.chain(id), n.veth(id)
 	fmt.Fprintf(&b, "add chain inet %s %s\n", n.table, c)
@@ -238,19 +246,22 @@ func renderSetup(n names, id string, gen uint32, rules []Rule) string {
 	for _, r := range rules {
 		fmt.Fprintf(&b, "add rule inet %s %s ip daddr %s tcp dport %d ct mark set %d accept\n", n.table, c, r.Prefix, r.Port, gen)
 	}
+	fmt.Fprintf(&b, "add element inet %s src_ok { \"%s\" . %s }\n", n.table, v, guest)
 	fmt.Fprintf(&b, "add element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
 	fmt.Fprintf(&b, "add element inet %s sandbox_out { \"%s\" : jump %s }\n", n.table, v, c)
 	return b.String()
 }
 
-// renderTeardown removes the sandbox's live element (first), map element and
-// chain. It adds each before deleting it so that it succeeds whether or not
-// they exist (the table must exist). gen 0 means the generation is unknown
-// and the live element is left alone.
-func renderTeardown(n names, id string, gen uint32) string {
+// renderTeardown removes the sandbox's src_ok and live elements (first), map
+// element and chain. It adds each before deleting it so that it succeeds
+// whether or not they exist (the table must exist). gen 0 means the sandbox
+// is unknown and the src_ok and live elements are left alone.
+func renderTeardown(n names, id string, gen uint32, guest netip.Addr) string {
 	var b strings.Builder
 	c, v := n.chain(id), n.veth(id)
 	if gen != 0 {
+		fmt.Fprintf(&b, "add element inet %s src_ok { \"%s\" . %s }\n", n.table, v, guest)
+		fmt.Fprintf(&b, "delete element inet %s src_ok { \"%s\" . %s }\n", n.table, v, guest)
 		fmt.Fprintf(&b, "add element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
 		fmt.Fprintf(&b, "delete element inet %s live { \"%s\" . %d }\n", n.table, v, gen)
 	}

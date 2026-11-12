@@ -43,11 +43,18 @@ type sandbox struct {
 
 // Manager owns this node's nftables table, sandbox namespaces and veths.
 type Manager struct {
-	names   names
-	cidr    netip.Prefix
-	slots   int // number of /30s in cidr
-	run     Runner
+	names names
+	cidr  netip.Prefix
+	slots int // number of /30s in cidr
+	run   Runner
+
+	// life is held shared by Setup and Teardown for their whole run and
+	// exclusively by Init and Close, so those never interleave with a
+	// sandbox's commands.
+	life sync.RWMutex
+
 	mu      sync.Mutex
+	closed  bool // set by Close; Setup and Init then fail
 	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
 	gen     uint32             // last generation issued; never 0 once issued
 	used    map[int]string     // slot -> sandbox id
@@ -101,6 +108,11 @@ func (m *Manager) SetResolver(resolve func(ctx context.Context, host string) ([]
 // the table. It refuses, changing nothing, when a table with this node's name
 // belongs to another node or another node's table covers an overlapping range.
 func (m *Manager) Init(ctx context.Context) error {
+	m.life.Lock()
+	defer m.life.Unlock()
+	if m.isClosed() {
+		return status.Error(codes.FailedPrecondition, "netpolicy: manager is closed")
+	}
 	if err := m.checkOtherNodes(ctx); err != nil {
 		return err
 	}
@@ -130,6 +142,9 @@ func (m *Manager) checkOtherNodes(ctx context.Context) error {
 		}
 		listing, err := m.run(ctx, "", "nft", "-t", "list", "table", "inet", f[2])
 		if err != nil {
+			if notFound(err) {
+				continue // deleted since `nft list tables` (another node's Close)
+			}
 			return fmt.Errorf("netpolicy: list table %s: %w", f[2], err)
 		}
 		node, cidr, ok := parseComment(listing)
@@ -142,6 +157,9 @@ func (m *Manager) checkOtherNodes(ctx context.Context) error {
 		if cidr.Overlaps(m.cidr) {
 			return status.Errorf(codes.FailedPrecondition, "netpolicy: egress range %s overlaps %s of node %q (table %s)", m.cidr, cidr, node, f[2])
 		}
+		if p := newNames(node).prefix; p == m.names.prefix {
+			return status.Errorf(codes.FailedPrecondition, "netpolicy: nodes %q and %q share the veth prefix %s", m.names.nodeID, node, p)
+		}
 	}
 	return nil
 }
@@ -151,6 +169,11 @@ func (m *Manager) checkOtherNodes(ctx context.Context) error {
 // the error is returned. net.ipv4.ip_forward stays on: it is VM-wide and other
 // nodes rely on it.
 func (m *Manager) Close(ctx context.Context) error {
+	m.life.Lock()
+	defer m.life.Unlock()
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
 	if err := m.removeLeftovers(ctx); err != nil {
 		return err
 	}
@@ -159,6 +182,12 @@ func (m *Manager) Close(ctx context.Context) error {
 	}
 	m.resetSlots()
 	return nil
+}
+
+func (m *Manager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 func (m *Manager) resetSlots() {
@@ -262,11 +291,17 @@ func (m *Manager) release(id string) {
 	}
 }
 
-// generation returns the generation of id, or 0 when this Manager did not set it up.
-func (m *Manager) generation(id string) uint32 {
+// lookup returns the generation and guest address of id; gen is 0 when this
+// Manager did not set it up.
+func (m *Manager) lookup(id string) (gen uint32, guest netip.Addr) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sbs[id].gen
+	sb, ok := m.sbs[id]
+	m.mu.Unlock()
+	if !ok {
+		return 0, netip.Addr{}
+	}
+	_, guest = m.slotAddrs(sb.slot)
+	return sb.gen, guest
 }
 
 // slotAddrs returns the host and guest addresses of slot i.
@@ -297,9 +332,14 @@ func (m *Manager) Setup(ctx context.Context, id string, allow []string) (netnsPa
 	if id == "" {
 		return "", nil, status.Error(codes.InvalidArgument, "netpolicy: empty sandbox id")
 	}
+	m.life.RLock()
+	defer m.life.RUnlock()
 	m.mu.Lock()
-	resolve := m.resolve
+	closed, resolve := m.closed, m.resolve
 	m.mu.Unlock()
+	if closed {
+		return "", nil, status.Error(codes.FailedPrecondition, "netpolicy: manager is closed")
+	}
 	rules, hosts, err := parseAllow(ctx, allow, resolve)
 	if err != nil {
 		return "", nil, allowError(err)
@@ -320,7 +360,6 @@ func (m *Manager) Setup(ctx context.Context, id string, allow []string) (netnsPa
 	steps := [][]string{
 		{"ip", "netns", "add", ns},
 		{"ip", "link", "add", veth, "type", "veth", "peer", "name", guestIf, "netns", ns},
-		{"sysctl", "-w", "net.ipv4.conf." + veth + ".rp_filter=1"}, // no forged source addresses
 		{"ip", "addr", "add", hostIP.String() + "/30", "dev", veth},
 		{"ip", "link", "set", veth, "up"},
 		{"ip", "-n", ns, "addr", "add", guestIP.String() + "/30", "dev", guestIf},
@@ -333,7 +372,7 @@ func (m *Manager) Setup(ctx context.Context, id string, allow []string) (netnsPa
 		// rollback fails the /30 stays reserved, as after a failed Teardown.
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if terr := m.teardown(cctx, id, sb.gen); terr != nil {
+		if terr := m.teardown(cctx, id, sb.gen, guestIP); terr != nil {
 			return "", nil, errors.Join(err, fmt.Errorf("netpolicy: rollback: %w", terr))
 		}
 		m.release(id)
@@ -344,7 +383,7 @@ func (m *Manager) Setup(ctx context.Context, id string, allow []string) (netnsPa
 			return fail(fmt.Errorf("netpolicy: setup %s: %w", id, err))
 		}
 	}
-	if _, err := m.run(ctx, renderSetup(m.names, id, sb.gen, rules), "nft", "-f", "-"); err != nil {
+	if _, err := m.run(ctx, renderSetup(m.names, id, sb.gen, guestIP, rules), "nft", "-f", "-"); err != nil {
 		return fail(fmt.Errorf("netpolicy: setup %s: add rules: %w", id, err))
 	}
 	return netnsDir + ns, hosts, nil
@@ -375,16 +414,19 @@ func (m *Manager) Teardown(ctx context.Context, id string) error {
 	if id == "" {
 		return status.Error(codes.InvalidArgument, "netpolicy: empty sandbox id")
 	}
-	if err := m.teardown(ctx, id, m.generation(id)); err != nil {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	gen, guest := m.lookup(id)
+	if err := m.teardown(ctx, id, gen, guest); err != nil {
 		return err
 	}
 	m.release(id)
 	return nil
 }
 
-func (m *Manager) teardown(ctx context.Context, id string, gen uint32) error {
+func (m *Manager) teardown(ctx context.Context, id string, gen uint32, guest netip.Addr) error {
 	var errs []error
-	if _, err := m.run(ctx, renderTeardown(m.names, id, gen), "nft", "-f", "-"); err != nil {
+	if _, err := m.run(ctx, renderTeardown(m.names, id, gen, guest), "nft", "-f", "-"); err != nil {
 		// The script succeeds whenever the table exists; without the table
 		// there is nothing to remove.
 		if _, lerr := m.run(ctx, "", "nft", "list", "table", "inet", m.names.table); lerr == nil {

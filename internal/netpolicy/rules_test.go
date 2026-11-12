@@ -99,8 +99,17 @@ table inet gss_a1 {
 	set live {
 		type ifname . mark
 	}
+	set src_ok {
+		type ifname . ipv4_addr
+	}
+	chain prerouting {
+		type filter hook prerouting priority raw; policy accept;
+		iifname "gf55f*" meta nfproto ipv6 counter drop
+		iifname "gf55f*" iifname . ip saddr != @src_ok counter drop
+	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
+		iifname "gf55f*" oifname "gf55f*" counter drop
 		iifname . ct mark @live ct state established,related accept
 		oifname . ct mark @live ct state established,related accept
 		oifname "gf55f*" counter drop
@@ -128,11 +137,13 @@ func TestRenderSetup(t *testing.T) {
 		{netip.MustParsePrefix("1.1.1.1/32"), 443},
 		{netip.MustParsePrefix("10.0.0.0/8"), 8080},
 	}
-	got := renderSetup(n, "sb1", 42, rules)
+	guest := netip.MustParseAddr("10.200.0.2")
+	got := renderSetup(n, "sb1", 42, guest, rules)
 	want := `add chain inet gss_a1 sb_320983ce
 flush chain inet gss_a1 sb_320983ce
 add rule inet gss_a1 sb_320983ce ip daddr 1.1.1.1/32 tcp dport 443 ct mark set 42 accept
 add rule inet gss_a1 sb_320983ce ip daddr 10.0.0.0/8 tcp dport 8080 ct mark set 42 accept
+add element inet gss_a1 src_ok { "gf55f320983ce" . 10.200.0.2 }
 add element inet gss_a1 live { "gf55f320983ce" . 42 }
 add element inet gss_a1 sandbox_out { "gf55f320983ce" : jump sb_320983ce }
 `
@@ -140,8 +151,10 @@ add element inet gss_a1 sandbox_out { "gf55f320983ce" : jump sb_320983ce }
 		t.Errorf("renderSetup:\n%s\nwant:\n%s", got, want)
 	}
 
-	gotTD := renderTeardown(n, "sb1", 42)
-	wantTD := `add element inet gss_a1 live { "gf55f320983ce" . 42 }
+	gotTD := renderTeardown(n, "sb1", 42, guest)
+	wantTD := `add element inet gss_a1 src_ok { "gf55f320983ce" . 10.200.0.2 }
+delete element inet gss_a1 src_ok { "gf55f320983ce" . 10.200.0.2 }
+add element inet gss_a1 live { "gf55f320983ce" . 42 }
 delete element inet gss_a1 live { "gf55f320983ce" . 42 }
 add chain inet gss_a1 sb_320983ce
 add element inet gss_a1 sandbox_out { "gf55f320983ce" : jump sb_320983ce }
@@ -152,9 +165,9 @@ delete chain inet gss_a1 sb_320983ce
 	if gotTD != wantTD {
 		t.Errorf("renderTeardown:\n%s\nwant:\n%s", gotTD, wantTD)
 	}
-	// Generation 0 means unknown (a sandbox this Manager did not set up): no live element.
-	if got := renderTeardown(n, "sb1", 0); strings.Contains(got, "live") {
-		t.Errorf("renderTeardown with no generation touches live:\n%s", got)
+	// Generation 0 means unknown (a sandbox this Manager did not set up): no live or src_ok element.
+	if got := renderTeardown(n, "sb1", 0, netip.Addr{}); strings.Contains(got, "live") || strings.Contains(got, "src_ok") {
+		t.Errorf("renderTeardown with no generation touches live or src_ok:\n%s", got)
 	}
 }
 

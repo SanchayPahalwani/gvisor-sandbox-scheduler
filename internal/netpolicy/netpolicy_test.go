@@ -3,12 +3,14 @@ package netpolicy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -98,7 +100,6 @@ func TestSetupCommands(t *testing.T) {
 		"ip -o link show",
 		"ip netns add gss-a1-320983ce",
 		"ip link add gf55f320983ce type veth peer name eth0 netns gss-a1-320983ce",
-		"sysctl -w net.ipv4.conf.gf55f320983ce.rp_filter=1",
 		"ip addr add 10.200.0.1/30 dev gf55f320983ce",
 		"ip link set gf55f320983ce up",
 		"ip -n gss-a1-320983ce addr add 10.200.0.2/30 dev eth0",
@@ -114,7 +115,7 @@ func TestSetupCommands(t *testing.T) {
 	if gen == 0 {
 		t.Error("generation 0 issued")
 	}
-	wantScript := renderSetup(m.names, "sb1", gen, []Rule{
+	wantScript := renderSetup(m.names, "sb1", gen, netip.MustParseAddr("10.200.0.2"), []Rule{
 		{netip.MustParsePrefix("1.1.1.1/32"), 443},
 		{netip.MustParsePrefix("10.0.0.0/8"), 8080},
 	})
@@ -247,7 +248,7 @@ func TestTeardownIdempotent(t *testing.T) {
 	if !reflect.DeepEqual(r.cmds, want) {
 		t.Errorf("Teardown commands %v, want %v", r.cmds, want)
 	}
-	if r.stdin[0] != renderTeardown(m.names, "sb1", gen) {
+	if r.stdin[0] != renderTeardown(m.names, "sb1", gen, netip.MustParseAddr("10.200.0.2")) {
 		t.Errorf("Teardown nft script:\n%s", r.stdin[0])
 	}
 
@@ -482,5 +483,140 @@ func TestResolverErrors(t *testing.T) {
 	m := newTestManager(t, "10.200.0.0/20", r)
 	if _, _, err := m.Setup(ctx, "sb1", []string{"v6only.example:443"}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("v6-only host: %v, want InvalidArgument", err)
+	}
+}
+
+func TestSetupCommandsNoSysctl(t *testing.T) {
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if _, _, err := m.Setup(context.Background(), "sb1", []string{"1.1.1.1:443"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range r.cmds {
+		if strings.HasPrefix(c, "sysctl") {
+			t.Errorf("Setup changed a sysctl: %q", c)
+		}
+	}
+}
+
+func TestInitOwnerCheckTableGone(t *testing.T) {
+	r := &recorder{
+		out: map[string]string{"nft list tables": "table inet gss_b2\n"},
+		fail: func(cmd string) error {
+			if cmd == "nft -t list table inet gss_b2" {
+				return errors.New("Error: No such file or directory\nlist table inet gss_b2")
+			}
+			return nil
+		},
+	}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if err := m.Init(context.Background()); err != nil {
+		t.Fatalf("Init with a table that disappeared: %v", err)
+	}
+}
+
+func TestInitRefusesVethPrefixCollision(t *testing.T) {
+	// Find another node id whose veth prefix equals that of "a1".
+	own := newNames("a1").prefix
+	other := ""
+	for i := 0; i < 1<<22 && other == ""; i++ {
+		id := fmt.Sprintf("n%d", i)
+		if newNames(id).prefix == own {
+			other = id
+		}
+	}
+	if other == "" {
+		t.Fatal("no colliding node id found")
+	}
+	tbl := newNames(other).table
+	r := &recorder{out: map[string]string{
+		"nft list tables":               "table inet " + tbl + "\n",
+		"nft -t list table inet " + tbl: "table inet " + tbl + " {\n\tcomment \"gss node " + other + " cidr 10.250.0.0/24\"\n}\n",
+	}}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	err := m.Init(context.Background())
+	if err == nil {
+		t.Fatalf("Init with node %s sharing veth prefix %s: want error", other, own)
+	}
+	if !strings.Contains(err.Error(), "a1") || !strings.Contains(err.Error(), other) {
+		t.Errorf("error %q does not name both nodes", err)
+	}
+	if len(r.cmds) != 2 {
+		t.Errorf("Init changed something: %v", r.cmds)
+	}
+}
+
+func TestSetupAfterClose(t *testing.T) {
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	ctx := context.Background()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.reset()
+	if _, _, err := m.Setup(ctx, "sb1", []string{"1.1.1.1:443"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("Setup after Close: %v, want FailedPrecondition", err)
+	}
+	if err := m.Init(ctx); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("Init after Close: %v, want FailedPrecondition", err)
+	}
+	if len(r.cmds) != 0 {
+		t.Errorf("commands after Close: %v", r.cmds)
+	}
+}
+
+func TestCloseWaitsForSetup(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	r := &recorder{}
+	// A runner that blocks Setup at "ip netns add" (outside the recorder's lock).
+	run := func(ctx context.Context, stdin, name string, args ...string) (string, error) {
+		cmd := strings.Join(append([]string{name}, args...), " ")
+		if cmd == "ip netns add gss-a1-320983ce" {
+			close(entered)
+			<-release
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.cmds = append(r.cmds, cmd)
+		r.stdin = append(r.stdin, stdin)
+		return "", nil
+	}
+	m, err := New("a1", netip.MustParsePrefix("10.200.0.0/20"), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	setupDone := make(chan error, 1)
+	go func() {
+		_, _, err := m.Setup(ctx, "sb1", []string{"1.1.1.1:443"})
+		setupDone <- err
+	}()
+	<-entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- m.Close(ctx) }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned during Setup: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-setupDone; err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Setup's nft transaction comes before any of Close's commands.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	setupNft := -1
+	for i, c := range r.cmds {
+		if c == "nft -f -" && strings.Contains(r.stdin[i], "add chain") {
+			setupNft = i
+		}
+	}
+	if setupNft < 0 || r.cmds[setupNft+1] != "ip netns list" {
+		t.Errorf("commands interleaved:\n%s", strings.Join(r.cmds, "\n"))
 	}
 }

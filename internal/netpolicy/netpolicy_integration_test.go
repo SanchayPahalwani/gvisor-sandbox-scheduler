@@ -8,11 +8,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/netip"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -325,6 +327,42 @@ func TestStaleFlowNotInherited(t *testing.T) {
 	}
 }
 
+// counter returns the packet count of the rule in chain whose text contains match.
+func counter(t *testing.T, m *Manager, chain, match string) int {
+	t.Helper()
+	out := mustRun(t, "nft", "list", "chain", "inet", m.names.table, chain)
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, match) {
+			continue
+		}
+		f := strings.Fields(line)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "packets" {
+				n, err := strconv.Atoi(f[i+1])
+				if err != nil {
+					t.Fatalf("counter in %q: %v", line, err)
+				}
+				return n
+			}
+		}
+	}
+	t.Fatalf("no rule matching %q in chain %s:\n%s", match, chain, out)
+	return 0
+}
+
+// listenPy listens on argv[1], prints "ready", then "accepted" for each connection.
+const listenPy = `import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(16)
+print("ready", flush=True)
+while True:
+    c, _ = s.accept()
+    print("accepted", flush=True)
+    c.close()
+`
+
 func TestNoSandboxToSandbox(t *testing.T) {
 	testenv.RequireRoot(t)
 	m, _ := testManager(t)
@@ -341,20 +379,94 @@ func TestNoSandboxToSandbox(t *testing.T) {
 	t.Cleanup(func() { _ = m.Teardown(context.Background(), "c") })
 	_, cGuest := m.slotAddrs(m.sbs["c"].slot)
 
-	srv := exec.Command("ip", "netns", "exec", nsName(cPath), "python3", "-m", "http.server", "9000", "--bind", "0.0.0.0")
+	srv := exec.Command("ip", "netns", "exec", nsName(cPath), "python3", "-c", listenPy, "9000")
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
-	deadline := time.Now().Add(10 * time.Second)
-	for connect(t, cPath, cGuest.String(), "9000") != "connected" {
-		if time.Now().After(deadline) {
-			t.Fatal("server in sandbox c did not start")
-		}
-		time.Sleep(100 * time.Millisecond)
+	rd := bufio.NewReader(stdout)
+	if line, _ := rd.ReadString('\n'); strings.TrimSpace(line) != "ready" {
+		t.Fatalf("listener in sandbox c: %q", line)
 	}
+
+	vethToVeth := fmt.Sprintf(`iifname "%s*" oifname "%s*"`, m.names.prefix, m.names.prefix)
+	before := counter(t, m, "forward", vethToVeth)
 	if got := connect(t, bPath, cGuest.String(), "9000"); got != "timeout" {
 		t.Errorf("sandbox b -> sandbox c %s:9000 (b's list covers %s): %s, want timeout", cGuest, m.cidr, got)
+	}
+	if after := counter(t, m, "forward", vethToVeth); after <= before {
+		t.Errorf("veth-to-veth drop counter %d -> %d, want it to rise", before, after)
+	}
+	_ = srv.Process.Kill()
+	rest, _ := io.ReadAll(rd)
+	_ = srv.Wait()
+	if strings.Contains(string(rest), "accepted") {
+		t.Errorf("sandbox c's listener accepted a connection: %q", rest)
+	}
+}
+
+const connectSrcPy = `import socket, sys
+src = (sys.argv[3], 0) if len(sys.argv) > 3 else None
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2, source_address=src).close()
+    print("connected")
+except socket.timeout:
+    print("timeout")
+except OSError as e:
+    print("error", e)
+`
+
+// TestSourceAddressEnforced: traffic from an address that is not the
+// sandbox's own guest address is dropped in prerouting.
+func TestSourceAddressEnforced(t *testing.T) {
+	testenv.RequireRoot(t)
+	targetFixture(t)
+	m, _ := testManager(t)
+	ctx := context.Background()
+	path, _, err := m.Setup(ctx, "sb1", []string{targetAddr + ":8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Teardown(context.Background(), "sb1") })
+	ns := nsName(path)
+	mustRun(t, "ip", "netns", "exec", ns, "ip", "addr", "add", "10.99.0.1/32", "dev", "eth0")
+
+	// Count, inside the target namespace, packets that arrive from 10.99.0.1.
+	tgt := func(args ...string) string {
+		return mustRun(t, "ip", append([]string{"netns", "exec", targetNS, "nft"}, args...)...)
+	}
+	tgt("add", "table", "inet", "gss_test_tgtcount")
+	t.Cleanup(func() {
+		_, _ = cmdOut("ip", "netns", "exec", targetNS, "nft", "delete", "table", "inet", "gss_test_tgtcount")
+	})
+	tgt("add", "chain", "inet", "gss_test_tgtcount", "in", "{ type filter hook input priority filter; policy accept; }")
+	tgt("add", "rule", "inet", "gss_test_tgtcount", "in", "ip", "saddr", "10.99.0.1", "counter")
+	arrived := func() string {
+		out := tgt("list", "chain", "inet", "gss_test_tgtcount", "in")
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "10.99.0.1") {
+				return strings.TrimSpace(line)
+			}
+		}
+		return out
+	}
+
+	before := counter(t, m, "prerouting", "@src_ok")
+	if out := strings.TrimSpace(mustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, targetAddr, "8080", "10.99.0.1")); out != "timeout" {
+		t.Errorf("connect from 10.99.0.1 to an allowed address and port: %s, want timeout", out)
+	}
+	if after := counter(t, m, "prerouting", "@src_ok"); after <= before {
+		t.Errorf("source check drop counter %d -> %d, want it to rise", before, after)
+	}
+	if got := arrived(); !strings.Contains(got, "packets 0 ") {
+		t.Errorf("packets from 10.99.0.1 reached the target: %s", got)
+	}
+	if out := strings.TrimSpace(mustRun(t, "ip", "netns", "exec", ns, "python3", "-c", connectSrcPy, targetAddr, "8080")); out != "connected" {
+		t.Errorf("connect from the guest address: %s, want connected", out)
 	}
 }
 
