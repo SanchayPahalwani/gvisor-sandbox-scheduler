@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/cluster"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -292,5 +293,55 @@ func TestManagerIsHeartbeatSource(t *testing.T) {
 	var src HeartbeatSource = e.m
 	if src.WarmReady() != 0 {
 		t.Errorf("WarmReady = %d, want 0 with the warm pool off", src.WarmReady())
+	}
+}
+
+// TestListReportsRemainingTTL: List reports the TTL left, not the TTL the
+// sandbox was created with, so a scheduler that adopts it after a restart
+// expires it on time (spec D18).
+func TestListReportsRemainingTTL(t *testing.T) {
+	e := startEnv(t, nil)
+	s := spec(500, 256<<20)
+	s.Ttl = durationpb.New(5 * time.Minute)
+	e.mustCreate(t, "sb-1", 1, s)
+	ttl := func() time.Duration {
+		t.Helper()
+		l := e.m.List()
+		if len(l) != 1 {
+			t.Fatalf("List = %v, want sb-1", l)
+		}
+		return l[0].GetSpec().GetTtl().AsDuration()
+	}
+	if got := ttl(); got != 5*time.Minute {
+		t.Errorf("TTL at create = %v, want 5m", got)
+	}
+	e.clock.Set(t0.Add(2 * time.Minute))
+	if got := ttl(); got != 3*time.Minute {
+		t.Errorf("TTL after 2m = %v, want 3m", got)
+	}
+	// Past the TTL but inside the node's grace: not reaped yet, nothing left.
+	e.clock.Set(t0.Add(5*time.Minute + 5*time.Second))
+	if got := ttl(); got != 0 {
+		t.Errorf("TTL in the grace period = %v, want 0", got)
+	}
+}
+
+// TestAdoptionKeepsOriginalExpiry: a scheduler that restarts 4 minutes into
+// a 10-minute sandbox adopts it from the heartbeat with its original expiry.
+func TestAdoptionKeepsOriginalExpiry(t *testing.T) {
+	e := startEnv(t, nil)
+	s := spec(500, 256<<20)
+	s.Ttl = durationpb.New(10 * time.Minute)
+	e.mustCreate(t, "sb-1", 1, s)
+	e.clock.Set(t0.Add(4 * time.Minute))
+	st := cluster.New(cluster.DefaultConfig(), e.clock.Now)
+	st.Register(hbNode)
+	st.Heartbeat(&gssv1.HeartbeatRequest{NodeId: hbNode.GetId(), Sandboxes: e.m.List()})
+	sb, ok := st.Get("sb-1")
+	if !ok {
+		t.Fatal("sb-1 not adopted")
+	}
+	if want := t0.Add(10 * time.Minute); !sb.GetExpiresAt().AsTime().Equal(want) {
+		t.Errorf("adopted sandbox expires at %v, want %v (created + TTL)", sb.GetExpiresAt().AsTime(), want)
 	}
 }

@@ -25,12 +25,12 @@ func TestParseFlagsDefaults(t *testing.T) {
 		t.Errorf("options = %+v\nwant      %+v", *o, want)
 	}
 
-	o, err = parseFlags([]string{"--node-id=n1", "--checkpoint-dir=", "--warm-pool-size=0", "--listen=127.0.0.1:0", "--scheduler=127.0.0.1:7000"}, io.Discard)
+	o, err = parseFlags([]string{"--node-id=n1", "--checkpoint-dir=", "--warm-pool-size=0", "--listen=127.0.0.1:0", "--scheduler=127.0.0.1:7000", "--max-sandboxes=10000"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" || o.scheduler != "127.0.0.1:7000" {
-		t.Errorf("checkpoint dir %q, pool %d, listen %q, scheduler %q", o.checkpointDir, o.warmPoolSize, o.listen, o.scheduler)
+	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" || o.scheduler != "127.0.0.1:7000" || o.maxSandboxes != 10000 {
+		t.Errorf("checkpoint dir %q, pool %d, listen %q, scheduler %q, max sandboxes %d", o.checkpointDir, o.warmPoolSize, o.listen, o.scheduler, o.maxSandboxes)
 	}
 }
 
@@ -50,6 +50,8 @@ func TestParseFlagsRejects(t *testing.T) {
 		{[]string{"--node-id", "n1", "--cpu-millis", "0"}, "positive"},
 		{[]string{"--node-id", "n1", "--memory-mib", "-1"}, "positive"},
 		{[]string{"--node-id", "n1", "--max-sandboxes", "0"}, "positive"},
+		{[]string{"--node-id", "n1", "--max-sandboxes", "10001"}, "--max-sandboxes"},
+		{[]string{"--node-id", "n1", "--max-sandboxes", "4294967297"}, "--max-sandboxes"}, // wraps to 1 as an int32
 		{[]string{"--node-id", "n1", "--warm-pool-size", "-1"}, "--warm-pool-size"},
 		{[]string{"--node-id", "n1", "--state-dir", "rel/dir"}, "--state-dir"},
 		{[]string{"--node-id", "n1", "--runsc-root", "/run/gss/x"}, "not defined"}, // always /run/gss/<node-id>

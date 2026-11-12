@@ -251,3 +251,40 @@ func TestRescheduleSpan(t *testing.T) {
 		t.Error("no sched.place span under gateway.reschedule")
 	}
 }
+
+// TestDestroyDuringReschedule: the client destroys a sandbox while its
+// reschedule is starting it on another node. The new copy is destroyed by
+// its incarnation and nothing places the sandbox again.
+func TestDestroyDuringReschedule(t *testing.T) {
+	e := newEnv(t, nil).run()
+	e.register("n1")
+	e.register("n2")
+	sb := e.mustCreate(nil)
+	var derr error
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		_, derr = e.srv.DestroySandbox(context.Background(), &gssv1.DestroySandboxRequest{SandboxId: req.GetSandboxId()})
+		return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+	})
+	e.kill("n2")
+	want := []string{addr("n2") + " " + sb.GetId() + " 0", addr("n2") + " " + sb.GetId() + " 2"}
+	eventually(t, "both node Destroys on n2", func() bool { return slices.Equal(e.nodes.destroyCalls(), want) })
+	if derr != nil {
+		t.Fatalf("DestroySandbox during the reschedule: %v", derr)
+	}
+	time.Sleep(5 * e.srv.cfg.RetryInterval)
+	if got := e.get(sb.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+		t.Errorf("state = %v, want DESTROYED", got.GetState())
+	}
+	if n := e.node("n2"); n.GetAllocated().GetCpuMillis() != 0 || n.GetSandboxes() != 0 {
+		t.Errorf("n2 allocation = %v, %d sandboxes; want none", n.GetAllocated(), n.GetSandboxes())
+	}
+	var onN2 int
+	for _, c := range e.nodes.createCalls() {
+		if c.addr == addr("n2") {
+			onN2++
+		}
+	}
+	if onN2 != 1 {
+		t.Errorf("%d Creates on n2, want 1: a destroyed sandbox is not placed again", onN2)
+	}
+}

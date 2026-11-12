@@ -4,9 +4,9 @@
 // restarts their sandboxes elsewhere. Its state is in memory and is rebuilt
 // from heartbeats after a restart (spec D18).
 //
-// SIGINT or SIGTERM stops it: no new RPCs, then up to drainTimeout for the
-// ones in flight, then the rescheduler. A second signal ends the process
-// at once.
+// SIGINT or SIGTERM stops it: failure detection and the rescheduler first,
+// then no new RPCs and up to drainTimeout for the ones in flight. A second
+// signal ends the process at once.
 package main
 
 import (
@@ -175,6 +175,11 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		serveErr = fmt.Errorf("serve: %w", serveErr)
 	}
 	stop()
+	// Failure detection and rescheduling stop first: while the server
+	// drains it takes no new RPCs, heartbeats included, so a detector still
+	// running would declare healthy nodes dead and move their sandboxes.
+	cancelRun()
+	<-ran
 	drained := make(chan struct{})
 	go func() {
 		srv.GracefulStop()
@@ -186,8 +191,6 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		srv.Stop()
 		<-drained
 	}
-	cancelRun()
-	<-ran
 	if serveErr != nil {
 		return serveErr
 	}

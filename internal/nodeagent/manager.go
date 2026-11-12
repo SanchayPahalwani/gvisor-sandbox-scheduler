@@ -538,8 +538,12 @@ func (m *Manager) destroyFor(ctx context.Context, e *sandbox, reason string) (er
 	return m.destroyEntry(ctx, e)
 }
 
-// List returns the live sandboxes (starting or ready), sorted by ID.
+// List returns the live sandboxes (starting or ready), sorted by ID. Each
+// spec's ttl is the time left (0 once it has passed), so a scheduler that
+// adopts the sandbox from a heartbeat expires it when the one that created
+// it would have.
 func (m *Manager) List() []*gssv1.NodeSandbox {
+	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]*gssv1.NodeSandbox, 0, len(m.sandboxes))
@@ -547,9 +551,11 @@ func (m *Manager) List() []*gssv1.NodeSandbox {
 		if e.state != stateStarting && e.state != stateReady {
 			continue
 		}
+		spec := proto.Clone(e.spec).(*gssv1.SandboxSpec)
+		spec.Ttl = durationpb.New(max(0, e.expires.Sub(now)-m.cfg.TTLGrace))
 		out = append(out, &gssv1.NodeSandbox{
 			Id:          e.id,
-			Spec:        proto.Clone(e.spec).(*gssv1.SandboxSpec),
+			Spec:        spec,
 			Incarnation: e.incarnation,
 			StartedAs:   e.startedAs,
 		})

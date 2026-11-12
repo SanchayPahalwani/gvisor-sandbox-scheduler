@@ -63,6 +63,7 @@ type sandboxEntry struct {
 	seq       uint64 // insertion order, breaks created_at ties
 	misses    int
 	allocNode string // node holding this sandbox's allocation, "" if none
+	adopted   bool   // known from a heartbeat, not placed by this scheduler (yet)
 }
 
 // State is the cluster state. All methods are safe for concurrent use.
@@ -334,6 +335,7 @@ func (s *State) Reserve(id, nodeID string, p *gssv1.Placement) (incarnation int3
 		return 0, 0, fmt.Errorf("node %s has no room for sandbox %s", nodeID, id)
 	}
 	s.allocate(e, nodeID, n)
+	e.adopted = false // placed by this scheduler from now on
 	e.sb.State = gssv1.SandboxState_SANDBOX_STATE_STARTING
 	e.sb.NodeId = nodeID
 	e.sb.NodeGroup = n.info.GetGroup()

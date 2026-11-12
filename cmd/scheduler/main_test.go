@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
@@ -162,5 +163,106 @@ func TestRunServesBothServices(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log has no %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+// blockingNode is a NodeService whose CreateSandbox waits for release.
+type blockingNode struct {
+	gssv1.UnimplementedNodeServiceServer
+	started chan struct{} // closed when the first Create arrives
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingNode) CreateSandbox(ctx context.Context, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+	b.once.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+}
+
+// TestShutdownStopsFailureDetection: while the server drains an RPC in
+// flight no heartbeat gets through, so failure detection must already be
+// off: the node is not declared dead and the create in flight completes.
+func TestShutdownStopsFailureDetection(t *testing.T) {
+	nodeLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &blockingNode{started: make(chan struct{}), release: make(chan struct{})}
+	ng := grpc.NewServer()
+	gssv1.RegisterNodeServiceServer(ng, fake)
+	go func() { _ = ng.Serve(nodeLis) }()
+	defer ng.Stop()
+
+	// A node is dead after 200 ms without a heartbeat.
+	o, err := parseFlags([]string{"--listen", "127.0.0.1:0", "--node-timeout", "200ms", "--heartbeat-interval", "100ms"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, func() {}, o) }()
+	addr := waitListen(t, logs)
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer rcancel()
+	node := &gssv1.NodeInfo{Id: "n1", Group: "a", Address: nodeLis.Addr().String(),
+		Capacity: &gssv1.Resources{CpuMillis: 4000, MemoryBytes: 2 << 30}, MaxSandboxes: 16}
+	if _, err := gssv1.NewClusterServiceClient(conn).Register(rctx, &gssv1.RegisterRequest{Node: node}); err != nil {
+		t.Fatal(err)
+	}
+	created := make(chan *gssv1.Sandbox, 1)
+	go func() {
+		sb, err := gssv1.NewSandboxServiceClient(conn).CreateSandbox(rctx, &gssv1.CreateSandboxRequest{})
+		if err != nil {
+			t.Errorf("CreateSandbox: %v", err)
+		}
+		created <- sb
+	}()
+	<-fake.started
+	// The node is alive when shutdown starts, however slow the test was so far.
+	if _, err := gssv1.NewClusterServiceClient(conn).Heartbeat(rctx, &gssv1.HeartbeatRequest{NodeId: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	cancel() // the signal: shutdown starts with the create still in flight
+	time.Sleep(time.Second)
+	close(fake.release)
+	if sb := <-created; sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY {
+		t.Errorf("the create drained during shutdown returned %v, want READY", sb)
+	}
+	if err := <-done; err != nil {
+		t.Errorf("run = %v", err)
+	}
+	if strings.Contains(logs.String(), `msg="node dead"`) {
+		t.Errorf("a node was declared dead during the drain:\n%s", logs.String())
+	}
+}
+
+// waitListen returns the address from run's serving line.
+func waitListen(t *testing.T, logs *syncBuffer) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if m := listenRE.FindStringSubmatch(logs.String()); m != nil {
+			return m[1]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving line in %q", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

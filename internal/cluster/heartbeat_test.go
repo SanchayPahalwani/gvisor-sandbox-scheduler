@@ -286,3 +286,94 @@ func TestWarmCountOverwrittenByHeartbeat(t *testing.T) {
 		t.Fatalf("after heartbeat: %d", w)
 	}
 }
+
+// TestAdoptedExpiresAtReportedTTL: the node reports the TTL left (6 of 10
+// minutes), so the adopted sandbox expires when it was always going to.
+func TestAdoptedExpiresAtReportedTTL(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Heartbeat(report("n1", &gssv1.NodeSandbox{Id: "sb-x", Spec: specTTL(6 * time.Minute), Incarnation: 1}))
+	if sb := get(t, s, "sb-x"); !sb.ExpiresAt.AsTime().Equal(c.now().Add(6 * time.Minute)) {
+		t.Fatalf("expires at %v, want now + 6m", sb.ExpiresAt.AsTime())
+	}
+	c.advance(6*time.Minute - time.Millisecond)
+	s.Heartbeat(report("n1", &gssv1.NodeSandbox{Id: "sb-x", Spec: specTTL(time.Millisecond), Incarnation: 1}))
+	if r := s.Tick(); len(r.Expired) != 0 {
+		t.Fatalf("expired early: %+v", r.Expired)
+	}
+	c.advance(time.Millisecond)
+	if r := s.Tick(); !reflect.DeepEqual(r.Expired, []Expired{{ID: "sb-x", NodeID: "n1"}}) {
+		t.Fatalf("Tick at the original expiry = %+v, want sb-x expired", r)
+	}
+}
+
+// TestReadoptHigherIncarnation: after a scheduler restart a healed node
+// reports a stale incarnation 1 before the current holder reports 2. The
+// adopted entry moves to the holder; the stale node is told to destroy its
+// copy on its next heartbeat.
+func TestReadoptHigherIncarnation(t *testing.T) {
+	s, _ := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Register(nodeInfo("n2", "b", 4000))
+	if r := s.Heartbeat(report("n1", reported("sb-x", 1))); len(r.Destroy) != 0 {
+		t.Fatalf("first report: %+v", r)
+	}
+	r := s.Heartbeat(report("n2", &gssv1.NodeSandbox{Id: "sb-x", Spec: spec(), Incarnation: 2, StartedAs: gssv1.StartMode_START_MODE_RESTORE}))
+	if len(r.Destroy) != 0 {
+		t.Fatalf("the holder of incarnation 2 was told to destroy it: %+v", r)
+	}
+	sb := get(t, s, "sb-x")
+	if sb.State != gssv1.SandboxState_SANDBOX_STATE_READY || sb.NodeId != "n2" || sb.NodeGroup != "b" ||
+		sb.Incarnation != 2 || sb.StartedAs != gssv1.StartMode_START_MODE_RESTORE {
+		t.Fatalf("after the higher report: %v", sb)
+	}
+	if n1, n2 := node(t, s, "n1"), node(t, s, "n2"); n1.Sandboxes != 0 || n1.Allocated.CpuMillis != 0 ||
+		n2.Sandboxes != 1 || n2.Allocated.CpuMillis != 500 {
+		t.Fatalf("allocations: n1 %v, n2 %v", n1, n2)
+	}
+	if r := s.Heartbeat(report("n1", reported("sb-x", 1))); !reflect.DeepEqual(r.Destroy, []string{"sb-x"}) {
+		t.Fatalf("stale node's next heartbeat = %+v, want sb-x on the destroy list", r)
+	}
+	if r := s.Heartbeat(report("n2", &gssv1.NodeSandbox{Id: "sb-x", Spec: spec(), Incarnation: 2})); len(r.Destroy) != 0 || len(r.Lost) != 0 {
+		t.Fatalf("holder's next heartbeat = %+v", r)
+	}
+}
+
+// TestPlacedSandboxNotDisplaced: a sandbox this scheduler placed (here
+// after adopting it, losing it and placing it again) is never moved by
+// another node's report, whatever the incarnation.
+func TestPlacedSandboxNotDisplaced(t *testing.T) {
+	s, c := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Register(nodeInfo("n2", "a", 4000))
+	place(t, s, "sb-p", "n1", spec())
+	if r := s.Heartbeat(report("n2", reported("sb-p", 5))); !reflect.DeepEqual(r.Destroy, []string{"sb-p"}) {
+		t.Fatalf("report of a placed sandbox from another node = %+v, want it destroyed", r)
+	}
+	if sb := get(t, s, "sb-p"); sb.NodeId != "n1" || sb.Incarnation != 1 {
+		t.Fatalf("placed sandbox moved: %v", sb)
+	}
+
+	// Adopted on n1, then n1 dies and the scheduler places it on n2 itself.
+	s.Register(nodeInfo("n3", "a", 4000))
+	s.Heartbeat(report("n1", reported("sb-a", 1)))
+	c.advance(2 * time.Second)
+	s.Heartbeat(report("n2"))
+	s.Heartbeat(report("n3"))
+	c.advance(1100 * time.Millisecond)
+	s.Heartbeat(report("n2"))
+	s.Heartbeat(report("n3"))
+	if r := s.Tick(); !reflect.DeepEqual(r.DeadNodes, []string{"n1"}) {
+		t.Fatalf("Tick = %+v, want n1 dead", r)
+	}
+	inc, _, err := s.Reserve("sb-a", "n2", nil)
+	if err != nil || inc != 2 || !s.Commit("sb-a", inc, gssv1.StartMode_START_MODE_COLD, time.Second) {
+		t.Fatalf("Reserve/Commit on n2: %d, %v", inc, err)
+	}
+	if r := s.Heartbeat(report("n3", reported("sb-a", 7))); !reflect.DeepEqual(r.Destroy, []string{"sb-a"}) {
+		t.Fatalf("report from n3 = %+v, want sb-a destroyed there", r)
+	}
+	if sb := get(t, s, "sb-a"); sb.NodeId != "n2" || sb.Incarnation != 2 {
+		t.Fatalf("re-placed sandbox moved: %v", sb)
+	}
+}

@@ -51,7 +51,7 @@ func (s *State) Heartbeat(req *gssv1.HeartbeatRequest) HeartbeatResult {
 			s.adopt(ns, nodeID, n, now)
 			continue
 		}
-		if !s.reportedHere(e, nodeID, ns.GetIncarnation()) {
+		if !s.reportedHere(e, nodeID, ns.GetIncarnation()) && !s.readopt(e, ns, nodeID, n, now) {
 			r.Destroy = append(r.Destroy, id)
 		}
 	}
@@ -87,9 +87,36 @@ func (s *State) adopt(ns *gssv1.NodeSandbox, nodeID string, n *nodeEntry, now ti
 		CreatedAt:   timestamppb.New(now),
 		ExpiresAt:   timestamppb.New(now.Add(ttlOf(ns.GetSpec()))),
 	}}
+	e.adopted = true
 	s.sandboxes[e.sb.Id] = e
 	s.allocate(e, nodeID, n)
 	s.notify()
+}
+
+// readopt moves an adopted sandbox to the node now reporting it at a higher
+// incarnation. After a scheduler restart, the first node to report a
+// sandbox is the one adopted; a healed node with a stale copy can report
+// before the node holding the newer incarnation. The stale node is told to
+// destroy its copy at its next heartbeat. A sandbox this scheduler placed
+// is never moved this way. It returns false, changing nothing, when the
+// rule does not apply. Call with s.mu held.
+func (s *State) readopt(e *sandboxEntry, ns *gssv1.NodeSandbox, nodeID string, n *nodeEntry, now time.Time) bool {
+	st := e.sb.State
+	if !e.adopted || e.sb.NodeId == nodeID || ns.GetIncarnation() <= e.sb.Incarnation ||
+		(st != gssv1.SandboxState_SANDBOX_STATE_READY && st != gssv1.SandboxState_SANDBOX_STATE_LOST) {
+		return false
+	}
+	s.allocate(e, nodeID, n) // releases the old node's share first
+	e.sb.State = gssv1.SandboxState_SANDBOX_STATE_READY
+	e.sb.NodeId = nodeID
+	e.sb.NodeGroup = n.info.GetGroup()
+	e.sb.Incarnation = ns.GetIncarnation()
+	e.sb.StartedAs = ns.GetStartedAs()
+	e.sb.ExpiresAt = timestamppb.New(now.Add(ttlOf(ns.GetSpec())))
+	e.sb.Message = ""
+	e.misses = 0
+	s.notify()
+	return true
 }
 
 // reportedHere handles a report of a known sandbox. It returns true, and

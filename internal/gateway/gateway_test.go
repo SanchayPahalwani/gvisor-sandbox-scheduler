@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -72,8 +73,15 @@ type fakeNodes struct {
 	createFn    func(ctx context.Context, addr string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error)
 	execFn      func(ctx context.Context, addr string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error)
 	destroyErr  error
-	inflight    int // Creates running now
+	forgets     []string // addresses whose connection was dropped
+	inflight    int      // Creates running now
 	maxInflight int
+}
+
+func (f *fakeNodes) Forget(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgets = append(f.forgets, addr)
 }
 
 func (f *fakeNodes) Create(ctx context.Context, addr string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
@@ -653,6 +661,8 @@ func TestExecErrors(t *testing.T) {
 		{status.Error(codes.Internal, "exec in sb: boom"), codes.Internal, "exec in sb: boom"},
 		{status.Error(codes.InvalidArgument, "argv is empty"), codes.InvalidArgument, "argv is empty"},
 		{status.Error(codes.Unavailable, "error reading from server: EOF"), codes.Unavailable, "sandbox " + sb.GetId() + " lost on node n1"},
+		// The agent restarted and has no such sandbox: lost, to be rescheduled.
+		{status.Error(codes.NotFound, "sandbox not found"), codes.Unavailable, "sandbox " + sb.GetId() + " lost on node n1: the node no longer has it"},
 	} {
 		e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
 			return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("partial")}, end: tc.end}, nil
@@ -747,7 +757,7 @@ func TestExecEndsWhenSandboxLost(t *testing.T) {
 	e.kill()
 	evs, err := recvAll(stream)
 	wantCode(t, err, codes.Unavailable, "Exec on a dead node")
-	if want := "sandbox " + sb.GetId() + " lost on node n1"; status.Convert(err).Message() != want {
+	if want := "sandbox " + sb.GetId() + " lost on node n1: marked LOST by the scheduler"; status.Convert(err).Message() != want {
 		t.Errorf("message %q, want %q", status.Convert(err).Message(), want)
 	}
 	if len(evs) != 0 {
@@ -938,11 +948,289 @@ func TestGRPCNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.mu.Lock()
-	defer svc.mu.Unlock()
-	if !slices.Equal(svc.destroys, []string{"sb-1 3"}) {
-		t.Errorf("node saw destroys %q, want [sb-1 3]", svc.destroys)
+	destroys := slices.Clone(svc.destroys)
+	svc.mu.Unlock()
+	if !slices.Equal(destroys, []string{"sb-1 3"}) {
+		t.Errorf("node saw destroys %q, want [sb-1 3]", destroys)
 	}
 	if err := nodes.Destroy(ctx(t), "127.0.0.1:1", "sb-1", 0); status.Code(err) != codes.Unavailable {
 		t.Errorf("Destroy on a closed port = %v, want Unavailable", err)
 	}
+
+	g2 := nodes.(*grpcNodes)
+	g2.mu.Lock()
+	conn := g2.conns[a]
+	g2.mu.Unlock()
+	nodes.(interface{ Forget(string) }).Forget(a)
+	g2.mu.Lock()
+	_, kept := g2.conns[a]
+	g2.mu.Unlock()
+	if kept || conn.GetState() != connectivity.Shutdown {
+		t.Errorf("after Forget: cached %v, connection %v; want dropped and shut down", kept, conn.GetState())
+	}
+	if err := nodes.Destroy(ctx(t), a, "sb-1", 1); err != nil {
+		t.Errorf("Destroy after Forget (a new connection): %v", err)
+	}
+}
+
+// TestExecExitThenLost: once the exit event is through, a loss seen before
+// the stream's end does not add an error after it (spec D34).
+func TestExecExitThenLost(t *testing.T) {
+	e := newEnv(t, nil).run()
+	e.register("n1")
+	sb := e.mustCreate(nil)
+	e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
+		return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("4\n"), exit(0)}, hold: true}, nil
+	})
+	stream, err := e.sc.Exec(ctx(t), &gssv1.ExecRequest{SandboxId: sb.GetId()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := stream.Recv(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.kill()
+	evs, err := recvAll(stream)
+	if err != nil || len(evs) != 0 {
+		t.Errorf("after the exit: events %q, %v; want a clean end", evs, err)
+	}
+}
+
+// TestExecEndsWhenSandboxDestroyed: a destroy ends a proxied Exec with
+// NotFound even if the node's stream does not end.
+func TestExecEndsWhenSandboxDestroyed(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	sb := e.mustCreate(nil)
+	e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
+		return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("started")}, hold: true}, nil
+	})
+	stream, err := e.sc.Exec(ctx(t), &gssv1.ExecRequest{SandboxId: sb.GetId()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.sc.DestroySandbox(ctx(t), &gssv1.DestroySandboxRequest{SandboxId: sb.GetId()}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = recvAll(stream)
+	wantCode(t, err, codes.NotFound, "Exec of a sandbox destroyed meanwhile")
+}
+
+// TestWatchEnd covers every way the state can end a proxied Exec.
+func TestWatchEnd(t *testing.T) {
+	was := &gssv1.Sandbox{Id: "sb-1", NodeId: "n1", Incarnation: 1, State: gssv1.SandboxState_SANDBOX_STATE_READY}
+	with := func(f func(*gssv1.Sandbox)) *gssv1.Sandbox {
+		sb := proto.Clone(was).(*gssv1.Sandbox)
+		f(sb)
+		return sb
+	}
+	for _, tc := range []struct {
+		name string
+		cur  *gssv1.Sandbox // nil: gone from the state
+		code codes.Code
+		msg  string
+	}{
+		{"unchanged", was, codes.OK, ""},
+		{"lost", with(func(sb *gssv1.Sandbox) { sb.State = gssv1.SandboxState_SANDBOX_STATE_LOST }),
+			codes.Unavailable, "sandbox sb-1 lost on node n1: marked LOST by the scheduler"},
+		{"moved", with(func(sb *gssv1.Sandbox) { sb.NodeId, sb.Incarnation = "n2", 2 }),
+			codes.Unavailable, "sandbox sb-1 lost on node n1: moved to node n2 (incarnation 2)"},
+		{"restarted", with(func(sb *gssv1.Sandbox) { sb.Incarnation, sb.State = 2, gssv1.SandboxState_SANDBOX_STATE_STARTING }),
+			codes.Unavailable, "sandbox sb-1 lost on node n1: moved to node n1 (incarnation 2)"},
+		{"destroyed", with(func(sb *gssv1.Sandbox) {
+			sb.State, sb.Message = gssv1.SandboxState_SANDBOX_STATE_DESTROYED, "ttl expired"
+		}), codes.NotFound, "sandbox sb-1 was destroyed (ttl expired)"},
+		{"failed", with(func(sb *gssv1.Sandbox) {
+			sb.State, sb.Message = gssv1.SandboxState_SANDBOX_STATE_FAILED, "no node fits"
+		}), codes.FailedPrecondition, "no node fits"},
+		{"gone", nil, codes.NotFound, "sandbox sb-1 not found"},
+	} {
+		err := watchEnd(was, tc.cur, tc.cur != nil)
+		if got := status.Convert(err); got.Code() != tc.code || got.Message() != tc.msg {
+			t.Errorf("%s: %v, want %v %q", tc.name, err, tc.code, tc.msg)
+		}
+	}
+}
+
+// TestRegisterNewAddressDropsConn: a node that registers again at another
+// address (an agent restarted on a new port) has its old connection dropped.
+func TestRegisterNewAddressDropsConn(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	e.register("n1") // same address: kept
+	moved := nodeInfo("n1", "g1", 4000)
+	moved.Address = "n1:7999"
+	e.registerNode(moved)
+	e.nodes.mu.Lock()
+	defer e.nodes.mu.Unlock()
+	if !slices.Equal(e.nodes.forgets, []string{addr("n1")}) {
+		t.Errorf("dropped connections %q, want [%s]", e.nodes.forgets, addr("n1"))
+	}
+}
+
+// TestDestroyLostSandbox: destroying a LOST sandbox does not wait on its
+// dead node; the node's next heartbeat answer lists the ID.
+func TestDestroyLostSandbox(t *testing.T) {
+	e := newEnv(t, nil).run()
+	e.register("n1")
+	sb := e.mustCreate(nil)
+	e.kill()
+	eventually(t, "the sandbox LOST", func() bool {
+		return e.get(sb.GetId()).GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST
+	})
+	if _, err := e.sc.DestroySandbox(ctx(t), &gssv1.DestroySandboxRequest{SandboxId: sb.GetId()}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.nodes.destroyCalls(); len(got) != 0 {
+		t.Errorf("node Destroy calls = %q, want none for a LOST sandbox", got)
+	}
+	resp, err := e.cc.Heartbeat(ctx(t), &gssv1.HeartbeatRequest{NodeId: "n1", Sandboxes: []*gssv1.NodeSandbox{
+		{Id: sb.GetId(), Spec: sb.GetSpec(), Incarnation: 1},
+	}})
+	if err != nil || !slices.Equal(resp.GetDestroySandboxIds(), []string{sb.GetId()}) {
+		t.Errorf("returning node's heartbeat = %v, %v; want %s on the destroy list", resp, err, sb.GetId())
+	}
+}
+
+// The race paths of a create: the state changes while the node Create is in
+// flight, so Commit refuses and the node's copy is destroyed by incarnation.
+
+func TestCommitRefusedAfterDestroy(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	var derr error
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		_, derr = e.srv.DestroySandbox(context.Background(), &gssv1.DestroySandboxRequest{SandboxId: req.GetSandboxId()})
+		return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+	})
+	_, err := e.create(nil)
+	if derr != nil {
+		t.Fatalf("DestroySandbox during the create: %v", derr)
+	}
+	wantCode(t, err, codes.Aborted, "a create whose sandbox was destroyed meanwhile")
+	id := "sb-000000000001"
+	// DestroySandbox's own call (whatever is live), then the stale copy by its incarnation.
+	if got, want := e.nodes.destroyCalls(), []string{addr("n1") + " " + id + " 0", addr("n1") + " " + id + " 1"}; !slices.Equal(got, want) {
+		t.Errorf("node Destroy calls = %q, want %q", got, want)
+	}
+	if sb := e.get(id); sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+		t.Errorf("state = %v, want DESTROYED", sb.GetState())
+	}
+	if n := e.node("n1"); n.GetAllocated().GetCpuMillis() != 0 || n.GetSandboxes() != 0 {
+		t.Errorf("n1 allocation = %v, %d sandboxes; want none", n.GetAllocated(), n.GetSandboxes())
+	}
+}
+
+func TestCommitRefusedAfterExpiry(t *testing.T) {
+	e := newEnv(t, nil).run()
+	e.register("n1")
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		e.clock.advance(61 * time.Second)
+		if !waitState(e.state, req.GetSandboxId(), gssv1.SandboxState_SANDBOX_STATE_DESTROYED) {
+			return nil, status.Error(codes.Internal, "the tick did not expire the sandbox")
+		}
+		return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+	})
+	_, err := e.create(&gssv1.SandboxSpec{Ttl: durationpb.New(time.Minute)})
+	wantCode(t, err, codes.Aborted, "a create whose sandbox expired meanwhile")
+	id := "sb-000000000001"
+	eventually(t, "the node Destroys", func() bool {
+		got := e.nodes.destroyCalls()
+		return slices.Contains(got, addr("n1")+" "+id+" 1") && slices.Contains(got, addr("n1")+" "+id+" 0")
+	})
+	if sb := e.get(id); sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_DESTROYED || sb.GetMessage() != "ttl expired" {
+		t.Errorf("sandbox = %v, want DESTROYED by ttl", sb)
+	}
+	if n := e.node("n1"); n.GetAllocated().GetCpuMillis() != 0 || n.GetSandboxes() != 0 {
+		t.Errorf("n1 allocation = %v, %d sandboxes; want none", n.GetAllocated(), n.GetSandboxes())
+	}
+}
+
+func TestCommitRefusedAfterNodeDeath(t *testing.T) {
+	e := newEnv(t, nil).run()
+	e.register("n1")
+	e.register("n2")
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		if a == addr("n1") {
+			// n1 stops heartbeating while its Create runs.
+			e.clock.advance(2 * time.Second)
+			e.state.Heartbeat(&gssv1.HeartbeatRequest{NodeId: "n2"})
+			e.clock.advance(1300 * time.Millisecond)
+			e.state.Heartbeat(&gssv1.HeartbeatRequest{NodeId: "n2"})
+			if !waitState(e.state, req.GetSandboxId(), gssv1.SandboxState_SANDBOX_STATE_LOST) {
+				return nil, status.Error(codes.Internal, "the tick did not lose the sandbox")
+			}
+		}
+		return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+	})
+	sb, err := e.create(nil)
+	if err != nil {
+		t.Fatalf("create on a node that died meanwhile: %v, want the LOST sandbox", err)
+	}
+	if sb.GetState() != gssv1.SandboxState_SANDBOX_STATE_LOST || sb.GetIncarnation() != 1 {
+		t.Errorf("response = %v, want LOST at incarnation 1", sb)
+	}
+	if got := e.nodes.destroyCalls(); !slices.Contains(got, addr("n1")+" "+sb.GetId()+" 1") {
+		t.Errorf("node Destroy calls = %q, want the stale copy on n1 at incarnation 1", got)
+	}
+	if n := e.node("n1"); n.GetAllocated().GetCpuMillis() != 0 || n.GetSandboxes() != 0 {
+		t.Errorf("n1 allocation = %v, %d sandboxes; want none", n.GetAllocated(), n.GetSandboxes())
+	}
+	eventually(t, "the sandbox READY on n2 at incarnation 2", func() bool {
+		got := e.get(sb.GetId())
+		return got.GetState() == gssv1.SandboxState_SANDBOX_STATE_READY && got.GetNodeId() == "n2" && got.GetIncarnation() == 2
+	})
+}
+
+// TestCreateCancelled: a client that gives up during the node Create leaves
+// the sandbox FAILED with nothing reserved, and the node is not blamed.
+func TestCreateCancelled(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	e.register("n2")
+	started := make(chan struct{})
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	})
+	cctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.sc.CreateSandbox(cctx, &gssv1.CreateSandboxRequest{})
+		done <- err
+	}()
+	<-started
+	cancel()
+	wantCode(t, <-done, codes.Canceled, "a cancelled create")
+	id := "sb-000000000001"
+	eventually(t, "the sandbox FAILED", func() bool {
+		return e.get(id).GetState() == gssv1.SandboxState_SANDBOX_STATE_FAILED
+	})
+	if got := e.nodes.createCalls(); len(got) != 1 {
+		t.Errorf("Create calls = %d, want 1: no other node after a cancel", len(got))
+	}
+	for _, n := range e.state.Nodes() {
+		if n.GetAllocated().GetCpuMillis() != 0 || n.GetSandboxes() != 0 || n.GetHealth() != 1 {
+			t.Errorf("node %s = %v, want nothing allocated and health 1", n.GetInfo().GetId(), n)
+		}
+	}
+}
+
+// waitState polls the state for up to 5 s; it is for fakes, which run on
+// the gateway's goroutines and must not stop the test.
+func waitState(st *cluster.State, id string, want gssv1.SandboxState) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sb, ok := st.Get(id); ok && sb.GetState() == want {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }

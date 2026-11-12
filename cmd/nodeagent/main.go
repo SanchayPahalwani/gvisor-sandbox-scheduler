@@ -63,6 +63,9 @@ const (
 	// destroyed, for RPCs still in flight (an Exec stuck sending to a
 	// client that stopped reading) before it cancels them.
 	drainTimeout = 5 * time.Second
+	// maxSandboxesLimit bounds --max-sandboxes, which is sent to the
+	// scheduler as an int32.
+	maxSandboxesLimit = 10000
 )
 
 // options are the parsed and checked flags.
@@ -167,6 +170,9 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	}
 	if o.cpuMillis <= 0 || memoryMiB <= 0 || o.maxSandboxes <= 0 {
 		return fail("--cpu-millis, --memory-mib and --max-sandboxes must be positive, got %d, %d and %d", o.cpuMillis, memoryMiB, o.maxSandboxes)
+	}
+	if o.maxSandboxes > maxSandboxesLimit {
+		return fail("--max-sandboxes %d is above %d", o.maxSandboxes, maxSandboxesLimit)
 	}
 	if memoryMiB > math.MaxInt64>>20 {
 		return fail("--memory-mib %d is too large", memoryMiB)

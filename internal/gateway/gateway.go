@@ -403,14 +403,16 @@ func modeName(m gssv1.StartMode) string {
 	return strings.ToLower(strings.TrimPrefix(m.String(), "START_MODE_"))
 }
 
-// errLost ends an Exec's node stream once the scheduler has the sandbox
-// LOST or elsewhere.
-var errLost = errors.New("sandbox lost")
+// watchCause is what the watcher cancels an Exec's node stream with: the
+// status the Exec ends with.
+type watchCause struct{ err error }
+
+func (w watchCause) Error() string { return w.err.Error() }
 
 // Exec waits for the sandbox to be READY and proxies the node's Exec
 // stream (spec D8, D34): events as they come; the node's status if the
 // stream ends with one; Unavailable if the sandbox is lost on the way.
-// No exit event is ever made up.
+// No exit event is ever made up, and nothing follows one that was sent.
 func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[gssv1.ExecEvent]) (err error) {
 	ctx, span := startSpan(stream.Context(), "gateway.exec", attribute.String("sandbox.id", req.GetSandboxId()))
 	defer func() { endSpan(span, err) }()
@@ -420,15 +422,16 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 		return err
 	}
 	span.SetAttributes(attribute.String("node.id", sb.GetNodeId()), attribute.Int("incarnation", int(sb.GetIncarnation())))
-	lost := fmt.Sprintf("sandbox %s lost on node %s", sb.GetId(), sb.GetNodeId())
+	lost := lostMsg(sb)
 	addr, ok := s.state.NodeAddress(sb.GetNodeId())
 	if !ok {
-		return status.Error(codes.Unavailable, lost)
+		return status.Errorf(codes.Unavailable, "%s: node %s is not registered", lost, sb.GetNodeId())
 	}
 	nctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	go s.watchLost(nctx, cancel, sb)
+	go s.watch(nctx, cancel, sb)
 
+	exited := false
 	ns, err := s.nodes.Exec(nctx, addr, req)
 	for err == nil {
 		var ev *gssv1.ExecEvent
@@ -436,21 +439,37 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 			if err := stream.Send(ev); err != nil {
 				return err
 			}
+			exited = exited || ev.GetExit() != nil
 		}
 	}
 	if err == io.EOF {
 		return nil
 	}
-	if errors.Is(context.Cause(nctx), errLost) {
-		return status.Error(codes.Unavailable, lost)
+	var wc watchCause
+	if errors.As(context.Cause(nctx), &wc) {
+		if exited {
+			return nil // the result is in; the loss came after it
+		}
+		return wc.err
 	}
 	st := status.Convert(err)
-	if st.Code() == codes.Unavailable {
+	switch st.Code() {
+	case codes.Unavailable:
 		// The node went away (the transport failed) or the node itself says
 		// the sandbox stopped: either way this copy is lost.
 		return status.Errorf(codes.Unavailable, "%s: %s", lost, st.Message())
+	case codes.NotFound:
+		if cur, ok := s.state.Get(sb.GetId()); ok && watchEnd(sb, cur, true) == nil {
+			// Still READY there for the scheduler but unknown to the node: the
+			// agent restarted, and its heartbeats will get the sandbox moved.
+			return status.Errorf(codes.Unavailable, "%s: the node no longer has it (%s)", lost, st.Message())
+		}
 	}
 	return st.Err()
+}
+
+func lostMsg(sb *gssv1.Sandbox) string {
+	return fmt.Sprintf("sandbox %s lost on node %s", sb.GetId(), sb.GetNodeId())
 }
 
 // waitReady waits for the sandbox to be READY, bounded by ctx and ExecWaitCap.
@@ -473,12 +492,12 @@ func (s *Server) waitReady(ctx context.Context, id string) (*gssv1.Sandbox, erro
 	return nil, err
 }
 
-// watchLost cancels ctx with errLost once the state no longer has sb READY
-// on its node at its incarnation (LOST, or already moved). grpc-go will not
-// ping a connection more often than every 10 s, so without this an Exec to
-// a node that vanished without closing its connection would hang for that
-// long; with it, the node timeout bounds it (spec 8.2).
-func (s *Server) watchLost(ctx context.Context, cancel context.CancelCauseFunc, sb *gssv1.Sandbox) {
+// watch ends an Exec's node stream once the state no longer has sb READY
+// on its node at its incarnation (spec D37): grpc-go will not ping a
+// connection more often than every 10 s, so an Exec to a node that vanished
+// without closing its connection would otherwise hang that long; with
+// this, the node timeout bounds it.
+func (s *Server) watch(ctx context.Context, cancel context.CancelCauseFunc, sb *gssv1.Sandbox) {
 	t := time.NewTicker(s.cfg.TickInterval)
 	defer t.Stop()
 	for {
@@ -488,21 +507,49 @@ func (s *Server) watchLost(ctx context.Context, cancel context.CancelCauseFunc, 
 		case <-t.C:
 		}
 		cur, ok := s.state.Get(sb.GetId())
-		if !ok || cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST ||
-			cur.GetNodeId() != sb.GetNodeId() || cur.GetIncarnation() != sb.GetIncarnation() {
-			cancel(errLost)
+		if err := watchEnd(sb, cur, ok); err != nil {
+			cancel(watchCause{err})
 			return
 		}
 	}
 }
 
+// watchEnd is the status an Exec on was ends with, given the state's
+// current copy cur (ok false: gone), or nil while was is still current.
+func watchEnd(was, cur *gssv1.Sandbox, ok bool) error {
+	id, lost := was.GetId(), lostMsg(was)
+	switch {
+	case !ok:
+		return status.Errorf(codes.NotFound, "sandbox %s not found", id)
+	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_DESTROYED:
+		msg := "sandbox " + id + " was destroyed"
+		if m := cur.GetMessage(); m != "" && m != "destroyed" {
+			msg += " (" + m + ")"
+		}
+		return status.Error(codes.NotFound, msg)
+	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_FAILED:
+		return status.Error(codes.FailedPrecondition, cur.GetMessage())
+	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST:
+		return status.Errorf(codes.Unavailable, "%s: marked LOST by the scheduler", lost)
+	case cur.GetNodeId() == "":
+		return status.Errorf(codes.Unavailable, "%s: waiting to be placed again", lost)
+	case cur.GetNodeId() != was.GetNodeId() || cur.GetIncarnation() != was.GetIncarnation():
+		return status.Errorf(codes.Unavailable, "%s: moved to node %s (incarnation %d)", lost, cur.GetNodeId(), cur.GetIncarnation())
+	}
+	return nil
+}
+
 // DestroySandbox destroys a sandbox, whatever incarnation is live. The
 // node's Destroy is bounded by destroyTimeout; if it fails, the node's next
-// heartbeat answer lists the ID. An unknown ID is not an error.
+// heartbeat answer lists the ID. A LOST sandbox's node is dead or no longer
+// has it, so it is not called at all: the heartbeat answer covers it. An
+// unknown ID is not an error.
 func (s *Server) DestroySandbox(ctx context.Context, req *gssv1.DestroySandboxRequest) (*gssv1.DestroySandboxResponse, error) {
 	id := req.GetSandboxId()
+	before, _ := s.state.Get(id)
 	nodeID, existed := s.state.Destroy(id)
-	if existed && nodeID != "" {
+	wasLost := before.GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST && before.GetNodeId() == nodeID
+	if existed && nodeID != "" && !wasLost {
 		if addr, ok := s.state.NodeAddress(nodeID); ok {
 			s.destroyOnNode(ctx, nodeID, addr, id, 0)
 		}
@@ -535,7 +582,11 @@ func (s *Server) Register(ctx context.Context, req *gssv1.RegisterRequest) (*gss
 	if n.GetId() == "" || n.GetAddress() == "" {
 		return nil, status.Error(codes.InvalidArgument, "node id and address are required")
 	}
+	old, known := s.state.NodeAddress(n.GetId())
 	s.state.Register(n)
+	if f, ok := s.nodes.(interface{ Forget(addr string) }); ok && known && old != n.GetAddress() {
+		f.Forget(old) // the agent restarted elsewhere; nothing answers there now
+	}
 	s.log.Info("node registered", "node", n.GetId(), "group", n.GetGroup(), "address", n.GetAddress(),
 		"cpu_millis", n.GetCapacity().GetCpuMillis(), "memory_bytes", n.GetCapacity().GetMemoryBytes(),
 		"max_sandboxes", n.GetMaxSandboxes())

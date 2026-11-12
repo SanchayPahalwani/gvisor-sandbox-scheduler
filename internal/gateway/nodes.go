@@ -17,15 +17,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Keepalive on the connections to nodes (spec 8.2): a ping after 2 s
-// without activity, the connection closed when no answer comes within 1 s.
-// grpc-go raises a client ping interval below 10 s to 10 s, so a node that
-// vanishes without closing its connection is noticed by keepalive only
-// after about 11 s; Exec also ends a stream as soon as the scheduler
-// declares the sandbox lost (spec 8.4), which bounds that case by the node
-// timeout.
+// Keepalive on the connections to nodes (spec D37): a ping after 10 s
+// without activity, the shortest interval grpc-go allows a client, and the
+// connection closed when no answer comes within 1 s. A node that vanishes
+// without closing its connection is noticed by keepalive after about 11 s;
+// a proxied Exec ends sooner, as soon as the scheduler marks the sandbox
+// LOST (Server.watch).
 const (
-	keepaliveTime    = 2 * time.Second
+	keepaliveTime    = 10 * time.Second
 	keepaliveTimeout = time.Second
 )
 
@@ -37,7 +36,9 @@ var reconnectParams = grpc.ConnectParams{
 	MinConnectTimeout: 5 * time.Second,
 }
 
-// NodeClient reaches node agents; tests fake it.
+// NodeClient reaches node agents; tests fake it. A NodeClient that caches
+// connections may also have a Forget(addr string) method, which the gateway
+// calls when a node registers again at another address.
 type NodeClient interface {
 	Create(ctx context.Context, addr string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error)
 	Exec(ctx context.Context, addr string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error)
@@ -104,6 +105,17 @@ func (g *grpcNodes) Destroy(ctx context.Context, addr, sandboxID string, incarna
 	}
 	_, err = c.DestroySandbox(ctx, &gssv1.DestroySandboxRequest{SandboxId: sandboxID, Incarnation: incarnation})
 	return err
+}
+
+// Forget closes and drops the connection to addr, if there is one.
+func (g *grpcNodes) Forget(addr string) {
+	g.mu.Lock()
+	conn := g.conns[addr]
+	delete(g.conns, addr)
+	g.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
 }
 
 // Close closes every connection.
