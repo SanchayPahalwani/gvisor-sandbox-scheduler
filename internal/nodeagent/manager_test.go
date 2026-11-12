@@ -139,6 +139,7 @@ func newEnv(t *testing.T, mod func(*Config, *Deps)) *env {
 	// Fake pids are not host processes; tests that check liveness replace this.
 	m.processAlive = func(int) bool { return true }
 	m.reapEvery, m.liveEvery = 10*time.Millisecond, 10*time.Millisecond
+	m.poolRetry = 10 * time.Millisecond
 	e.m = m
 	return e
 }
@@ -1270,6 +1271,7 @@ func TestEgressUsesRestore(t *testing.T) {
 	}
 }
 
+// A node with no warm pool and no checkpoint image serves only COLD.
 func TestForcedModesUnavailable(t *testing.T) {
 	e := startEnv(t, nil)
 	before := len(e.rt.Calls())
@@ -1322,6 +1324,7 @@ func TestNewManagerValidates(t *testing.T) {
 		"cpu":           func(c *Config, _ *Deps) { c.CPUMillis = 0 },
 		"memory":        func(c *Config, _ *Deps) { c.MemoryBytes = -1 },
 		"max":           func(c *Config, _ *Deps) { c.MaxSandboxes = 0 },
+		"pool":          func(c *Config, _ *Deps) { c.WarmPoolSize = -1 },
 		"rootfs":        func(c *Config, _ *Deps) { c.RootFS = "rel" },
 		"state":         func(c *Config, _ *Deps) { c.StateDir = "" },
 		"runtime":       func(_ *Config, d *Deps) { d.Runtime = nil },

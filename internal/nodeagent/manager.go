@@ -73,13 +73,14 @@ const (
 var nodeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
 
 // Manager owns the sandboxes of one node: the table of entries, admission
-// against the node's capacity, the start and teardown steps, the TTL reaper
-// and the liveness check.
+// against the node's capacity, the start and teardown steps, the warm pool
+// (pool.go), the TTL reaper and the liveness check.
 //
-// Locking: mu guards the table, the image directory, and each entry's state,
-// pid and start mode. Each entry also has a lifecycle lock (sandbox.op) held
-// for the whole of a Create or a destroy, so those never run at once on one
-// entry; mu is never held while waiting for that lock or while calling runsc.
+// Locking: mu guards the table, the pool, the image directory, and each
+// entry's state, pid and start mode. Each entry also has a lifecycle lock
+// (sandbox.op) held for the whole of a Create or a destroy, so those never
+// run at once on one entry; mu is never held while waiting for that lock or
+// while calling runsc.
 type Manager struct {
 	cfg Config
 	rt  runsc.Runtime // every call is traced as runsc.<method>
@@ -93,6 +94,7 @@ type Manager struct {
 	destroyLookedUp      func(e *sandbox)        // called by Destroy before it destroys e
 	fsync                func(path string) error // fsyncPath: syncs a file or directory
 	restoreReadyTimeout  time.Duration           // the readiness bound after a restore
+	poolRetry            time.Duration           // the refill loop's wait after a failed start
 
 	mu            sync.Mutex
 	sandboxes     map[string]*sandbox // by sandbox ID
@@ -104,6 +106,12 @@ type Manager struct {
 	serving       bool                // Start finished; Create is open
 	started       bool
 	closed        bool
+
+	// The warm pool. Pool sandboxes are not in the table until claimed.
+	warm     []*sandbox        // ready to be claimed, oldest first
+	fill     *poolFill         // the pool sandbox being started, or nil
+	dropping map[*sandbox]bool // pool sandboxes being torn down
+	refill   chan struct{}     // wakes the refill loop (buffer of one)
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -122,6 +130,8 @@ func NewManager(cfg Config, deps Deps) (*Manager, error) {
 	case cfg.CPUMillis <= 0 || cfg.MemoryBytes <= 0 || cfg.MaxSandboxes <= 0:
 		return nil, fmt.Errorf("nodeagent: capacity must be positive, got %dm, %d bytes, %d sandboxes",
 			cfg.CPUMillis, cfg.MemoryBytes, cfg.MaxSandboxes)
+	case cfg.WarmPoolSize < 0:
+		return nil, fmt.Errorf("nodeagent: WarmPoolSize must not be negative, got %d", cfg.WarmPoolSize)
 	case !filepath.IsAbs(cfg.RootFS) || !filepath.IsAbs(cfg.StateDir):
 		return nil, fmt.Errorf("nodeagent: RootFS %q and StateDir %q must be absolute paths", cfg.RootFS, cfg.StateDir)
 	}
@@ -141,15 +151,18 @@ func NewManager(cfg Config, deps Deps) (*Manager, error) {
 	return &Manager{
 		cfg: cfg, rt: tracedRuntime{deps.Runtime}, cg: deps.Cgroups, net: deps.Net, now: now,
 		processAlive: pidAlive, fsync: fsyncPath, restoreReadyTimeout: defaultRestoreReadyTimeout,
-		reapEvery: reapInterval, liveEvery: livenessInterval,
+		reapEvery: reapInterval, liveEvery: livenessInterval, poolRetry: defaultPoolRetry,
 		sandboxes: map[string]*sandbox{},
+		dropping:  map[*sandbox]bool{},
+		refill:    make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 	}, nil
 }
 
 // Start removes what an earlier agent with this node ID left behind, makes
 // sure the checkpoint image exists (when CheckpointDir is set), then starts
-// the reaper and the liveness loop, which run until Close. Create is refused
+// the reaper, the liveness loop and (with a WarmPoolSize) the refill loop
+// of the warm pool, which run until Close. Create is refused
 // until Start has succeeded: the leftover sweep deletes every container under
 // the runsc root. A failed image build is logged and does not fail Start:
 // the node then serves cold starts.
@@ -175,6 +188,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.loops.Add(2)
 	go m.loop(m.reapEvery, m.reapExpired)
 	go m.loop(m.liveEvery, m.checkLiveness)
+	if m.cfg.WarmPoolSize > 0 {
+		m.loops.Add(1)
+		go m.refillLoop()
+	}
 	m.mu.Lock()
 	m.serving = !m.closed
 	m.mu.Unlock()
@@ -182,11 +199,13 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Create starts a sandbox and returns when it is ready, on the path
-// chooseMode picks (spec 7.3). When a restore fails in its own steps, in
-// AUTO mode the restore is undone and the cold path runs once instead, and a
-// forced RESTORE fails with Internal. A failed runsc restore also turns
-// restore off on this node until it restarts, and so do three restored
-// sandboxes in a row that do not get ready (restoreFailed).
+// chooseMode picks (spec 7.3). The warm path claims a pool sandbox; when
+// the pool has emptied by then or the claim fails, AUTO takes the restore
+// or cold path instead, and a forced WARM fails. When a restore fails in
+// its own steps, in AUTO mode the restore is undone and the cold path runs
+// once instead, and a forced RESTORE fails with Internal. A failed runsc
+// restore also turns restore off on this node until it restarts, and so do
+// three restored sandboxes in a row that do not get ready (restoreFailed).
 func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (resp *gssv1.NodeCreateResponse, err error) {
 	begin := time.Now() // ready_latency is a measurement: real time, not Deps.Now
 	ctx, span := startSpan(ctx, "node.create",
@@ -211,7 +230,7 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	}
 	egress := len(spec.GetEgressAllow()) > 0
 	imageDir := m.restoreImage()
-	mode, err := chooseMode(spec.GetStartMode(), egress, noWarmPool, imageDir != "")
+	mode, err := chooseMode(spec.GetStartMode(), egress, m.WarmReady(), imageDir != "")
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +239,21 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	}
 	span.SetAttributes(attribute.String("start.mode", modeName(mode)))
 
+	if mode == gssv1.StartMode_START_MODE_WARM {
+		miss, err := m.claim(ctx, id, inc, spec)
+		if err == nil {
+			return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(time.Since(begin))}, nil
+		}
+		if !miss || spec.GetStartMode() != gssv1.StartMode_START_MODE_AUTO {
+			return nil, err
+		}
+		mode = gssv1.StartMode_START_MODE_COLD
+		if imageDir != "" {
+			mode = gssv1.StartMode_START_MODE_RESTORE
+		}
+		span.SetAttributes(attribute.String("start.mode", modeName(mode)))
+	}
+
 	e, err := m.reserve(ctx, id, inc, spec, mode)
 	if err != nil {
 		return nil, err
@@ -227,16 +261,11 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	defer e.unlock()
 	var step string
 	if mode == gssv1.StartMode_START_MODE_RESTORE {
-		step, err = m.startSandbox(ctx, e, imageDir)
-		if err == nil {
-			m.restoreSucceeded()
-		} else if restoreStep(step) && ctx.Err() == nil {
-			m.restoreFailed(step, err)
-			if spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO {
-				mode = gssv1.StartMode_START_MODE_COLD
-				span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
-				step, err = m.coldAfterRestore(ctx, e, step, err)
-			}
+		step, err = m.restoreSandbox(ctx, e, imageDir)
+		if err != nil && restoreStep(step) && ctx.Err() == nil && spec.GetStartMode() == gssv1.StartMode_START_MODE_AUTO {
+			mode = gssv1.StartMode_START_MODE_COLD
+			span.SetAttributes(attribute.String("start.mode", modeName(mode)), attribute.Bool("start.fallback", true))
+			step, err = m.coldAfterRestore(ctx, e, step, err)
 		}
 	} else {
 		step, err = m.startSandbox(ctx, e, "")
@@ -259,10 +288,6 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	m.mu.Unlock()
 	return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(latency)}, nil
 }
-
-// noWarmPool is the number of ready pooled sandboxes until the node has a
-// warm pool.
-const noWarmPool = 0
 
 // chooseMode is the whole start-path policy (spec 7.3). AUTO takes the warm
 // pool for a no-network sandbox when it has a ready sandbox, else restores
@@ -304,6 +329,20 @@ func chooseMode(requested gssv1.StartMode, hasEgress bool, poolReady int, imageR
 // step the cold path shares and would fail the same way.
 func restoreStep(step string) bool { return step == "runsc.restore" || step == "sandbox.ready" }
 
+// restoreSandbox runs the restore path for e from imageDir (startSandbox)
+// and counts its outcome for the image's drop rule: restoreSucceeded, or
+// restoreFailed for a failure in a step of the restore's own. A restore
+// whose ctx ended does not count. Creates and pool starts both use it.
+func (m *Manager) restoreSandbox(ctx context.Context, e *sandbox, imageDir string) (string, error) {
+	step, err := m.startSandbox(ctx, e, imageDir)
+	if err == nil {
+		m.restoreSucceeded()
+	} else if restoreStep(step) && ctx.Err() == nil {
+		m.restoreFailed(step, err)
+	}
+	return step, err
+}
+
 // coldAfterRestore is the AUTO fallback after the restore path failed with
 // err in step: it removes everything the restore made (container, bundle,
 // cgroup, network), then runs the cold path for the same entry once.
@@ -331,10 +370,12 @@ func modeName(mode gssv1.StartMode) string {
 }
 
 // reserve puts a new starting entry for (id, inc) in the table, with its
-// lifecycle lock held by the caller. A live entry at the same or a higher
-// incarnation is AlreadyExists. Any other entry with that ID (a live older
-// incarnation the scheduler has moved on from, or one being destroyed) is
-// destroyed first.
+// lifecycle lock held by the caller: for mode WARM a claimed pool sandbox
+// (errPoolEmpty if there is none), else a new entry, which on a node at
+// MaxSandboxes takes the place of a pool sandbox. A live entry at the same
+// or a higher incarnation is AlreadyExists. Any other entry with that ID (a
+// live older incarnation the scheduler has moved on from, or one being
+// destroyed) is destroyed first.
 func (m *Manager) reserve(ctx context.Context, id string, inc int32, spec *gssv1.SandboxSpec, mode gssv1.StartMode) (*sandbox, error) {
 	for {
 		m.mu.Lock()
@@ -348,9 +389,29 @@ func (m *Manager) reserve(ctx context.Context, id string, inc int32, spec *gssv1
 				m.mu.Unlock()
 				return nil, err
 			}
+			if mode == gssv1.StartMode_START_MODE_WARM {
+				// A claim moves a sandbox from the pool to the table: the
+				// node holds no more sandboxes than before.
+				e := m.claimLocked(id, inc, spec)
+				m.mu.Unlock()
+				if e == nil {
+					return nil, errPoolEmpty
+				}
+				return e, nil
+			}
+			wait, err := m.roomLocked()
+			if err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
 			e := m.newSandbox(id, inc, spec, mode)
 			m.sandboxes[id] = e
 			m.mu.Unlock()
+			if wait != nil {
+				if err := wait(ctx); err != nil {
+					return nil, m.unreserve(ctx, e, err)
+				}
+			}
 			return e, nil
 		}
 		live := old.state == stateStarting || old.state == stateReady
@@ -368,13 +429,29 @@ func (m *Manager) reserve(ctx context.Context, id string, inc int32, spec *gssv1
 	}
 }
 
-// admitLocked checks that spec fits next to every entry in the table
-// (including ones still being torn down: they hold their resources until
-// they are gone). Call with mu held.
-func (m *Manager) admitLocked(spec *gssv1.SandboxSpec) error {
-	if len(m.sandboxes) >= m.cfg.MaxSandboxes {
-		return status.Errorf(codes.ResourceExhausted, "node %s holds %d sandboxes, its maximum", m.cfg.NodeID, len(m.sandboxes))
+// unreserve takes e, a reserved entry that has started nothing, out of the
+// table again, after making room for it failed with err, and releases its
+// lifecycle lock.
+func (m *Manager) unreserve(ctx context.Context, e *sandbox, err error) error {
+	m.mu.Lock()
+	e.state = stateDestroying
+	m.mu.Unlock()
+	rerr := m.remove(ctx, e)
+	e.unlock()
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
 	}
+	if rerr != nil {
+		err = fmt.Errorf("%w (cleanup failed: %v)", err, rerr)
+	}
+	return status.Errorf(codes.Internal, "create %s: remove a pool sandbox to make room: %v", e.ref.ID, err)
+}
+
+// admitLocked checks that spec's CPU and memory fit next to every entry in
+// the table (including ones still being torn down: they hold their
+// resources until they are gone). Pool sandboxes count only once claimed;
+// the number of sandboxes is roomLocked's check. Call with mu held.
+func (m *Manager) admitLocked(spec *gssv1.SandboxSpec) error {
 	var cpu, mem int64
 	for _, e := range m.sandboxes {
 		cpu += e.spec.GetResources().GetCpuMillis()
@@ -481,8 +558,9 @@ func (m *Manager) List() []*gssv1.NodeSandbox {
 	return out
 }
 
-// Close refuses new Creates, stops the loops and destroys every sandbox,
-// waiting (bounded by ctx) for Creates in flight. A second Close returns nil.
+// Close refuses new Creates, ends a pool start in flight, stops the loops
+// and destroys every sandbox, pool sandboxes too, waiting (bounded by ctx)
+// for Creates in flight. A second Close returns nil.
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
@@ -490,14 +568,25 @@ func (m *Manager) Close(ctx context.Context) error {
 		return nil
 	}
 	m.closed, m.serving = true, false
+	if m.fill != nil {
+		m.fill.cancel() // the refill loop tears it down before it stops
+	}
+	pooled := m.warm
+	m.warm = nil
+	for _, p := range pooled {
+		m.dropping[p] = true
+	}
+	m.mu.Unlock()
+
+	m.stopLoops()
+	// Taken after the loops stopped, so that it has what they left broken.
+	m.mu.Lock()
 	entries := make([]*sandbox, 0, len(m.sandboxes))
 	for _, e := range m.sandboxes {
 		entries = append(entries, e)
 	}
 	m.mu.Unlock()
-
-	m.stopLoops()
-	errs := make([]error, len(entries))
+	errs := make([]error, len(entries)+len(pooled))
 	var wg sync.WaitGroup
 	for i, e := range entries {
 		wg.Add(1)
@@ -508,11 +597,21 @@ func (m *Manager) Close(ctx context.Context) error {
 			}
 		}()
 	}
+	for i, p := range pooled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.dropPooled(ctx, p, "close"); err != nil {
+				errs[len(entries)+i] = fmt.Errorf("destroy %s: %w", p.ref.ID, err)
+			}
+		}()
+	}
 	wg.Wait()
 	return errors.Join(errs...)
 }
 
-// stopLoops stops the reaper and the liveness loop and waits for them.
+// stopLoops stops the reaper, the liveness loop and the refill loop and
+// waits for them.
 func (m *Manager) stopLoops() {
 	m.stopOnce.Do(func() { close(m.stop) })
 	m.loops.Wait()
@@ -552,7 +651,7 @@ func (m *Manager) reapExpired() {
 
 // checkLiveness removes ready sandboxes whose runsc sandbox process is gone
 // (the scheduler notices them missing from heartbeats), and retries the
-// teardown of broken ones.
+// teardown of broken ones. It also drops dead pool sandboxes (checkPool).
 func (m *Manager) checkLiveness() {
 	type check struct {
 		e   *sandbox
@@ -578,6 +677,7 @@ func (m *Manager) checkLiveness() {
 	for _, e := range broken {
 		m.backgroundDestroy(e, "retry")
 	}
+	m.checkPool()
 }
 
 func (m *Manager) backgroundDestroy(e *sandbox, reason string) {

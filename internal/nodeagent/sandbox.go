@@ -59,7 +59,9 @@ const (
 // sandbox is one entry of the manager's table, keyed by sandbox ID. Every
 // entry uses its share of the node's capacity until it is gone.
 type sandbox struct {
-	// Set before the entry is in the table, then never changed.
+	// Set before the entry is in the table, then never changed. A pool
+	// sandbox gets its id, incarnation, spec and expiry when a Create claims
+	// it, as it enters the table.
 	id          string
 	incarnation int32
 	spec        *gssv1.SandboxSpec // defaulted and validated
@@ -234,6 +236,7 @@ func (m *Manager) remove(ctx context.Context, e *sandbox) error {
 	if m.sandboxes[e.id] == e {
 		delete(m.sandboxes, e.id)
 	}
+	m.kickRefill() // the pool may have room again
 	return nil
 }
 

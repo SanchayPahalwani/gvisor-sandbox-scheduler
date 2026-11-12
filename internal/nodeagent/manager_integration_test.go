@@ -513,3 +513,107 @@ func TestRealColdStillWorks(t *testing.T) {
 		t.Errorf("cold sandbox: exit %v, stdout %q, stderr %q", exit, r.stdout.String(), r.stderr.String())
 	}
 }
+
+// waitWarmReady polls m until n pool sandboxes are ready, for up to limit,
+// and returns how long it took.
+func waitWarmReady(t *testing.T, m *Manager, n int, limit time.Duration, what string) time.Duration {
+	t.Helper()
+	begin := time.Now()
+	for m.WarmReady() != n {
+		if time.Since(begin) > limit {
+			t.Fatalf("%s: WarmReady = %d after %v, want %d", what, m.WarmReady(), limit, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return time.Since(begin)
+}
+
+func TestRealWarmClaim(t *testing.T) {
+	n := newRealNode(t)
+	m := n.managerConfig(t, nil, func(c *Config) {
+		c.CheckpointDir = filepath.Join(n.state, "checkpoints")
+		c.WarmPoolSize = 2
+	})
+	closed := false
+	t.Cleanup(func() {
+		if closed {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := m.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if !m.ImageReady() {
+		t.Fatal("Start did not build the checkpoint image")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	d := waitWarmReady(t, m, 2, time.Minute, "pool after Start")
+	t.Logf("pool full %v after Start", d)
+	if got := n.listContainers(t); len(got) != 2 || !strings.HasPrefix(got[0], "warm_") || !strings.HasPrefix(got[1], "warm_") {
+		t.Errorf("runsc list = %q, want two pool sandboxes", got)
+	}
+	if got := m.List(); len(got) != 0 {
+		t.Errorf("List = %v, want no pool sandboxes", got)
+	}
+
+	resp, err := m.Create(ctx, &gssv1.NodeCreateRequest{SandboxId: "sb-1", Incarnation: 1,
+		Spec: &gssv1.SandboxSpec{Resources: &gssv1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := time.Now()
+	if resp.GetStartedAs() != gssv1.StartMode_START_MODE_WARM {
+		t.Fatalf("started as %v, want WARM", resp.GetStartedAs())
+	}
+	lat := resp.GetReadyLatency().AsDuration()
+	t.Logf("warm ready latency %v", lat)
+	if lat <= 0 || lat >= 50*time.Millisecond {
+		t.Errorf("warm ready latency %v, want under 50ms", lat)
+	}
+	m.mu.Lock()
+	rid := m.sandboxes["sb-1"].ref.ID
+	m.mu.Unlock()
+	if !strings.HasPrefix(rid, "warm_") {
+		t.Errorf("sb-1 runs as %s, want a pool sandbox", rid)
+	}
+	if got := n.readCgroup(t, rid, "cpu.max"); got != "100000 100000" {
+		t.Errorf("cpu.max = %q, want \"100000 100000\"", got)
+	}
+	if got := n.readCgroup(t, rid, "memory.max"); got != "536870912" {
+		t.Errorf("memory.max = %q, want 536870912", got)
+	}
+	r := runExec(ctx, m, pyReq("sb-1", `import sys; print("pandas" in sys.modules)`), nil)
+	if exit := r.ok(t, "python in the claimed sandbox"); exit.GetCode() != 0 || r.stdout.String() != "True\n" {
+		t.Errorf("exit %v, stdout %q, stderr %q; want 0 and \"True\\n\"", exit, r.stdout.String(), r.stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(n.state, "execs", rid)); err != nil {
+		t.Errorf("exec pid directory of %s: %v", rid, err)
+	}
+
+	waitWarmReady(t, m, 2, 10*time.Second-time.Since(claimed), "pool after the claim")
+	t.Logf("pool full again %v after the claim", time.Since(claimed))
+	if got := n.listContainers(t); len(got) != 3 {
+		t.Errorf("runsc list = %q, want sb-1's and two pool sandboxes", got)
+	}
+
+	if err := m.Destroy(ctx, "sb-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(n.cgroupDir(rid)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("cgroup of %s after Destroy: %v", rid, err)
+	}
+	closed = true
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.listContainers(t); len(got) != 0 {
+		t.Errorf("runsc list after Close = %q", got)
+	}
+	if got := childDirs(t, filepath.Join(cgroupRoot, "gss", n.id)); len(got) != 0 {
+		t.Errorf("sandbox cgroups after Close = %q", got)
+	}
+}
