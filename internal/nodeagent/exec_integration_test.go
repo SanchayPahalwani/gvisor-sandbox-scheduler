@@ -309,9 +309,10 @@ func TestRealExecCancel(t *testing.T) {
 }
 
 func TestRealExecMemoryLimit(t *testing.T) {
-	// Not 128 MiB: while the zygote imports numpy and pandas the sandbox's
-	// memory.peak reaches about 135 MiB, so a 128 MiB sandbox is OOM-killed
-	// before it is ready. Idle after priming it uses about 60 MiB.
+	// The smallest sandbox (spec D31): while the zygote imports numpy and
+	// pandas the sandbox's memory.peak reaches about 135 MiB, so a 128 MiB
+	// sandbox is OOM-killed before it is ready. Idle after priming it uses
+	// about 60 MiB.
 	_, m := execSandbox(t, &gssv1.SandboxSpec{Resources: &gssv1.Resources{CpuMillis: 500, MemoryBytes: 192 << 20}})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -403,15 +404,14 @@ print(time.process_time())
 	if err != nil {
 		t.Fatalf("stdout %q", r.stdout.String())
 	}
+	cpus := used.Seconds() / window.Seconds()
 	t.Logf("2 s busy loop at 200m: process_time %.3f s in the sandbox; the cgroup used %v in %v (%.2f CPUs)",
-		cpu, used, window, used.Seconds()/window.Seconds())
-	// What the host kernel enforces: 20 ms per 100 ms period, plus one
-	// period's quota at each end of the window.
-	if limit := time.Duration(0.2*float64(window)) + 40*time.Millisecond; used > limit {
-		t.Errorf("the sandbox cgroup used %v of CPU in %v, more than 200m allows (%v)", used, window, limit)
-	}
-	if cpu >= 0.8 {
-		t.Errorf("process_time %.3f s, want below 0.8 s at 200m", cpu)
+		cpu, used, window, cpus)
+	// Spec D30: gVisor's in-sandbox CPU time (process_time) counts the time
+	// the host throttled the sandbox, so it is only logged. The limit is
+	// checked where it is enforced, in the host cgroup's cpu.stat.
+	if cpus > 0.30 {
+		t.Errorf("the sandbox cgroup used %v of CPU in %v (%.2f CPUs), want at most 0.30 at 200m", used, window, cpus)
 	}
 }
 

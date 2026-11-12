@@ -15,7 +15,7 @@ const (
 	DefaultCPUMillis   int64 = 500
 	DefaultMemoryBytes int64 = 256 << 20
 	MinCPUMillis       int64 = 100
-	MinMemoryBytes     int64 = 128 << 20
+	MinMemoryBytes     int64 = 192 << 20 // spec D31: a cold start peaks at about 135 MiB
 	MaxCPUMillis       int64 = 256000
 	MaxMemoryBytes     int64 = 1 << 40
 
@@ -58,7 +58,7 @@ func ValidateSpec(s *SandboxSpec) error {
 	}
 	mem := s.GetResources().GetMemoryBytes()
 	if mem < MinMemoryBytes {
-		return fmt.Errorf("memory_bytes %d is below the minimum %d (128 MiB)", mem, MinMemoryBytes)
+		return fmt.Errorf("memory_bytes %d is below the minimum %d (192 MiB)", mem, MinMemoryBytes)
 	}
 	if mem > MaxMemoryBytes {
 		return fmt.Errorf("memory_bytes %d exceeds the maximum %d (1 TiB)", mem, MaxMemoryBytes)
