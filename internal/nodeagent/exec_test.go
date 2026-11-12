@@ -543,6 +543,9 @@ func TestExecWhileDestroying(t *testing.T) {
 	sent := 0
 	err := e.m.Exec(context.Background(), argvReq("sb-1", "true"), func(*gssv1.ExecEvent) error { sent++; return nil })
 	wantCode(t, err, codes.NotFound, "Exec during the teardown")
+	if !strings.Contains(err.Error(), "being destroyed") {
+		t.Errorf("error %v does not say the sandbox is being destroyed", err)
+	}
 	if sent != 0 {
 		t.Errorf("send called %d times", sent)
 	}
@@ -593,6 +596,39 @@ func TestExecTimeoutWhileSendBlocked(t *testing.T) {
 	}
 	if got := rec.Kills(); len(got) != 1 || !strings.HasSuffix(got[0], " <nil>") {
 		t.Errorf("kills = %q, want one successful kill", got)
+	}
+}
+
+// A clean exit stays a clean exit when the timer fires after the program
+// exited but while send is still blocked on its last chunk.
+func TestExecCleanExitNotTimeoutWhileSendBlocked(t *testing.T) {
+	var rec *killRecorder
+	e := readyEnv(t, withKills(&rec))
+	e.rt.ExecFunc = func(ctx context.Context, ref runsc.Ref, s runsc.ExecSpec) (int, error) {
+		fmt.Fprint(s.Stdout, "last")
+		time.Sleep(time.Millisecond)
+		return 0, nil
+	}
+	var c collector
+	send := func(ev *gssv1.ExecEvent) error {
+		if ev.GetStdout() != nil {
+			time.Sleep(200 * time.Millisecond) // past the 50ms timeout
+		}
+		return c.send(ev)
+	}
+	req := argvReq("sb-1", "echo", "last")
+	req.Timeout = durationpb.New(50 * time.Millisecond)
+	if err := e.m.Exec(context.Background(), req, send); err != nil {
+		t.Fatal(err)
+	}
+	if exit := c.exit(t); exit.GetCode() != 0 || exit.GetTimedOut() {
+		t.Errorf("exit = %v, want code 0", exit)
+	}
+	if got := c.stream(false); got != "last" {
+		t.Errorf("stdout = %q", got)
+	}
+	if got := rec.Kills(); len(got) != 0 {
+		t.Errorf("kills = %q, want none for a process that exited", got)
 	}
 }
 

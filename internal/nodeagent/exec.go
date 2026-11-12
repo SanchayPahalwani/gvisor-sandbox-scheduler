@@ -315,7 +315,7 @@ func (m *Manager) execIn(ctx, rctx context.Context, cancel context.CancelFunc, e
 	// timer nor the loop waits for runsc kill.
 	var (
 		mu                 sync.Mutex
-		stopped, over      bool // a stop started; the runtime call has returned
+		stopped, over      bool // a stop started; the loop saw the runtime call return
 		timedOut, killSent bool
 		killed             = make(chan struct{}) // the stop's kill and cancel are done
 	)
@@ -324,6 +324,14 @@ func (m *Manager) execIn(ctx, rctx context.Context, cancel context.CancelFunc, e
 		defer mu.Unlock()
 		if stopped || over {
 			return
+		}
+		// The runtime call may have returned while the loop is still in
+		// send: the process has exited, so there is nothing to stop and its
+		// exit is not a timeout.
+		select {
+		case <-runDone:
+			return
+		default:
 		}
 		stopped, timedOut = true, timeout
 		go func() {
