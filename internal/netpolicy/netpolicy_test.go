@@ -335,13 +335,18 @@ func TestInitAndClose(t *testing.T) {
 }
 
 func TestCloseKeepsTableWhenCleanupFails(t *testing.T) {
-	r := &recorder{fail: func(cmd string) error {
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if err := m.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.reset()
+	r.fail = func(cmd string) error {
 		if cmd == "ip netns list" {
 			return errors.New("ip: boom")
 		}
 		return nil
-	}}
-	m := newTestManager(t, "10.200.0.0/20", r)
+	}
 	if err := m.Close(context.Background()); err == nil {
 		t.Fatal("Close: want error")
 	}
@@ -544,6 +549,25 @@ func TestInitRefusesVethPrefixCollision(t *testing.T) {
 	if len(r.cmds) != 2 {
 		t.Errorf("Init changed something: %v", r.cmds)
 	}
+	// Close after a refused Init must not delete links by the shared prefix.
+	r.reset()
+	if err := m.Close(context.Background()); err != nil {
+		t.Errorf("Close after a refused Init: %v", err)
+	}
+	if len(r.cmds) != 0 {
+		t.Errorf("Close after a refused Init ran commands: %v", r.cmds)
+	}
+}
+
+func TestCloseWithoutInitIsNoop(t *testing.T) {
+	r := &recorder{}
+	m := newTestManager(t, "10.200.0.0/20", r)
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.cmds) != 0 {
+		t.Errorf("Close without Init ran commands: %v", r.cmds)
+	}
 }
 
 func TestSetupAfterClose(t *testing.T) {
@@ -587,6 +611,9 @@ func TestCloseWaitsForSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	if err := m.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
 	setupDone := make(chan error, 1)
 	go func() {
 		_, _, err := m.Setup(ctx, "sb1", []string{"1.1.1.1:443"})

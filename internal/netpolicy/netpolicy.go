@@ -55,6 +55,7 @@ type Manager struct {
 
 	mu      sync.Mutex
 	closed  bool // set by Close; Setup and Init then fail
+	inited  bool // set when Init succeeded; Close does nothing until then
 	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
 	gen     uint32             // last generation issued; never 0 once issued
 	used    map[int]string     // slot -> sandbox id
@@ -106,7 +107,9 @@ func (m *Manager) SetResolver(resolve func(ctx context.Context, host string) ([]
 
 // Init removes this node's leftovers, enables net.ipv4.ip_forward and creates
 // the table. It refuses, changing nothing, when a table with this node's name
-// belongs to another node or another node's table covers an overlapping range.
+// belongs to another node, another node's table covers an overlapping range,
+// or another node's veths share this node's prefix. It waits for in-flight
+// Setup and Teardown calls to finish (that wait does not observe ctx).
 func (m *Manager) Init(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
@@ -126,6 +129,9 @@ func (m *Manager) Init(ctx context.Context) error {
 	if _, err := m.run(ctx, renderInit(m.names, m.cidr), "nft", "-f", "-"); err != nil {
 		return fmt.Errorf("netpolicy: create table %s: %w", m.names.table, err)
 	}
+	m.mu.Lock()
+	m.inited = true
+	m.mu.Unlock()
 	return nil
 }
 
@@ -167,13 +173,20 @@ func (m *Manager) checkOtherNodes(ctx context.Context) error {
 // Close removes every namespace and veth of this node and then the table. If
 // removing them fails the table stays (running sandboxes stay filtered) and
 // the error is returned. net.ipv4.ip_forward stays on: it is VM-wide and other
-// nodes rely on it.
+// nodes rely on it. Close waits for in-flight Setup and Teardown calls to
+// finish (that wait does not observe ctx). Unless Init succeeded, Close runs
+// no commands and returns nil: the names it would delete by prefix may belong
+// to another node (Init refuses exactly that case).
 func (m *Manager) Close(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
 	m.mu.Lock()
 	m.closed = true
+	inited := m.inited
 	m.mu.Unlock()
+	if !inited {
+		return nil
+	}
 	if err := m.removeLeftovers(ctx); err != nil {
 		return err
 	}
