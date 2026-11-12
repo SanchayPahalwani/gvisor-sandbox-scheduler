@@ -25,12 +25,12 @@ func TestParseFlagsDefaults(t *testing.T) {
 		t.Errorf("options = %+v\nwant      %+v", *o, want)
 	}
 
-	o, err = parseFlags([]string{"--node-id=n1", "--checkpoint-dir=", "--warm-pool-size=0", "--listen=127.0.0.1:0"}, io.Discard)
+	o, err = parseFlags([]string{"--node-id=n1", "--checkpoint-dir=", "--warm-pool-size=0", "--listen=127.0.0.1:0", "--scheduler=127.0.0.1:7000"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" {
-		t.Errorf("checkpoint dir %q, pool %d, listen %q", o.checkpointDir, o.warmPoolSize, o.listen)
+	if o.checkpointDir != "" || o.warmPoolSize != 0 || o.listen != "127.0.0.1:0" || o.scheduler != "127.0.0.1:7000" {
+		t.Errorf("checkpoint dir %q, pool %d, listen %q, scheduler %q", o.checkpointDir, o.warmPoolSize, o.listen, o.scheduler)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestParseFlagsRejects(t *testing.T) {
 		{[]string{"--node-id", strings.Repeat("a", 33)}, "--node-id"}, // at most 32
 		{[]string{"--node-id", "n1", "--listen", "7101"}, "--listen"}, // no port separator
 		{[]string{"--node-id", "n1", "--advertise", "host"}, "--advertise"},
-		{[]string{"--node-id", "n1", "--scheduler", "127.0.0.1:7000"}, "not implemented"},
+		{[]string{"--node-id", "n1", "--scheduler", "7000"}, "--scheduler"}, // no port separator
 		{[]string{"--node-id", "n1", "--cpu-millis", "0"}, "positive"},
 		{[]string{"--node-id", "n1", "--memory-mib", "-1"}, "positive"},
 		{[]string{"--node-id", "n1", "--max-sandboxes", "0"}, "positive"},

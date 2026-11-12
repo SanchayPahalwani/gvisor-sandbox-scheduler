@@ -161,7 +161,9 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 		}
 	}
 	if o.scheduler != "" {
-		return fail("--scheduler: registering with a scheduler is not implemented yet; leave it empty to run standalone")
+		if _, _, err := net.SplitHostPort(o.scheduler); err != nil {
+			return fail("--scheduler %q: %v", o.scheduler, err)
+		}
 	}
 	if o.cpuMillis <= 0 || memoryMiB <= 0 || o.maxSandboxes <= 0 {
 		return fail("--cpu-millis, --memory-mib and --max-sandboxes must be positive, got %d, %d and %d", o.cpuMillis, memoryMiB, o.maxSandboxes)
@@ -231,6 +233,14 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		"cpu_millis", o.cpuMillis, "memory_bytes", o.memoryBytes, "max_sandboxes", o.maxSandboxes,
 		"warm_pool_size", o.warmPoolSize, "checkpoint_dir", o.checkpointDir, "egress_cidr", o.egressCIDR.String())
 
+	stopHeartbeats := func() error { return nil }
+	if o.scheduler != "" {
+		if stopHeartbeats, err = n.startHeartbeats(); err != nil {
+			stop()
+			return errors.Join(err, n.shutdown(srv))
+		}
+	}
+
 	var serveErr error
 	select {
 	case <-ctx.Done():
@@ -239,7 +249,10 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		serveErr = fmt.Errorf("serve: %w", serveErr)
 	}
 	stop()
-	if err := errors.Join(serveErr, n.shutdown(srv)); err != nil {
+	// The heartbeats stop before the sandboxes go: the scheduler then
+	// declares the node dead and moves its sandboxes elsewhere.
+	hbErr := stopHeartbeats()
+	if err := errors.Join(serveErr, hbErr, n.shutdown(srv)); err != nil {
 		return err
 	}
 	slog.Info("node agent stopped", "node", o.nodeID)
@@ -345,6 +358,33 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, s
 		return nil, false, err
 	}
 	return n, false, nil
+}
+
+// startHeartbeats registers the node with the scheduler at --scheduler and
+// heartbeats in the background (spec 8.2). The returned function stops the
+// heartbeats and closes the connection.
+func (n *node) startHeartbeats() (stop func() error, err error) {
+	conn, err := grpc.NewClient(n.o.scheduler, nodeagent.SchedulerDialOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("--scheduler %q: %w", n.o.scheduler, err)
+	}
+	info := &gssv1.NodeInfo{
+		Id: n.o.nodeID, Group: n.o.group, Address: n.advertise,
+		Capacity:     &gssv1.Resources{CpuMillis: n.o.cpuMillis, MemoryBytes: n.o.memoryBytes},
+		MaxSandboxes: int32(n.o.maxSandboxes),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nodeagent.RunHeartbeats(ctx, gssv1.NewClusterServiceClient(conn), info, n.m)
+	}()
+	slog.Info("heartbeating to the scheduler", "node", n.o.nodeID, "scheduler", n.o.scheduler)
+	return func() error {
+		cancel()
+		<-done
+		return conn.Close()
+	}, nil
 }
 
 func (n *node) unlock() {
