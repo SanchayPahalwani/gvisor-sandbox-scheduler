@@ -77,6 +77,10 @@ type sandbox struct {
 	state sandboxState
 	pid   int // the runsc sandbox process, once ready
 
+	// The Execs in flight, guarded by Manager.mu. An Exec adds itself while
+	// the entry is ready; a destroy ends them all when it starts.
+	execs map[*execRun]struct{}
+
 	// The steps done so far, so a teardown undoes exactly those. Only the
 	// holder of op touches them.
 	netUp         bool // Net.Setup succeeded
@@ -181,7 +185,9 @@ func (m *Manager) recordPID(ctx context.Context, e *sandbox) error {
 
 // destroyEntry tears e down and removes it from the table. It first takes
 // e's lifecycle lock, so it waits for an in-flight Create (or another
-// destroy) of e; ctx bounds only that wait. A nil error means e is gone.
+// destroy) of e; ctx bounds only that wait. It does not wait for Execs: it
+// marks each one destroyed and ends its runsc exec client, and each returns
+// Unavailable on its own. A nil error means e is gone.
 func (m *Manager) destroyEntry(ctx context.Context, e *sandbox) error {
 	if err := e.lock(ctx); err != nil {
 		return err
@@ -193,6 +199,10 @@ func (m *Manager) destroyEntry(ctx context.Context, e *sandbox) error {
 		return nil
 	}
 	e.state = stateDestroying // new Execs refuse from here on
+	for run := range e.execs {
+		run.destroyed = true
+		run.cancel()
+	}
 	m.mu.Unlock()
 	return m.remove(ctx, e)
 }
@@ -218,17 +228,21 @@ func (m *Manager) remove(ctx context.Context, e *sandbox) error {
 // teardown undoes the steps recorded in e: runsc delete, network teardown,
 // bundle directory, cgroup. Each step is idempotent and is forgotten once it
 // succeeded. If the delete fails the container may still be running, so the
-// host-side pieces it uses are left for the next attempt.
+// host-side pieces it uses are left for the next attempt. After the delete,
+// every process left in the sandbox's cgroup is killed: one runsc no longer
+// tracks would otherwise keep the cgroup busy for good.
 //
 // It never runs with a cancelled ctx: the caller's may have ended (a
 // cancelled Create), and runsc fails at once on a done context.
 func (m *Manager) teardown(ctx context.Context, e *sandbox) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
+	var killErr error
 	if e.containerMade {
 		if err := m.rt.Delete(ctx, e.ref); err != nil {
 			return fmt.Errorf("runsc.delete: %w", err)
 		}
+		killErr = m.cg.KillTree(e.cgroup)
 	}
 	var errs []error
 	if e.netUp {
@@ -246,8 +260,9 @@ func (m *Manager) teardown(ctx context.Context, e *sandbox) error {
 		}
 	}
 	if e.containerMade {
+		// A failed kill matters only if the cgroup then cannot be removed.
 		if err := m.cg.Remove(e.cgroup); err != nil {
-			errs = append(errs, fmt.Errorf("remove cgroup: %w", err))
+			errs = append(errs, fmt.Errorf("remove cgroup: %w", errors.Join(err, killErr)))
 		} else {
 			e.containerMade = false
 		}

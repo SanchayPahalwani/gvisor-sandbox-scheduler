@@ -16,10 +16,7 @@ import (
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bundle"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	otelcodes "go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -93,6 +90,7 @@ type Manager struct {
 	// Test hooks, set before Start.
 	processAlive         func(pid int) bool
 	reapEvery, liveEvery time.Duration
+	destroyLookedUp      func(e *sandbox) // called by Destroy before it destroys e
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandbox // by sandbox ID
@@ -326,6 +324,7 @@ func (m *Manager) newSandbox(id string, inc int32, spec *gssv1.SandboxSpec, mode
 		expires:   m.now().Add(spec.GetTtl().AsDuration() + m.cfg.TTLGrace),
 		op:        make(chan struct{}, 1),
 		state:     stateStarting,
+		execs:     map[*execRun]struct{}{},
 	}
 	e.op <- struct{}{}
 	return e
@@ -336,7 +335,12 @@ func (m *Manager) bundlesDir() string { return filepath.Join(m.cfg.StateDir, "bu
 // Destroy removes a sandbox. incarnation 0 means whatever is live; otherwise
 // only a live incarnation <= incarnation is destroyed, so an instruction about
 // an old copy cannot remove a newer one. An unknown ID is not an error. A
-// Destroy during a Create of the same sandbox waits for the Create to finish.
+// Destroy during a Create of the same sandbox waits for the Create to finish;
+// Execs in flight end with Unavailable and are not waited for.
+//
+// A Create of a newer incarnation may replace the entry Destroy found before
+// Destroy gets to it, so Destroy looks again after each entry and goes on
+// while it finds a different one that the request covers.
 func (m *Manager) Destroy(ctx context.Context, sandboxID string, incarnation int32) (err error) {
 	ctx, span := startSpan(ctx, "node.destroy",
 		attribute.String("sandbox.id", sandboxID),
@@ -344,19 +348,25 @@ func (m *Manager) Destroy(ctx context.Context, sandboxID string, incarnation int
 		attribute.String("destroy.reason", "request"))
 	defer func() { endSpan(span, err) }()
 
-	m.mu.Lock()
-	e := m.sandboxes[sandboxID]
-	m.mu.Unlock()
-	if e == nil || (incarnation != 0 && e.incarnation > incarnation) {
-		return nil
-	}
-	if err := m.destroyEntry(ctx, e); err != nil {
-		if ctx.Err() != nil {
-			return status.FromContextError(ctx.Err()).Err()
+	var last *sandbox
+	for {
+		m.mu.Lock()
+		e := m.sandboxes[sandboxID]
+		m.mu.Unlock()
+		if e == nil || e == last || (incarnation != 0 && e.incarnation > incarnation) {
+			return nil
 		}
-		return status.Errorf(codes.Internal, "destroy %s: %v", e.ref.ID, err)
+		if m.destroyLookedUp != nil {
+			m.destroyLookedUp(e)
+		}
+		if err := m.destroyEntry(ctx, e); err != nil {
+			if ctx.Err() != nil {
+				return status.FromContextError(ctx.Err()).Err()
+			}
+			return status.Errorf(codes.Internal, "destroy %s: %v", e.ref.ID, err)
+		}
+		last = e
 	}
-	return nil
 }
 
 // destroyFor is a destroy the manager starts itself, traced as node.destroy
@@ -495,106 +505,4 @@ func (m *Manager) backgroundDestroy(e *sandbox, reason string) {
 	if err := m.destroyFor(ctx, e, reason); err != nil {
 		slog.Warn("destroy failed", "sandbox", e.id, "runsc_id", e.ref.ID, "reason", reason, "err", err)
 	}
-}
-
-func startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
-	// The global tracer is looked up on each use so a provider set later
-	// (internal/telemetry, or a test) takes effect.
-	return otel.Tracer("gss").Start(ctx, name, trace.WithAttributes(attrs...))
-}
-
-// endSpan records err, if any, on the span and ends it.
-func endSpan(span trace.Span, err error) {
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
-	}
-	span.End()
-}
-
-// tracedRuntime wraps every Runtime call in a span named runsc.<method>.
-type tracedRuntime struct{ rt runsc.Runtime }
-
-var _ runsc.Runtime = tracedRuntime{}
-
-func refSpan(ctx context.Context, method string, ref runsc.Ref) (context.Context, trace.Span) {
-	return startSpan(ctx, "runsc."+method, attribute.String("runsc.id", ref.ID))
-}
-
-func (t tracedRuntime) Create(ctx context.Context, ref runsc.Ref, bundleDir, logPath string) error {
-	ctx, span := refSpan(ctx, "create", ref)
-	err := t.rt.Create(ctx, ref, bundleDir, logPath)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) Start(ctx context.Context, ref runsc.Ref) error {
-	ctx, span := refSpan(ctx, "start", ref)
-	err := t.rt.Start(ctx, ref)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) Restore(ctx context.Context, ref runsc.Ref, bundleDir, imagePath string) error {
-	ctx, span := refSpan(ctx, "restore", ref)
-	err := t.rt.Restore(ctx, ref, bundleDir, imagePath)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) Checkpoint(ctx context.Context, ref runsc.Ref, imagePath string) error {
-	ctx, span := refSpan(ctx, "checkpoint", ref)
-	err := t.rt.Checkpoint(ctx, ref, imagePath)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) Exec(ctx context.Context, ref runsc.Ref, spec runsc.ExecSpec) (int, error) {
-	ctx, span := refSpan(ctx, "exec", ref)
-	code, err := t.rt.Exec(ctx, ref, spec)
-	span.SetAttributes(attribute.Int("exec.exit_code", code))
-	endSpan(span, err)
-	return code, err
-}
-
-func (t tracedRuntime) KillProcess(ctx context.Context, ref runsc.Ref, internalPID int) error {
-	ctx, span := refSpan(ctx, "kill_process", ref)
-	err := t.rt.KillProcess(ctx, ref, internalPID)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) Delete(ctx context.Context, ref runsc.Ref) error {
-	ctx, span := refSpan(ctx, "delete", ref)
-	err := t.rt.Delete(ctx, ref)
-	endSpan(span, err)
-	return err
-}
-
-func (t tracedRuntime) State(ctx context.Context, ref runsc.Ref) (runsc.State, error) {
-	ctx, span := refSpan(ctx, "state", ref)
-	st, err := t.rt.State(ctx, ref)
-	endSpan(span, err)
-	return st, err
-}
-
-func (t tracedRuntime) List(ctx context.Context) ([]string, error) {
-	ctx, span := startSpan(ctx, "runsc.list")
-	ids, err := t.rt.List(ctx)
-	endSpan(span, err)
-	return ids, err
-}
-
-func (t tracedRuntime) Version(ctx context.Context) (string, error) {
-	ctx, span := startSpan(ctx, "runsc.version")
-	v, err := t.rt.Version(ctx)
-	endSpan(span, err)
-	return v, err
-}
-
-func (t tracedRuntime) RemoveRoot(ctx context.Context) error {
-	ctx, span := startSpan(ctx, "runsc.remove_root")
-	err := t.rt.RemoveRoot(ctx)
-	endSpan(span, err)
-	return err
 }

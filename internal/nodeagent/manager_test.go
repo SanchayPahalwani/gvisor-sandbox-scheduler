@@ -573,11 +573,49 @@ func TestDestroyIdempotent(t *testing.T) {
 	if n := e.cg.count("Remove /gss/n1/sb-1_1_"); n != 1 {
 		t.Errorf("cgroup Remove called %d times: %q", n, e.cg.Calls())
 	}
+	// Processes runsc no longer tracks are killed before the cgroup is removed.
+	if got, want := e.cg.Calls()[2:], []string{"KillTree /gss/n1/sb-1_1_", "Remove /gss/n1/sb-1_1_"}; !slices.Equal(got, want) {
+		t.Errorf("teardown cgroup calls = %q, want %q", got, want)
+	}
 	if exists(e.bundleDir("sb-1_1_")) {
 		t.Error("bundle dir left")
 	}
 	if len(e.rt.Containers()) != 0 || len(e.m.List()) != 0 {
 		t.Errorf("containers %v, list %v", e.rt.Containers(), e.m.List())
+	}
+}
+
+// A Create of a newer incarnation can replace the entry a Destroy looked up
+// before the Destroy gets to it. Destroy then looks again, and removes the
+// new incarnation too when the request covers it.
+func TestDestroyFindsReplacingIncarnation(t *testing.T) {
+	for _, tc := range []struct {
+		incarnation int32
+		want        []string
+	}{
+		{0, nil},                // any incarnation
+		{2, nil},                // up to 2
+		{1, []string{"sb-1/2"}}, // only 1: the replacement stays
+	} {
+		e := newEnv(t, nil)
+		replaced := false
+		e.m.destroyLookedUp = func(s *sandbox) {
+			if s.incarnation == 1 && !replaced {
+				replaced = true
+				e.mustCreate(t, "sb-1", 2, nil) // runs between the lookup and the teardown
+			}
+		}
+		e.start(t)
+		e.mustCreate(t, "sb-1", 1, nil)
+		if err := e.m.Destroy(context.Background(), "sb-1", tc.incarnation); err != nil {
+			t.Fatalf("Destroy(sb-1, %d): %v", tc.incarnation, err)
+		}
+		if !replaced {
+			t.Fatal("the hook did not run")
+		}
+		if got := e.listed(); !slices.Equal(got, tc.want) {
+			t.Errorf("Destroy(sb-1, %d): List = %q, want %q", tc.incarnation, got, tc.want)
+		}
 	}
 }
 
