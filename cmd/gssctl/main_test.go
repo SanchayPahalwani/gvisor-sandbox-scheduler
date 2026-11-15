@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -82,9 +86,23 @@ type fake struct {
 	destroyErr error
 	nodes      []*gssv1.Node
 	sandboxes  []*gssv1.Sandbox
+	// createGate, when set, holds each CreateSandbox until it is closed;
+	// createStarted is closed when the first one arrives.
+	createGate, createStarted chan struct{}
+	// execBlock holds each Exec after its output until the call's context ends;
+	// execStarted is closed when the first one has sent its output.
+	execBlock   bool
+	execStarted chan struct{}
 }
 
 func (f *fake) CreateSandbox(_ context.Context, req *gssv1.CreateSandboxRequest) (*gssv1.Sandbox, error) {
+	f.mu.Lock()
+	gate, started := f.createGate, f.createStarted
+	f.mu.Unlock()
+	if gate != nil {
+		close(started)
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.creates = append(f.creates, proto.Clone(req.GetSpec()).(*gssv1.SandboxSpec))
@@ -99,6 +117,7 @@ func (f *fake) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[gs
 	f.mu.Lock()
 	f.execs = append(f.execs, proto.Clone(req).(*gssv1.ExecRequest))
 	code, timedOut, end := f.exitCode, f.timedOut, f.execEnd
+	block, started := f.execBlock, f.execStarted
 	f.mu.Unlock()
 	out := "1\n"
 	if req.GetPythonCode() != "print(1)" {
@@ -111,6 +130,11 @@ func (f *fake) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[gs
 		if err := stream.Send(ev); err != nil {
 			return err
 		}
+	}
+	if block {
+		close(started)
+		<-stream.Context().Done()
+		return stream.Context().Err()
 	}
 	if end != nil {
 		return end
@@ -187,10 +211,165 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
-func (h *harness) run(args ...string) int {
+func (h *harness) run(args ...string) int { return h.runCtx(context.Background(), args...) }
+
+func (h *harness) runCtx(ctx context.Context, args ...string) int {
 	h.stdout.Reset()
 	h.stderr.Reset()
-	return h.c.main(context.Background(), args)
+	return h.c.main(ctx, args)
+}
+
+// brokenPipe is a stdout whose reader has gone, as with `gssctl run ... | head -1`.
+type brokenPipe struct{}
+
+func (brokenPipe) Write([]byte) (int, error) { return 0, syscall.EPIPE }
+
+// A write to a closed stdout ends the run, and the sandbox is still destroyed.
+func TestRunStdoutBroken(t *testing.T) {
+	h := newHarness(t)
+	h.c.stdout = brokenPipe{}
+	if code := h.run("run", "-c", "print(1)"); code != 1 {
+		t.Errorf("exit code %d, want 1", code)
+	}
+	if !strings.Contains(h.stderr.String(), "broken pipe") {
+		t.Errorf("stderr = %q, want the write error", h.stderr)
+	}
+	if strings.Join(h.f.destroys, " ") != "sb-1" {
+		t.Errorf("destroys = %q, want [sb-1]", h.f.destroys)
+	}
+}
+
+// gssctl catches SIGPIPE and SIGHUP as well as SIGINT and SIGTERM, so that a
+// closed pipe or a hung-up terminal ends the run through the destroy.
+func TestSignals(t *testing.T) {
+	for _, want := range []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE} {
+		if !slices.Contains(signals, want) {
+			t.Errorf("signals %v lack %v", signals, want)
+		}
+	}
+}
+
+// TestHelperProcess is gssctl itself when GSSCTL_HELPER_PROCESS is set: the test
+// below runs the test binary again as a gssctl process, with the arguments after "--".
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GSSCTL_HELPER_PROCESS") != "1" {
+		t.Skip("only as a child of TestRunBrokenPipeProcess")
+	}
+	args := os.Args
+	for i, a := range args {
+		if a == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+	os.Exit(gssctl(args))
+}
+
+// A gssctl process whose stdout reader is gone (gssctl run ... | head -0) is not
+// killed by SIGPIPE: the write fails, the sandbox is destroyed, gssctl exits 1.
+func TestRunBrokenPipeProcess(t *testing.T) {
+	f := &fake{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	gssv1.RegisterSandboxServiceServer(srv, f)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close() // no reader: the first write to stdout raises SIGPIPE
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--",
+		"--scheduler", lis.Addr().String(), "run", "-c", "print(1)")
+	cmd.Env = append(os.Environ(), "GSSCTL_HELPER_PROCESS=1")
+	var stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = w, &stderr
+	err = cmd.Run()
+	w.Close()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Errorf("gssctl ended with %v, want exit status 1; stderr %q", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "broken pipe") {
+		t.Errorf("stderr = %q, want the write error", stderr.String())
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if strings.Join(f.destroys, " ") != "sb-1" {
+		t.Errorf("destroys = %q, want [sb-1]", f.destroys)
+	}
+}
+
+// SIGPIPE is caught but does not end the context (a broken gRPC socket raises it
+// too); SIGHUP ends it.
+func TestNotifyContext(t *testing.T) {
+	ctx, stop := notifyContext(context.Background())
+	defer stop()
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGPIPE); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if ctx.Err() != nil {
+		t.Fatalf("SIGPIPE ended the context: %v", context.Cause(ctx))
+	}
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+		if got := context.Cause(ctx).Error(); got != "signal: hangup" {
+			t.Errorf("cause %q, want signal: hangup", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGHUP did not end the context")
+	}
+}
+
+// Ctrl-C while the program runs: the Exec is cancelled, the sandbox destroyed,
+// and gssctl exits 130.
+func TestRunInterruptedDuringExec(t *testing.T) {
+	h := newHarness(t)
+	h.f.execBlock, h.f.execStarted = true, make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-h.f.execStarted
+		cancel()
+	}()
+	if code := h.runCtx(ctx, "run", "-c", "print(1)"); code != 130 {
+		t.Errorf("exit code %d, want 130; stderr %q", code, h.stderr)
+	}
+	if strings.Join(h.f.destroys, " ") != "sb-1" {
+		t.Errorf("destroys = %q, want [sb-1]", h.f.destroys)
+	}
+	if !strings.Contains(h.stderr.String(), "interrupted") {
+		t.Errorf("stderr = %q", h.stderr)
+	}
+}
+
+// Ctrl-C while the sandbox is being created: the create is waited for, the new
+// sandbox destroyed, nothing run in it, and gssctl exits 130.
+func TestRunInterruptedDuringCreate(t *testing.T) {
+	h := newHarness(t)
+	h.f.createGate, h.f.createStarted = make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-h.f.createStarted
+		cancel()
+		time.Sleep(50 * time.Millisecond) // the create is still in flight after the cancel
+		close(h.f.createGate)
+	}()
+	if code := h.runCtx(ctx, "run", "-c", "print(1)"); code != 130 {
+		t.Errorf("exit code %d, want 130; stderr %q", code, h.stderr)
+	}
+	if strings.Join(h.f.destroys, " ") != "sb-1" || len(h.f.execs) != 0 {
+		t.Errorf("destroys = %q, execs %d; want [sb-1] and none", h.f.destroys, len(h.f.execs))
+	}
 }
 
 // summaryRE is the line run prints after the program's output.
@@ -337,6 +516,13 @@ func TestRunFile(t *testing.T) {
 
 func TestUsageErrors(t *testing.T) {
 	h := newHarness(t)
+	big := filepath.Join(t.TempDir(), "big.py")
+	if err := os.WriteFile(big, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(big, 16<<20+1); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -353,6 +539,9 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"run", "--mode", "hot", "-c", "x"}, "--mode"},
 		{[]string{"run", "--allow", "1.1.1.1", "-c", "x"}, "egress_allow"},
 		{[]string{"run", "--timeout", "0s", "-c", "x"}, "--timeout"},
+		{[]string{"run", "--timeout", "10m1s", "-c", "x"}, "at most 10m0s"},
+		{[]string{"exec", "sb-1", "--timeout", "1h", "-c", "x"}, "at most 10m0s"},
+		{[]string{"run", "-f", big}, "more than 16 MiB"},
 		{[]string{"run", "--bogus"}, "flag provided but not defined"},
 		{[]string{"exec"}, "sandbox ID"},
 		{[]string{"exec", "-c", "x"}, "sandbox ID"},

@@ -4,10 +4,13 @@
 # outlive this shell and log to the journal (journalctl -u gss-node-a1).
 #
 #   cluster.sh up               start every unit that is not running, then wait until
-#                               every node is READY with its warm pool full (120 s at most)
+#                               every node is READY with its warm pool full (120 s at most);
+#                               fails at once if a running unit has other flags
 #   cluster.sh down             stop every gss unit, then remove what they left: cgroups
 #                               under /sys/fs/cgroup/gss, gss-* namespaces, inet gss_*
-#                               nft tables and the runsc roots under /run/gss
+#                               nft tables and the runsc roots under /run/gss; a node whose
+#                               /run/gss/<id>.lock is held (an agent outside systemd) is
+#                               skipped, and down then fails
 #   cluster.sh status           the units and the scheduler's view of the nodes
 #   cluster.sh kill-group G     SIGKILL every node of group G (in GSS_NODES) and its sandboxes
 #   cluster.sh kill-node ID     SIGKILL node ID and its sandboxes (spec D3)
@@ -121,11 +124,54 @@ unit_running() {
 	[[ $state == active || $state == activating || $state == reloading ]]
 }
 
-# start_unit UNIT SYSTEMD-RUN-ARGS... starts a transient unit, unless it is running
+# unit_spec I sets unit, unit_opts (systemd-run options) and unit_cmd for the
+# scheduler (I = -1) or node I of GSS_NODES. It reads up's settings.
+unit_spec() {
+	if (($1 < 0)); then
+		unit=$sched_unit
+		# The scheduler needs no root; it runs as the user who started the cluster.
+		unit_opts=(--uid="$(id -u)" --gid="$(id -g)" ${env_args[@]+"${env_args[@]}"})
+		unit_cmd=("$repo/bin/scheduler" ${sched_args[@]+"${sched_args[@]}"})
+		return
+	fi
+	local i=$1
+	unit=gss-node-${node_ids[i]}.service
+	# Node agents run as root (runsc needs it). KillMode=mixed: a stop sends SIGTERM to
+	# the agent alone, which destroys its sandboxes and cleans up; whatever is left in
+	# the unit when it exits gets SIGKILL.
+	unit_opts=(--property=KillMode=mixed ${env_args[@]+"${env_args[@]}"})
+	unit_cmd=("$repo/bin/nodeagent" --node-id "${node_ids[i]}" --group "${node_groups[i]}"
+		--listen "127.0.0.1:${node_ports[i]}" --scheduler "$sched_addr"
+		--cpu-millis "$cpu" --memory-mib "$mem" --max-sandboxes "$max" --warm-pool-size "$pool"
+		--egress-cidr "10.200.$((16 * i)).0/20")
+}
+
+# exec_argv UNIT prints the command line a unit runs, from systemd's ExecStart
+# "{ path=... ; argv[]=<the arguments, joined by spaces> ; ignore_errors=no ; ... }",
+# or nothing when it cannot be read. No argument here holds a space.
+exec_argv() {
+	systemctl show --property=ExecStart --value "$1" 2>/dev/null |
+		sed -n 's/.*argv\[\]=\(.*\) ; ignore_errors=.*/\1/p' | head -n 1
+}
+
+# check_unit fails when $unit runs, but with another command line than unit_cmd: a
+# cluster of another shape is up, and adding to it would mix the two.
+check_unit() {
+	unit_running "$unit" || return 0
+	local running
+	running=$(exec_argv "$unit")
+	if [[ -z $running ]]; then
+		say "$unit is running already; its command line could not be read to compare, so it is left as it is"
+	elif [[ $running != "${unit_cmd[*]}" ]]; then
+		say "$unit runs: $running"
+		say "this up would run: ${unit_cmd[*]}"
+		die "a cluster with a different topology is running; run scripts/cluster.sh down first"
+	fi
+}
+
+# start_unit starts $unit as a transient unit running unit_cmd, unless it is running
 # already: up leaves running units alone.
 start_unit() {
-	local unit=$1
-	shift
 	local state
 	state=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
 	case $state in
@@ -138,7 +184,7 @@ start_unit() {
 		;;
 	esac
 	sudo systemctl reset-failed "$unit" >/dev/null 2>&1 || true
-	sudo systemd-run --quiet --collect --unit="$unit" "$@"
+	sudo systemd-run --quiet --collect --unit="$unit" ${unit_opts[@]+"${unit_opts[@]}"} "${unit_cmd[@]}"
 	say "started $unit"
 }
 
@@ -213,61 +259,101 @@ up() {
 		env_args=(--setenv="OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_EXPORTER_OTLP_ENDPOINT")
 	fi
 
-	# The scheduler needs no root; it runs as the user who started the cluster.
-	start_unit "$sched_unit" --uid="$(id -u)" --gid="$(id -g)" ${env_args[@]+"${env_args[@]}"} \
-		"$repo/bin/scheduler" ${sched_args[@]+"${sched_args[@]}"}
-	# Node agents run as root (runsc needs it). KillMode=mixed: a stop sends SIGTERM to
-	# the agent alone, which destroys its sandboxes and cleans up; whatever is left in
-	# the unit when it exits gets SIGKILL. Agents retry registering until the scheduler
-	# answers, so they need not wait for it.
-	for ((i = 0; i < ${#node_ids[@]}; i++)); do
-		start_unit "gss-node-${node_ids[i]}.service" --property=KillMode=mixed ${env_args[@]+"${env_args[@]}"} \
-			"$repo/bin/nodeagent" --node-id "${node_ids[i]}" --group "${node_groups[i]}" \
-			--listen "127.0.0.1:${node_ports[i]}" --scheduler "$sched_addr" \
-			--cpu-millis "$cpu" --memory-mib "$mem" --max-sandboxes "$max" --warm-pool-size "$pool" \
-			--egress-cidr "10.200.$((16 * i)).0/20"
+	# I = -1 is the scheduler, then the nodes. Every running unit is checked before
+	# anything starts. Agents retry registering until the scheduler answers, so they
+	# need not wait for it.
+	local unit unit_opts=() unit_cmd=()
+	for ((i = -1; i < ${#node_ids[@]}; i++)); do
+		unit_spec "$i"
+		check_unit
+	done
+	for ((i = -1; i < ${#node_ids[@]}; i++)); do
+		unit_spec "$i"
+		start_unit
 	done
 	wait_ready "$pool"
 }
 
+# The leftovers of nodes whose runsc-root lock another process holds (a node agent
+# running outside systemd) are not touched; find_held fills held with their IDs.
+held=" "
+
+is_held() { [[ $held == *" $1 "* ]]; }
+
+find_held() {
+	held=" "
+	local lock id pid
+	while read -r lock; do
+		id=${lock##*/}
+		id=${id%.lock}
+		[[ $id =~ $node_id_re ]] || continue
+		if ! sudo flock -n "$lock" true; then
+			held+="$id "
+			pid=$(sudo cat "$lock" 2>/dev/null || true)
+			say "node $id: $lock is held (pid ${pid:-unknown}), by a node agent outside systemd; its cgroups, namespaces, nft table and runsc root are left in place"
+		fi
+	done < <(sudo find "$run_dir" -mindepth 1 -maxdepth 1 -name '*.lock' -type f 2>/dev/null)
+}
+
 # remove_cgroups kills whatever is left in each node's cgroup subtree and removes the
-# cgroups below /sys/fs/cgroup/gss, deepest first.
+# node's cgroups, /sys/fs/cgroup/gss/<node> and below, deepest first.
 remove_cgroups() {
 	[[ -d $cgroup_dir ]] || return 0
-	local d try
+	local d id try left dirs=()
 	for d in "$cgroup_dir"/*/; do
-		if [[ -e ${d}cgroup.kill ]]; then
-			echo 1 | sudo tee "${d}cgroup.kill" >/dev/null || true
+		[[ -d $d ]] || continue
+		d=${d%/}
+		id=${d##*/}
+		if is_held "$id"; then
+			continue
+		fi
+		dirs+=("$d")
+		if [[ -e $d/cgroup.kill ]]; then
+			echo 1 | sudo tee "$d/cgroup.kill" >/dev/null || true
 		fi
 	done
+	[[ ${#dirs[@]} -gt 0 ]] || return 0
 	# A cgroup stays busy for a moment after its last process dies.
 	for try in 1 2 3 4 5 6 7 8 9 10; do
-		sudo find "$cgroup_dir" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true
-		if [[ -z $(find "$cgroup_dir" -mindepth 1 -type d 2>/dev/null) ]]; then
+		sudo find "${dirs[@]}" -depth -type d -exec rmdir {} + 2>/dev/null || true
+		left=$(find "${dirs[@]}" -type d 2>/dev/null || true)
+		if [[ -z $left ]]; then
 			return 0
 		fi
 		sleep 0.5
 	done
 	say "cgroups left in place after $try tries:"
-	find "$cgroup_dir" -mindepth 1 -type d >&2
+	echo "$left" >&2
 	return 1
 }
 
-# remove_netns deletes the sandbox namespaces; that also removes their veth pairs.
+# remove_netns deletes the sandbox namespaces gss-<node>-<8 hex>; that also removes
+# their veth pairs.
 remove_netns() {
-	local ns rest rc=0
+	local ns rest node rc=0
 	while read -r ns rest; do
 		[[ $ns =~ $netns_re ]] || continue
+		node=${ns#gss-}
+		node=${node%-*}
+		if is_held "$node"; then
+			continue
+		fi
 		sudo ip netns delete "$ns" || rc=1
 	done < <(sudo ip netns list 2>/dev/null || true)
 	return $rc
 }
 
+# remove_nft_tables deletes the tables inet gss_<node with - as _>.
 remove_nft_tables() {
 	command -v nft >/dev/null 2>&1 || return 0
-	local kw family name rest rc=0
+	local kw family name rest node rc=0
 	while read -r kw family name rest; do
 		[[ $kw == table && $family == inet && $name =~ $table_re ]] || continue
+		node=${name#gss_}
+		node=${node//_/-}
+		if is_held "$node"; then
+			continue
+		fi
 		sudo nft delete table inet "$name" || rc=1
 	done < <(sudo nft list tables 2>/dev/null || true)
 	return $rc
@@ -278,19 +364,41 @@ remove_nft_tables() {
 # below /run/gss go first; rm stays on one file system in case one did not.
 remove_run_dirs() {
 	sudo test -d "$run_dir" || return 0
-	local m p name rc=0
+	local m rel p name rc=0
 	while read -r m; do
 		[[ -n $m ]] || continue
+		rel=${m#"$run_dir"/}
+		if is_held "${rel%%/*}"; then
+			continue
+		fi
 		sudo umount "$m" || rc=1
 	done < <(findmnt -rn -o TARGET 2>/dev/null | awk -v p="$run_dir/" 'index($0, p) == 1' | sort -r)
 	while read -r p; do
 		name=${p##*/}
 		if [[ $name =~ $node_id_re || ($name == *.lock && ${name%.lock} =~ $node_id_re) ]]; then
+			if is_held "${name%.lock}"; then
+				continue
+			fi
 			sudo rm -rf --one-file-system -- "$p" || rc=1
 		else
 			say "left $p in place: not a node's runsc root or lock"
 		fi
 	done < <(sudo find "$run_dir" -mindepth 1 -maxdepth 1)
+	return $rc
+}
+
+# remove_leftovers removes what stopped agents left, node by node, except the nodes
+# whose lock is held. It fails when a node was skipped or something could not go.
+remove_leftovers() {
+	local rc=0
+	find_held
+	remove_cgroups || rc=1
+	remove_netns || rc=1
+	remove_nft_tables || rc=1
+	remove_run_dirs || rc=1
+	if [[ $held != " " ]]; then
+		rc=1
+	fi
 	return $rc
 }
 
@@ -324,10 +432,7 @@ down() {
 	if [[ -n $left ]]; then
 		die "still running after the stop, so no leftovers were removed: ${left//$'\n'/ }"
 	fi
-	remove_cgroups || failed=1
-	remove_netns || failed=1
-	remove_nft_tables || failed=1
-	remove_run_dirs || failed=1
+	remove_leftovers || failed=1
 	if [[ $failed -ne 0 ]]; then
 		die "down did not finish cleanly (see above)"
 	fi

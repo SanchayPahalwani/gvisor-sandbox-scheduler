@@ -10,10 +10,15 @@ import (
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 )
 
+// errOutput marks a failed write of the program's output to gssctl's own stdout or
+// stderr (a closed pipe, a terminal gone).
+var errOutput = errors.New("cannot write the program's output")
+
 // execStream runs req, copying the program's output to stdout and stderr as it
 // arrives, and returns its exit status and when it arrived. Per spec D34 a stream
 // that ends without an exit event did not see the program exit: that is an error,
-// the stream's status if it ended with one.
+// the stream's status if it ended with one. A failed write of the output ends the
+// stream with an error that wraps errOutput.
 func (c *cli) execStream(ctx context.Context, sc gssv1.SandboxServiceClient, req *gssv1.ExecRequest) (*gssv1.ExitStatus, time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, req.GetTimeout().AsDuration()+execSlack)
 	defer cancel()
@@ -34,15 +39,19 @@ func (c *cli) execStream(ctx context.Context, sc gssv1.SandboxServiceClient, req
 			}
 			return nil, time.Time{}, err
 		}
+		var werr error
 		switch e := ev.GetEvent().(type) {
 		case *gssv1.ExecEvent_Stdout:
-			c.stdout.Write(e.Stdout)
+			_, werr = c.stdout.Write(e.Stdout)
 		case *gssv1.ExecEvent_Stderr:
-			c.stderr.Write(e.Stderr)
+			_, werr = c.stderr.Write(e.Stderr)
 		case *gssv1.ExecEvent_Exit:
 			if exit == nil {
 				exit, exitAt = e.Exit, c.now()
 			}
+		}
+		if werr != nil {
+			return nil, time.Time{}, fmt.Errorf("%w: %v", errOutput, werr)
 		}
 	}
 	if exit == nil {
@@ -104,19 +113,36 @@ func (c *cli) run(ctx context.Context, args []string) (int, error) {
 	defer conn.Close()
 
 	sent := c.now()
-	sb, err := createSandbox(ctx, sc, spec)
+	// A signal does not cancel the create (createTimeout bounds it): a sandbox it
+	// makes is destroyed below, not left to its TTL.
+	sb, err := createSandbox(context.WithoutCancel(ctx), sc, spec)
 	if err != nil {
 		return 0, err
 	}
-	req.SandboxId = sb.GetId()
-	exit, exitAt, execErr := c.execStream(ctx, sc, req)
+	var exit *gssv1.ExitStatus
+	var exitAt time.Time
+	var execErr error
+	if ctx.Err() == nil {
+		req.SandboxId = sb.GetId()
+		exit, exitAt, execErr = c.execStream(ctx, sc, req)
+	}
+	fate := "kept"
 	if !*keep {
-		// Also after Ctrl-C: the sandbox would otherwise live until its TTL.
+		// Also after a signal or a failed write: the sandbox would otherwise live
+		// until its TTL.
+		fate = "destroyed"
 		if err := destroySandbox(context.WithoutCancel(ctx), sc, sb.GetId()); err != nil {
 			fmt.Fprintf(c.stderr, "gssctl: %v; it is removed when its TTL ends\n", err)
+			fate = "not destroyed"
 		}
 	}
-	if execErr != nil {
+	switch {
+	case errors.Is(execErr, errOutput):
+		return 0, execErr
+	case exit == nil && ctx.Err() != nil:
+		fmt.Fprintf(c.stderr, "gssctl: interrupted (%v); sandbox %s %s\n", context.Cause(ctx), sb.GetId(), fate)
+		return exitInterrupted, nil
+	case execErr != nil:
 		return 0, fmt.Errorf("exec in sandbox %s on node %s: %s", sb.GetId(), sb.GetNodeId(), describe(execErr))
 	}
 	c.exitNotes(exit, cf.timeout)
@@ -181,7 +207,13 @@ func (c *cli) exec(ctx context.Context, args []string) (int, error) {
 	}
 	defer conn.Close()
 	exit, _, err := c.execStream(ctx, sc, req)
-	if err != nil {
+	switch {
+	case errors.Is(err, errOutput):
+		return 0, err
+	case err != nil && ctx.Err() != nil:
+		fmt.Fprintf(c.stderr, "gssctl: interrupted (%v)\n", context.Cause(ctx))
+		return exitInterrupted, nil
+	case err != nil:
 		return 0, fmt.Errorf("exec in sandbox %s: %s", id, describe(err))
 	}
 	c.exitNotes(exit, cf.timeout)

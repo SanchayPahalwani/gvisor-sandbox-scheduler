@@ -183,7 +183,7 @@ func addCmdFlags(fs *flag.FlagSet) *cmdFlags {
 	f := &cmdFlags{}
 	fs.StringVar(&f.code, "c", "", "Python code to run in a fork of the primed interpreter")
 	fs.StringVar(&f.file, "f", "", "file of Python code to run the same way")
-	fs.DurationVar(&f.timeout, "timeout", defaultExecTimeout, "the program's time limit (at most 10m)")
+	fs.DurationVar(&f.timeout, "timeout", defaultExecTimeout, fmt.Sprintf("the program's time limit (at most %v)", maxExecTimeout))
 	return f
 }
 
@@ -210,17 +210,30 @@ func (f *cmdFlags) request(fs *flag.FlagSet, args []string) (*gssv1.ExecRequest,
 	case given > 1:
 		return nil, usagef("%s: give only one of -c CODE, -f FILE and -- ARGV...", fs.Name())
 	}
-	if f.timeout <= 0 {
-		return nil, usagef("%s: --timeout must be positive, got %v", fs.Name(), f.timeout)
+	if f.timeout <= 0 || f.timeout > maxExecTimeout {
+		return nil, usagef("%s: --timeout must be positive and at most %v, got %v", fs.Name(), maxExecTimeout, f.timeout)
 	}
 	req := &gssv1.ExecRequest{Timeout: durationpb.New(f.timeout)}
+	tooBig := func(what string) error {
+		return usagef("%s: %s is more than %d MiB of code", fs.Name(), what, maxCodeBytes>>20)
+	}
 	switch {
 	case f.code != "":
+		if len(f.code) > maxCodeBytes {
+			return nil, tooBig("-c")
+		}
 		req.Command = &gssv1.ExecRequest_PythonCode{PythonCode: f.code}
 	case f.file != "":
+		// Checked before and after reading: a file can grow in between.
+		if st, err := os.Stat(f.file); err == nil && st.Size() > maxCodeBytes {
+			return nil, tooBig(f.file)
+		}
 		b, err := os.ReadFile(f.file)
 		if err != nil {
 			return nil, err
+		}
+		if len(b) > maxCodeBytes {
+			return nil, tooBig(f.file)
 		}
 		req.Command = &gssv1.ExecRequest_PythonCode{PythonCode: string(b)}
 	default:

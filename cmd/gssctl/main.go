@@ -64,8 +64,12 @@ const (
 	// maxMsgSize bounds a gRPC message each way: code sent with -f, and the
 	// output chunks of an Exec.
 	maxMsgSize = 20 << 20
-	// defaultExecTimeout is the program's time limit, as the scheduler's default.
+	// The program's time limit: the scheduler's default and most (spec section 5).
 	defaultExecTimeout = 30 * time.Second
+	maxExecTimeout     = 10 * time.Minute
+	// maxCodeBytes is the most Python code -c or -f sends; the message limit has room
+	// for the rest of the request.
+	maxCodeBytes = 16 << 20
 )
 
 // Deadlines of the calls. They keep a hung call from hanging gssctl; none is near
@@ -80,16 +84,55 @@ const (
 
 // Exit codes of gssctl's own failures; run and exec otherwise exit with the program's.
 const (
-	exitFail  = 1
-	exitUsage = 2
+	exitFail        = 1
+	exitUsage       = 2
+	exitInterrupted = 130 // a signal ended run or exec before the program's exit was seen
 )
 
-func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+// signals are caught while gssctl runs, so that none of them kills it between
+// creating a sandbox and destroying it. SIGINT, SIGTERM and SIGHUP (the terminal
+// went away) end its context. SIGPIPE is caught only so that a write to a closed
+// stdout or stderr fails with EPIPE instead of killing the process; that write
+// error ends the run. It does not end the context: once SIGPIPE is caught, a write
+// to a broken gRPC connection raises it too, and that failure is the RPC's status
+// to report (spec D34), not an interruption.
+var signals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE}
+
+func main() { os.Exit(gssctl(os.Args[1:])) }
+
+// gssctl runs the command line args with the process's own outputs, environment
+// and signals, and returns the exit code.
+func gssctl(args []string) int {
+	ctx, stop := notifyContext(context.Background())
+	defer stop()
 	c := &cli{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, now: time.Now, dial: dial}
-	code := c.main(ctx, os.Args[1:])
-	stop()
-	os.Exit(code)
+	return c.main(ctx, args)
+}
+
+// notifyContext returns a context that a signal in signals other than SIGPIPE
+// ends, and the function that stops catching them.
+func notifyContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	ch := make(chan os.Signal, len(signals))
+	signal.Notify(ch, signals...)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case s := <-ch:
+				if s != syscall.SIGPIPE {
+					cancel(fmt.Errorf("signal: %v", s))
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		close(done)
+		cancel(nil)
+	}
 }
 
 func dial(addr string) (*grpc.ClientConn, error) {
