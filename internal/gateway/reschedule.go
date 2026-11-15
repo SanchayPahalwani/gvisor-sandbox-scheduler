@@ -12,8 +12,9 @@ import (
 // Run drives the cluster until ctx ends: every TickInterval it runs failure
 // detection and TTL expiry, handing lost sandboxes to the rescheduler and
 // telling nodes to destroy expired ones; every RetryInterval it hands over
-// every sandbox that still needs a node (spec 8.4). It returns once the
-// reschedules and destroys it started are done. Run once per Server.
+// every sandbox that still needs a node (spec 8.4). The end of ctx cancels
+// the reschedules in flight; Run returns once they and the destroys it
+// started are done. Run once per Server.
 func (s *Server) Run(ctx context.Context) {
 	s.mu.Lock()
 	s.runCtx = ctx
@@ -30,7 +31,8 @@ func (s *Server) Run(ctx context.Context) {
 			s.mu.Lock()
 			s.runCtx = nil // no new reschedules
 			s.mu.Unlock()
-			s.wg.Wait()
+			s.reschedules.Wait()
+			s.destroys.Wait()
 			return
 		case <-tick.C:
 			s.tick(ctx)
@@ -40,7 +42,35 @@ func (s *Server) Run(ctx context.Context) {
 	}
 }
 
+// Drain begins a shutdown. Failure detection, TTL expiry and the start of
+// reschedules stop at once: while the gRPC server drains it takes no new
+// RPCs, heartbeats included, and a detector still running would declare
+// healthy nodes dead. The reschedules already running go on to their
+// normal result; the returned channel is closed once they are done.
+// Cancelling Run's context ends them early.
+func (s *Server) Drain() <-chan struct{} {
+	s.tickMu.Lock() // a pass in progress finishes first
+	s.mu.Lock()
+	s.draining = true
+	s.mu.Unlock()
+	s.tickMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.reschedules.Wait() // none is added once draining is set
+		close(done)
+	}()
+	return done
+}
+
 func (s *Server) tick(ctx context.Context) {
+	s.tickMu.Lock()
+	defer s.tickMu.Unlock()
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return
+	}
 	r := s.state.Tick()
 	for _, id := range r.DeadNodes {
 		s.log.Warn("node dead", "node", id)
@@ -58,9 +88,9 @@ func (s *Server) tick(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		s.wg.Add(1)
+		s.destroys.Add(1)
 		go func() {
-			defer s.wg.Done()
+			defer s.destroys.Done()
 			s.destroyOnNode(ctx, x.NodeID, addr, x.ID, 0)
 		}()
 	}
@@ -82,13 +112,14 @@ func (s *Server) enqueue(ids ...string) {
 }
 
 // dispatchLocked starts queued reschedules while fewer than
-// RescheduleConcurrency are in flight and Run runs. Call with s.mu held.
+// RescheduleConcurrency are in flight, Run runs and no Drain was called.
+// Call with s.mu held.
 func (s *Server) dispatchLocked() {
-	for s.runCtx != nil && s.running < s.cfg.RescheduleConcurrency && len(s.queue) > 0 {
+	for s.runCtx != nil && !s.draining && s.running < s.cfg.RescheduleConcurrency && len(s.queue) > 0 {
 		id := s.queue[0]
 		s.queue = s.queue[1:]
 		s.running++
-		s.wg.Add(1)
+		s.reschedules.Add(1)
 		go s.reschedule(s.runCtx, id)
 	}
 }
@@ -98,7 +129,7 @@ func (s *Server) dispatchLocked() {
 // sandbox with no node to go to stays as it is; RetryInterval brings it
 // back.
 func (s *Server) reschedule(ctx context.Context, id string) {
-	defer s.wg.Done() // after the slot is handed on, so Run's Wait covers that
+	defer s.reschedules.Done() // after the slot is handed on, so the Waits cover that
 	defer func() {
 		s.mu.Lock()
 		delete(s.busy, id)

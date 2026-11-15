@@ -1234,3 +1234,59 @@ func waitState(st *cluster.State, id string, want gssv1.SandboxState) bool {
 	}
 	return false
 }
+
+// TestExecNothingAfterExit: once the exit event was sent, however the node
+// stream ends, the Exec ends cleanly (spec D34: nothing follows the exit).
+func TestExecNothingAfterExit(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	sb := e.mustCreate(nil)
+	for _, end := range []error{
+		status.Error(codes.Unavailable, "error reading from server: EOF"),
+		status.Error(codes.Internal, "stream reset"),
+		status.Error(codes.NotFound, "sandbox not found"),
+	} {
+		e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
+			return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("4\n"), exit(0)}, end: end}, nil
+		})
+		evs, err := e.exec(sb.GetId())
+		if err != nil || !slices.Equal(evs, []string{"stdout 4\n", "exit 0"}) {
+			t.Errorf("node stream ending with %v after the exit: events %q, %v; want the exit and a clean end", end, evs, err)
+		}
+	}
+}
+
+// TestExecNodeNotFound: a node that does not know the sandbox ends the Exec
+// as the scheduler's state says: lost while the state still has it here,
+// lost when the state marked it LOST, NotFound when it was destroyed.
+func TestExecNodeNotFound(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	for _, tc := range []struct {
+		name   string
+		before func(id string) // runs just before the node answers NotFound
+		code   codes.Code
+		msg    string
+	}{
+		{"still READY", func(string) {}, codes.Unavailable, "lost on node n1: the node no longer has it"},
+		{"marked LOST", func(string) {
+			e.clock.advance(3300 * time.Millisecond) // n1 misses its heartbeats
+			e.state.Tick()
+		}, codes.Unavailable, "lost on node n1: marked LOST by the scheduler"},
+		{"destroyed", func(id string) {
+			_, _ = e.srv.DestroySandbox(context.Background(), &gssv1.DestroySandboxRequest{SandboxId: id})
+		}, codes.NotFound, "was destroyed"},
+	} {
+		e.register("n1") // alive again for the create
+		sb := e.mustCreate(nil)
+		e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
+			tc.before(req.GetSandboxId())
+			return &fakeStream{ctx: ctx, end: status.Error(codes.NotFound, "sandbox "+req.GetSandboxId()+" not found")}, nil
+		})
+		_, err := e.exec(sb.GetId())
+		wantCode(t, err, tc.code, tc.name)
+		if !strings.Contains(err.Error(), tc.msg) {
+			t.Errorf("%s: error %v does not contain %q", tc.name, err, tc.msg)
+		}
+	}
+}

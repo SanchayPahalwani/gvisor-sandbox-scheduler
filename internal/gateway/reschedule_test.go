@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -286,5 +289,115 @@ func TestDestroyDuringReschedule(t *testing.T) {
 	}
 	if onN2 != 1 {
 		t.Errorf("%d Creates on n2, want 1: a destroyed sandbox is not placed again", onN2)
+	}
+}
+
+// drainEnv is a running gateway with a sandbox on n1 whose reschedule to n2
+// is in flight: n2's Create waits for release (or for its context to end).
+type drainEnv struct {
+	*env
+	sb       *gssv1.Sandbox
+	release  chan struct{}
+	createOK chan error // what each Create after setup saw, the reschedule's first
+	cancel   context.CancelFunc
+	done     chan struct{} // closed when Run returned
+}
+
+func newDrainEnv(t *testing.T) *drainEnv {
+	e := newEnv(t, nil)
+	d := &drainEnv{env: e, release: make(chan struct{}), createOK: make(chan error, 4), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	d.cancel = cancel
+	go func() {
+		e.srv.Run(ctx)
+		close(d.done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-d.done
+	})
+	e.register("n1")
+	e.register("n2")
+	d.sb = e.mustCreate(nil)
+	started := make(chan struct{})
+	var once sync.Once
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		once.Do(func() { close(started) })
+		select {
+		case <-d.release:
+			d.createOK <- nil
+			return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+		case <-ctx.Done():
+			d.createOK <- ctx.Err()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	})
+	e.kill("n2")
+	<-started
+	return d
+}
+
+// TestDrainLetsReschedulesFinish: Drain stops failure detection and new
+// reschedules at once, while a reschedule already running finishes with its
+// normal result.
+func TestDrainLetsReschedulesFinish(t *testing.T) {
+	d := newDrainEnv(t)
+	drained := d.srv.Drain()
+	// No heartbeat gets through while a server drains: nothing may be declared dead.
+	d.clock.advance(10 * time.Second)
+	time.Sleep(10 * d.srv.cfg.TickInterval)
+	if n := d.node("n2"); n.GetState() != gssv1.NodeState_NODE_STATE_READY {
+		t.Errorf("n2 is %v during the drain, want READY", n.GetState())
+	}
+	select {
+	case <-drained:
+		t.Fatal("Drain's channel closed with a reschedule still running")
+	default:
+	}
+	close(d.release)
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain's channel not closed after the reschedule finished")
+	}
+	if err := <-d.createOK; err != nil {
+		t.Errorf("the reschedule's node Create saw %v, want it left to finish", err)
+	}
+	if got := d.get(d.sb.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY || got.GetNodeId() != "n2" {
+		t.Errorf("sandbox = %v, want READY on n2", got)
+	}
+	// Nothing new is started during the drain: a sandbox lost now waits.
+	other := d.mustCreate(nil) // n2, the only node left
+	d.clock.advance(5 * time.Second)
+	d.state.Tick() // as if the detector had run once more: n2 dead, other LOST
+	if _, err := d.cc.Register(ctx(t), &gssv1.RegisterRequest{Node: nodeInfo("n3", "g1", 4000)}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * d.srv.cfg.RetryInterval)
+	if got := d.get(other.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_LOST {
+		t.Errorf("sandbox lost during the drain is %v, want still LOST (no reschedule starts)", got.GetState())
+	}
+	d.cancel()
+	<-d.done
+}
+
+// TestDrainThenCancel: cancelling Run's context after Drain (the drain
+// timeout passed) ends the reschedules still running, and Run returns.
+func TestDrainThenCancel(t *testing.T) {
+	d := newDrainEnv(t)
+	drained := d.srv.Drain()
+	d.cancel()
+	select {
+	case <-d.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context ended")
+	}
+	if err := <-d.createOK; !errors.Is(err, context.Canceled) {
+		t.Errorf("the reschedule's node Create saw %v, want it cancelled", err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Error("Drain's channel not closed after the cancelled reschedule ended")
 	}
 }

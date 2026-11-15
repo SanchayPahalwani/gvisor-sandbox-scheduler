@@ -166,12 +166,18 @@ func TestRunServesBothServices(t *testing.T) {
 	}
 }
 
-// blockingNode is a NodeService whose CreateSandbox waits for release.
+// blockingNode is a NodeService whose CreateSandbox waits for release
+// (closed at once for a node that answers at once).
 type blockingNode struct {
 	gssv1.UnimplementedNodeServiceServer
 	started chan struct{} // closed when the first Create arrives
 	release chan struct{}
 	once    sync.Once
+	result  chan error // what each Create ended with
+}
+
+func newBlockingNode() *blockingNode {
+	return &blockingNode{started: make(chan struct{}), release: make(chan struct{}), result: make(chan error, 8)}
 }
 
 func (b *blockingNode) CreateSandbox(ctx context.Context, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
@@ -179,24 +185,39 @@ func (b *blockingNode) CreateSandbox(ctx context.Context, req *gssv1.NodeCreateR
 	select {
 	case <-b.release:
 	case <-ctx.Done():
+		b.result <- ctx.Err()
 		return nil, ctx.Err()
 	}
+	b.result <- nil
 	return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+}
+
+// serveNode serves b on a loopback port until the test ends and returns
+// the address.
+func serveNode(t *testing.T, b *blockingNode) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := grpc.NewServer()
+	gssv1.RegisterNodeServiceServer(g, b)
+	go func() { _ = g.Serve(lis) }()
+	t.Cleanup(g.Stop)
+	return lis.Addr().String()
+}
+
+func nodeInfo(id, addr string) *gssv1.NodeInfo {
+	return &gssv1.NodeInfo{Id: id, Group: "a", Address: addr,
+		Capacity: &gssv1.Resources{CpuMillis: 4000, MemoryBytes: 2 << 30}, MaxSandboxes: 16}
 }
 
 // TestShutdownStopsFailureDetection: while the server drains an RPC in
 // flight no heartbeat gets through, so failure detection must already be
 // off: the node is not declared dead and the create in flight completes.
 func TestShutdownStopsFailureDetection(t *testing.T) {
-	nodeLis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &blockingNode{started: make(chan struct{}), release: make(chan struct{})}
-	ng := grpc.NewServer()
-	gssv1.RegisterNodeServiceServer(ng, fake)
-	go func() { _ = ng.Serve(nodeLis) }()
-	defer ng.Stop()
+	fake := newBlockingNode()
+	nodeAddr := serveNode(t, fake)
 
 	// A node is dead after 200 ms without a heartbeat.
 	o, err := parseFlags([]string{"--listen", "127.0.0.1:0", "--node-timeout", "200ms", "--heartbeat-interval", "100ms"}, io.Discard)
@@ -220,9 +241,7 @@ func TestShutdownStopsFailureDetection(t *testing.T) {
 	defer conn.Close()
 	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer rcancel()
-	node := &gssv1.NodeInfo{Id: "n1", Group: "a", Address: nodeLis.Addr().String(),
-		Capacity: &gssv1.Resources{CpuMillis: 4000, MemoryBytes: 2 << 30}, MaxSandboxes: 16}
-	if _, err := gssv1.NewClusterServiceClient(conn).Register(rctx, &gssv1.RegisterRequest{Node: node}); err != nil {
+	if _, err := gssv1.NewClusterServiceClient(conn).Register(rctx, &gssv1.RegisterRequest{Node: nodeInfo("n1", nodeAddr)}); err != nil {
 		t.Fatal(err)
 	}
 	created := make(chan *gssv1.Sandbox, 1)
@@ -249,6 +268,90 @@ func TestShutdownStopsFailureDetection(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), `msg="node dead"`) {
 		t.Errorf("a node was declared dead during the drain:\n%s", logs.String())
+	}
+}
+
+// TestShutdownLetsReschedulesFinish: a reschedule running when shutdown
+// starts is not cancelled; it finishes within the drain timeout with its
+// normal result.
+func TestShutdownLetsReschedulesFinish(t *testing.T) {
+	n1, n2 := newBlockingNode(), newBlockingNode()
+	close(n1.release) // n1 answers at once; n2 holds its Create
+	a1, a2 := serveNode(t, n1), serveNode(t, n2)
+
+	o, err := parseFlags([]string{"--listen", "127.0.0.1:0", "--node-timeout", "200ms", "--heartbeat-interval", "100ms"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, func() {}, o) }()
+	conn, err := grpc.NewClient(waitListen(t, logs), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	cluster := gssv1.NewClusterServiceClient(conn)
+	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer rcancel()
+	for _, n := range []*gssv1.NodeInfo{nodeInfo("n1", a1), nodeInfo("n2", a2)} {
+		if _, err := cluster.Register(rctx, &gssv1.RegisterRequest{Node: n}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sb, err := gssv1.NewSandboxServiceClient(conn).CreateSandbox(rctx, &gssv1.CreateSandboxRequest{})
+	if err != nil || sb.GetNodeId() != "n1" {
+		t.Fatalf("CreateSandbox = %v, %v; want it on n1", sb, err)
+	}
+
+	// Only n2 heartbeats: n1 is declared dead and the sandbox moves to n2.
+	beat := func() error {
+		_, err := cluster.Heartbeat(rctx, &gssv1.HeartbeatRequest{NodeId: "n2"})
+		return err
+	}
+	stopBeats := make(chan struct{})
+	var beats sync.WaitGroup
+	beats.Add(1)
+	go func() {
+		defer beats.Done()
+		for {
+			select {
+			case <-stopBeats:
+				return
+			case <-time.After(50 * time.Millisecond):
+				_ = beat()
+			}
+		}
+	}()
+	select {
+	case <-n2.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no reschedule reached n2")
+	}
+	close(stopBeats)
+	beats.Wait()
+	if err := beat(); err != nil { // n2 alive when shutdown starts
+		t.Fatal(err)
+	}
+	cancel() // the signal, with the reschedule's Create on n2 in flight
+	time.Sleep(time.Second)
+	close(n2.release)
+	if err := <-done; err != nil {
+		t.Errorf("run = %v", err)
+	}
+	if err := <-n2.result; err != nil {
+		t.Errorf("the reschedule's Create on n2 ended with %v, want it left to finish", err)
+	}
+	if want := `msg="sandbox rescheduled" sandbox=` + sb.GetId() + ` node=n2 incarnation=2`; !strings.Contains(logs.String(), want) {
+		t.Errorf("log has no %q:\n%s", want, logs.String())
+	}
+	if strings.Contains(logs.String(), `msg="node dead" node=n2`) {
+		t.Errorf("n2 was declared dead during the drain:\n%s", logs.String())
 	}
 }
 

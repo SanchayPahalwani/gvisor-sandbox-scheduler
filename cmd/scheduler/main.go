@@ -4,9 +4,9 @@
 // restarts their sandboxes elsewhere. Its state is in memory and is rebuilt
 // from heartbeats after a restart (spec D18).
 //
-// SIGINT or SIGTERM stops it: failure detection and the rescheduler first,
-// then no new RPCs and up to drainTimeout for the ones in flight. A second
-// signal ends the process at once.
+// SIGINT or SIGTERM stops it: failure detection and the start of
+// reschedules first, then no new RPCs; RPCs and reschedules in flight get
+// up to drainTimeout to finish. A second signal ends the process at once.
 package main
 
 import (
@@ -29,8 +29,8 @@ import (
 	"google.golang.org/grpc"
 )
 
-// drainTimeout is how long a shutdown waits for RPCs in flight (Exec
-// streams, creates) before it cancels them.
+// drainTimeout is how long a shutdown waits for RPCs (Exec streams,
+// creates) and reschedules in flight before it cancels them.
 const drainTimeout = 5 * time.Second
 
 // options are the parsed and checked flags.
@@ -175,11 +175,13 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		serveErr = fmt.Errorf("serve: %w", serveErr)
 	}
 	stop()
-	// Failure detection and rescheduling stop first: while the server
+	// Failure detection and new reschedules stop first: while the server
 	// drains it takes no new RPCs, heartbeats included, so a detector still
 	// running would declare healthy nodes dead and move their sandboxes.
-	cancelRun()
-	<-ran
+	// RPCs and reschedules in flight then get drainTimeout to finish.
+	rescheduled := gw.Drain()
+	dctx, dcancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer dcancel()
 	drained := make(chan struct{})
 	go func() {
 		srv.GracefulStop()
@@ -187,10 +189,16 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 	}()
 	select {
 	case <-drained:
-	case <-time.After(drainTimeout):
+	case <-dctx.Done():
 		srv.Stop()
 		<-drained
 	}
+	select {
+	case <-rescheduled:
+	case <-dctx.Done():
+	}
+	cancelRun() // ends what is still running
+	<-ran
 	if serveErr != nil {
 		return serveErr
 	}

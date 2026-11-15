@@ -74,12 +74,17 @@ type Server struct {
 	log    *slog.Logger
 	newID  func() (string, error)
 
-	mu      sync.Mutex
-	busy    map[string]bool // IDs being placed (a create or a reschedule) or queued to be: one placement per ID at a time
-	queue   []string        // reschedules waiting for a slot, in arrival order
-	running int             // reschedules in flight
-	runCtx  context.Context // Run's context while Run runs, else nil
-	wg      sync.WaitGroup  // goroutines Run waits for: reschedules and destroys of expired sandboxes
+	tickMu sync.Mutex // held for each failure-detection pass, so Drain can wait one out
+
+	mu       sync.Mutex
+	busy     map[string]bool // IDs being placed (a create or a reschedule) or queued to be: one placement per ID at a time
+	queue    []string        // reschedules waiting for a slot, in arrival order
+	running  int             // reschedules in flight
+	runCtx   context.Context // Run's context while Run runs, else nil
+	draining bool            // Drain was called: no failure detection, no new reschedules
+
+	reschedules sync.WaitGroup // reschedules in flight
+	destroys    sync.WaitGroup // node Destroys of expired sandboxes
 }
 
 // New returns a gateway. policy is shared by every placement (it
@@ -442,14 +447,13 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 			exited = exited || ev.GetExit() != nil
 		}
 	}
-	if err == io.EOF {
+	if err == io.EOF || exited {
+		// The result is in: however the stream ended after the exit event,
+		// nothing follows it (spec D34).
 		return nil
 	}
 	var wc watchCause
 	if errors.As(context.Cause(nctx), &wc) {
-		if exited {
-			return nil // the result is in; the loss came after it
-		}
 		return wc.err
 	}
 	st := status.Convert(err)
@@ -459,11 +463,14 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 		// the sandbox stopped: either way this copy is lost.
 		return status.Errorf(codes.Unavailable, "%s: %s", lost, st.Message())
 	case codes.NotFound:
-		if cur, ok := s.state.Get(sb.GetId()); ok && watchEnd(sb, cur, true) == nil {
-			// Still READY there for the scheduler but unknown to the node: the
-			// agent restarted, and its heartbeats will get the sandbox moved.
-			return status.Errorf(codes.Unavailable, "%s: the node no longer has it (%s)", lost, st.Message())
+		// The node does not know the sandbox: the state says why.
+		cur, ok := s.state.Get(sb.GetId())
+		if werr := watchEnd(sb, cur, ok); werr != nil {
+			return werr // LOST or moved, destroyed, failed
 		}
+		// Still READY there for the scheduler: the agent restarted, and its
+		// heartbeats will get the sandbox moved.
+		return status.Errorf(codes.Unavailable, "%s: the node no longer has it (%s)", lost, st.Message())
 	}
 	return st.Err()
 }
