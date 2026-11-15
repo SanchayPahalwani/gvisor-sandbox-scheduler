@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bench"
 )
 
 var update = flag.Bool("update", false, "rewrite testdata/results.golden.md")
@@ -279,5 +281,26 @@ func TestHardwareWithoutVM(t *testing.T) {
 	md := Render(in)
 	if !strings.Contains(md, "VM: not captured (the Lima VM gss was not running") {
 		t.Errorf("hardware line lacks the VM note:\n%s", md)
+	}
+}
+
+func TestRampReach(t *testing.T) {
+	mk := func(rows ...map[string]any) *bench.Run { return &bench.Run{Rows: rows} }
+	row := func(live, failed float64) map[string]any {
+		return map[string]any{"live": live, "failed": failed}
+	}
+	for _, c := range []struct {
+		name string
+		run  *bench.Run
+		want string
+	}{
+		{"no failures", mk(row(5, 0), row(10, 0), row(20, 0)), "; the ramp reached 20 with no failed start or Exec"},
+		{"failure at third step", mk(row(5, 0), row(10, 0), row(20, 2), row(30, 0)), "; the ramp reached 10 before the first failed start or Exec"},
+		{"failure at first step", mk(row(5, 1)), "; the ramp stopped at its first failure"},
+		{"no rows", mk(), ""},
+	} {
+		if got := rampReach(c.run); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
 	}
 }

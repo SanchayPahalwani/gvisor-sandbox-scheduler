@@ -2,7 +2,7 @@
 
 This document explains the design of `gvisor-sandbox-scheduler`, one decision at a time: what was chosen, why, the main alternative, and what would change the answer. The build spec, [2026-11-12-agent-sandbox-design.md](superpowers/specs/2026-11-12-agent-sandbox-design.md), records 37 calls made while designing it, D1 to D37. Each one is explained below in the section where it belongs, and the [index at the end](#index-of-calls) says where to find it. Decisions that are not numbered calls get the same treatment.
 
-The numbers in this document are design parameters: timeouts, weights, sizes and defaults from the code. None is a measurement. Measured numbers will appear only in `docs/results.md`, which `make results` writes from the JSON files under `results/`, and no benchmark has run yet (see the README's Status section). A few behaviours were observed by hand while the design was made (spec section 17); where they shaped a decision they are described in words, as single observations and not as benchmark results.
+The numbers in this document are design parameters: timeouts, weights, sizes and defaults from the code. None is a measurement. Measured numbers will appear only in `docs/results.md`, which `make results` writes from the JSON files under `results/`, and the benchmarks ran once, on one laptop (see the README's Status section). A few behaviours were observed by hand while the design was made (spec section 17); where they shaped a decision they are described in words, as single observations and not as benchmark results.
 
 Contents:
 
@@ -667,7 +667,7 @@ The dashboard ([deploy/grafana/dashboard.json](../deploy/grafana/dashboard.json)
 - *Why.* One command and one dashboard file.
 - *Alternative.* Separate collector, Tempo, Prometheus and Grafana containers: four configurations that teach nothing about sandboxes.
 - *What would change it.* Any real deployment: separate components with persistent storage, retention and access control.
-- *Not yet verified.* The image tag, its provisioning paths, and the label names OTLP metrics get in its Prometheus store, which the dashboard queries depend on. The VM was off before they could be checked.
+- *Verified.* The image tag, its provisioning paths, and the label names OTLP metrics get in its Prometheus store, which the dashboard queries depend on, were checked in the VM on 2026-11-15: Grafana answers, the dashboard is provisioned, and Prometheus has every `gss_` metric with its labels.
 
 **D25. Headline numbers are measured with the observability container stopped and OTLP export off.**
 
@@ -678,7 +678,9 @@ The dashboard ([deploy/grafana/dashboard.json](../deploy/grafana/dashboard.json)
 
 ## 11. Benchmarks
 
-Nothing has been measured yet. This section says what will be measured, how, and on what; the numbers will be in `docs/results.md` once the benchmarks have run, written by `make results`. Until then that file does not exist and the README's results block says "not run" in every row.
+This section says what is measured, how, and on what. The numbers are in [docs/results.md](results.md), written by `make results` from the JSON files under `results/`, and each benchmark ran once.
+
+The results bear on these design calls: the start tables on D11 and D15 (the primed interpreter and restore) and D16 (the warm pool); the group-loss table on D19 (the failure threshold); and the placement table and the throughput table on D20 to D22 (the placement policy). They do not show that any of those calls is the best one, only what each costs on this machine.
 
 | Benchmark | Command | What it does | What it reports |
 | --- | --- | --- | --- |
@@ -727,10 +729,8 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 ### Not verified yet
 
-- Nothing that needs Linux has run against the code on `main`: the integration tests, `make demo`, the benchmarks and the Grafana checks all wait for the VM.
-- Neither CI job has run on a hosted runner; the repository has not been pushed.
+- No CI job has run on a hosted runner; the repository has not been pushed.
 - The name of `runsc`'s control socket in the runsc root is taken from gVisor's source and has not been confirmed on this release. If it is wrong, removing the root at shutdown fails safe: an entry it does not recognise is left in place, and the error names it.
-- The `grafana/otel-lgtm` image tag, its provisioning paths, and the Prometheus label names of the OTLP metrics (D24).
 
 ### Isolation and the sandbox
 
@@ -770,6 +770,10 @@ Why the local failure-domain test says nothing about these: it kills processes i
 - Tombstones are kept for 60 min 10 s, so the table holds every sandbox destroyed in that time (they are not listed, but `GetSandbox` returns them).
 - When a node reports a sandbox at a different incarnation from the scheduler's, that report keeps the scheduler's copy from counting as missing; once the node has destroyed the stale copy the count starts, so detection is delayed, not lost. Allocation releases are clamped at zero, which would hide a double release.
 
+### Performance
+
+- Under heavy load the restore path's p95 grows (see the throughput and density tables in [docs/results.md](results.md)), because the nodes share the VM's 4 vCPUs with each other and with the load generator.
+
 ### Observability and tooling
 
 - Each metric instrument is looked up on every call instead of once.
@@ -787,16 +791,15 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 ### What to do next
 
-1. Start the VM, run `make test-integration`, `make demo`, `make bench` (which runs `make hardware` first) and `make results`, and check the dashboard. Commit `results/*.json`, including `results/hardware.json`, and the rendered `docs/results.md`.
-2. Push the repository and let both CI jobs run; record which ones passed in the README.
-3. Re-read D21 (weights) and D16 (pool size) against the measured start latencies.
-4. mTLS between the scheduler and the nodes, with node certificates; then authentication for clients.
-5. A suspect state before death (D19), and a node that fences itself when it cannot reach the scheduler.
-6. Leader election over the same soft state, so a second scheduler can take over.
-7. pidfd-based liveness; image garbage collection; a pinned base image digest.
-8. A warm pool with network namespaces made ahead of time, so egress sandboxes can be claimed.
-9. Measure gVisor's KVM platform on a host that exposes `/dev/kvm`.
-10. Periodic checkpoints shipped off the node, for sessions that should survive node loss (D23).
+1. Push the repository and let both CI jobs run; record which ones passed in the README.
+2. Re-read D21 (weights) and D16 (pool size) against the measured start latencies.
+3. mTLS between the scheduler and the nodes, with node certificates; then authentication for clients.
+4. A suspect state before death (D19), and a node that fences itself when it cannot reach the scheduler.
+5. Leader election over the same soft state, so a second scheduler can take over.
+6. pidfd-based liveness; image garbage collection; a pinned base image digest.
+7. A warm pool with network namespaces made ahead of time, so egress sandboxes can be claimed.
+8. Measure gVisor's KVM platform on a host that exposes `/dev/kvm`.
+9. Periodic checkpoints shipped off the node, for sessions that should survive node loss (D23).
 
 ## Index of calls
 

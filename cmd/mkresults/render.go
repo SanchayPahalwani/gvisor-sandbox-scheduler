@@ -601,12 +601,42 @@ func renderGroupLoss(in *Inputs) string {
 	return b.String()
 }
 
+// rampReach says how far the density ramp got without a failed start or Exec:
+// the last row's live count when no row has failures, otherwise the last row
+// before the first failure. It returns "" when the rows do not say.
+func rampReach(r *bench.Run) string {
+	reached, found := 0.0, false
+	for _, row := range r.Rows {
+		live, ok := rowNum(row, "live")
+		if !ok {
+			continue
+		}
+		if f, ok := rowNum(row, "failed"); ok && f > 0 {
+			if !found {
+				return "; the ramp stopped at its first failure"
+			}
+			return "; the ramp reached " + fmtInt(reached) + " before the first failed start or Exec"
+		}
+		reached, found = live, true
+	}
+	if !found {
+		return ""
+	}
+	return "; the ramp reached " + fmtInt(reached) + " with no failed start or Exec"
+}
+
 func renderCaveats(in *Inputs) string {
 	vcpus := "its vCPUs"
 	if n, ok := in.Hardware.vcpus(); ok {
 		vcpus = fmt.Sprintf("its %d vCPUs", n)
 	}
-	return bullets([]string{
+	densitySentence := ""
+	if in.Density != nil {
+		if n, ok := in.Density.Params["per_step"].(float64); ok {
+			densitySentence = fmt.Sprintf("Density p95 values come from %s samples per step (the `per_step` parameter), so a single slow start moves them; the 2x rule is therefore strict.", fmtInt(n))
+		}
+	}
+	items := []string{
 		"One laptop. Every number comes from one machine.",
 		"Nodes are processes in one VM and share " + vcpus + ", so they compete for CPU with each other and with the load generator.",
 		"Node capacities are declared with flags, not measured.",
@@ -615,7 +645,11 @@ func renderCaveats(in *Inputs) string {
 		primedSentence(in.Start) + " The start-latency figures say nothing about other Python code or other packages.",
 		"Observability was off during the runs (spec D25): no OTLP export and no observability container.",
 		"A single run each. There are no repeats and no confidence intervals, so small differences between rows are not evidence.",
-	})
+	}
+	if densitySentence != "" {
+		items = append(items, densitySentence)
+	}
+	return bullets(items)
 }
 
 // Summary returns the README block: a table of the headline numbers.
@@ -641,7 +675,7 @@ func Summary(in *Inputs) string {
 	add("Throughput (create, Exec, destroy)", v, "throughput.json")
 	v = notRun
 	if r := in.Density; r != nil {
-		v = scalar(r, "max_live_within_2x", fmtInt) + " live sandboxes, with restore-start p95 staying within 2x of the first step's"
+		v = scalar(r, "max_live_within_2x", fmtInt) + " within 2x of the first step's restore-start p95" + rampReach(r)
 	}
 	add("Sandboxes per node", v, "density.json")
 	v = notRun

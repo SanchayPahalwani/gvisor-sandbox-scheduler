@@ -146,3 +146,4 @@ The scheduler ran with the spread policy (spec D35), which splits the sessions e
 - Primed set (the node agent's default, `bundle.DefaultPrime`): json,re,math,random,statistics,datetime,collections,itertools,functools,decimal,csv,io,numpy,pandas. The start-latency figures say nothing about other Python code or other packages.
 - Observability was off during the runs (spec D25): no OTLP export and no observability container.
 - A single run each. There are no repeats and no confidence intervals, so small differences between rows are not evidence.
+- Density p95 values come from 10 samples per step (the `per_step` parameter), so a single slow start moves them; the 2x rule is therefore strict.

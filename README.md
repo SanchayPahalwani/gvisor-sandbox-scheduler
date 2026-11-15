@@ -2,7 +2,7 @@
 
 A small reference implementation of sandboxes for code written by an AI agent. A Go node agent runs each sandbox as a gVisor (`runsc`) container built from an OCI bundle, with CPU and memory limits, no network unless the request carries an egress allowlist, and three ways to start: cold, restored from a checkpoint of a Python interpreter that has already done its imports, or claimed from a warm pool. A Go scheduler takes sandbox requests over gRPC, places each one with a filter and score policy modelled on kube-scheduler, proxies the command output streams, and starts the sandboxes of a node that stops heartbeating again on other nodes. Everything runs on one laptop, in one Linux VM; the "nodes" are processes in that VM.
 
-Status in one line: the code is written, reviewed and unit-tested on macOS; nothing that needs Linux has run against it yet (see [Status](#status)).
+Status in one line: the code is written, reviewed and unit-tested on macOS, and the integration tests, the demo, the benchmarks and the telemetry check have run in a Linux VM on one laptop (see [Status](#status)).
 
 ## How the pieces fit
 
@@ -70,13 +70,13 @@ Inside the VM, [lima/gss.yaml](lima/gss.yaml) installs from official sources: Go
    sandbox sb-<id> node=<node> group=<group> start=<cold|restore|warm> ready=<ms> total=<ms>
    ```
 
-   `ready` is the node-side time from receiving Create to a ready sandbox; `total` is from sending Create to receiving the exit event. With the default settings every node keeps two warm sandboxes, so the expected start path is `warm`. This has not been run yet; no output is shown here for that reason.
+   `ready` is the node-side time from receiving Create to a ready sandbox; `total` is from sending Create to receiving the exit event. With the default settings every node keeps two warm sandboxes, so the expected start path is `warm`. The demo has run in the VM; no output is pasted here, because the `ready` and `total` figures differ from run to run.
 
 The cluster keeps running afterwards. `gssctl ps`, `gssctl nodes` and `gssctl explain <id>` (the nodes considered and the per-plugin scores of the top candidates) work against it.
 
 ## Results
 
-The block below is written by `make results` from the JSON files under `results/`; no number in it is typed by hand. No benchmark has run yet, so every row says "not run".
+The block below is written by `make results` from the JSON files under `results/`; no number in it is typed by hand. The numbers are from one run of each benchmark on the machine named below.
 
 <!-- results:begin -->
 | Metric | Value | Source |
@@ -85,14 +85,16 @@ The block below is written by `make results` from the JSON files under `results/
 | Start latency, restore (ready p50 / p95) | 144 / 230 ms | `start.json` |
 | Start latency, warm (ready p50 / p95) | 0.1 / 0.5 ms | `start.json` |
 | Throughput (create, Exec, destroy) | 7.1 sandboxes/s (8 workers, 1m0s) | `throughput.json` |
-| Sandboxes per node | 20 live sandboxes, with restore-start p95 staying within 2x of the first step's | `density.json` |
+| Sandboxes per node | 20 within 2x of the first step's restore-start p95; the ramp reached 60 with no failed start or Exec | `density.json` |
 | Placement, default policy, fill scenario | 38253 decisions/s | `schedsim.json` |
 | Group-loss recovery (local failure-domain test) | 3567 ms without retry, 3905 ms with retry | `grouploss.json, grouploss-retry.json` |
 
 Hardware: MacBook Pro, Apple M3 Pro, 6 performance + 6 efficiency cores, 18 GiB, macOS 26.5.2; VM: 4 vCPUs, 5910 MiB, Linux 6.8.0-147-generic, Ubuntu 24.04.5 LTS, runsc version release-20261102.0, go1.27.4, virtualization apple. Full tables, commands and caveats: [docs/results.md](docs/results.md).
 <!-- results:end -->
 
-The benchmarks are meant to run on one laptop: an Apple M3 Pro (arm64) with one Lima VM (Apple Virtualization.framework, Ubuntu 24.04 arm64, 4 vCPU, 6 GiB). All nodes are processes in that VM and share its vCPUs; their capacity is declared with flags. gVisor is runsc release-20261102.0 on the systrap platform, the only platform the benchmarks use; Go is 1.27.4. `make hardware` records the exact machine in `results/hardware.json` (`make bench` runs it first), and `make results` prints it under every table. `make results` also writes `docs/results.md` with the full tables, commands and caveats; that file does not exist until the benchmarks have run. [docs/design.md](docs/design.md#11-benchmarks) says what each benchmark measures and how to read it.
+**What the results show.** Restore gets a sandbox ready roughly an order of magnitude faster than a cold start (see the start latency rows). A warm claim makes no `runsc` call, so its time to ready is dominated by bookkeeping, and the time to first result is then mostly the Exec itself. Recovery from losing a whole node group is bounded by the 3 s failure threshold plus the time to start the lost sandboxes again, and with client retries no request was lost. The placement policy's cost per decision is small next to the cost of starting a sandbox. All of this is one run on one laptop, with nodes sharing the VM's vCPUs; [docs/results.md](docs/results.md) has the full tables and caveats.
+
+The benchmarks ran on one laptop: an Apple M3 Pro (arm64) with one Lima VM (Apple Virtualization.framework, Ubuntu 24.04 arm64, 4 vCPU, 6 GiB). All nodes are processes in that VM and share its vCPUs; their capacity is declared with flags. gVisor is runsc release-20261102.0 on the systrap platform, the only platform the benchmarks use; Go is 1.27.4. `make hardware` records the exact machine in `results/hardware.json` (`make bench` runs it first), and `make results` prints it under every table. `make results` also writes `docs/results.md` with the full tables, commands and caveats; it is committed. [docs/design.md](docs/design.md#11-benchmarks) says what each benchmark measures and how to read it.
 
 ## Repository map
 
@@ -127,7 +129,7 @@ The benchmarks are meant to run on one laptop: an Apple M3 Pro (arm64) with one 
 - [docs/design.md](docs/design.md): every design choice with its reason, the alternative, and what would change the answer. Isolation (gVisor, Firecracker, runc), the gVisor platform, the sandbox, the network, start paths, the scheduler, failure handling, the mapping to Kubernetes, observability, benchmarks, what is not built, known limits.
 - [docs/walkthrough.md](docs/walkthrough.md): one `gssctl run -c 'print(1)'` followed through the code, then what happens when the node dies mid-session. About 30 minutes.
 - [docs/prior-art.md](docs/prior-art.md): existing projects in the same space and how this one differs.
-- `docs/results.md`: benchmark tables, written by `make results` (not present until the benchmarks run).
+- `docs/results.md`: benchmark tables, commands and caveats, written by `make results`.
 - [docs/superpowers/specs/2026-11-12-agent-sandbox-design.md](docs/superpowers/specs/2026-11-12-agent-sandbox-design.md): the build spec, with the 37 design calls (D1 to D37) the design document explains.
 - [docs/superpowers/plans/2026-11-12-gvisor-sandbox-scheduler.md](docs/superpowers/plans/2026-11-12-gvisor-sandbox-scheduler.md): the task plan the code was built from.
 
@@ -146,8 +148,12 @@ This is a reference implementation for reading and discussion. Not built:
 
 - All code is written and reviewed, and is on `main` as local commits. The repository has not been pushed.
 - Unit tests pass on macOS (arm64): `go test -race ./...`.
-- The Lima VM has been switched off, so nothing that needs Linux has run against the code on `main`: no integration test (`make test-integration`), no `make demo`, no benchmark, and no check of the Grafana dashboard. Some integration tests of the first packages ran in the VM while those packages were being written; the code has changed since, so those runs are not evidence for the current code.
-- CI: [.github/workflows/ci.yml](.github/workflows/ci.yml) defines a unit job and an integration job. Neither has run on a hosted runner, because the repository has not been pushed.
+- The Linux batch ran in the Lima VM on 2026-11-15 (Ubuntu 24.04 arm64 on an Apple M3 Pro, `runsc` release-20261102.0, systrap platform):
+  - `make test-integration` passed for every package. A verbose rerun counted 36 integration tests passed, none skipped, none failed.
+  - `make demo` ran. Four nodes became READY, and both examples ran in gVisor sandboxes started from the warm pool. Exit codes pass through; `--allow` reaches the allowed address, a sandbox with no allowlist gets "Network is unreachable", and an address off the list times out. `make down` left nothing behind.
+  - Telemetry was checked with `make obs-up`: Grafana answers, the dashboard is provisioned, Prometheus has every `gss_` metric with its labels, and one `gssctl run` gives traces that cross `gssctl`, the scheduler and the node agent down to the `runsc` spans.
+  - `make bench` produced every results file, and `make results` rendered `docs/results.md` and the block above. The group-loss run first failed because `systemctl kill` cannot signal gVisor's `runsc-fd-parking` helper processes; `scripts/cluster.sh` was fixed (commit d5d5cc4) and the run then passed.
+- CI: [.github/workflows/ci.yml](.github/workflows/ci.yml) defines a unit job and an integration job. No CI job has run on a hosted runner, because the repository has not been pushed.
 - There are no users, and the project has never run on more than one machine.
 
 ## License
