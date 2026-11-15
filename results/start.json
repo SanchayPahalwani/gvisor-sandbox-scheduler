@@ -1,0 +1,130 @@
+{
+  "name": "start",
+  "command": "bin/loadgen start --out results/start.json",
+  "started_at": "2026-11-15T16:13:31.956930341Z",
+  "seconds": 70.460244227,
+  "params": {
+    "code": "print(\"hello\")",
+    "cpu_millis": 500,
+    "group": "a",
+    "memory_mib": 256,
+    "modes": "cold,restore,warm",
+    "n": 30,
+    "warm_retries_max": 10,
+    "warm_retry_pause": "500ms",
+    "warm_wait": "20s"
+  },
+  "series": [
+    {
+      "name": "cold_ready_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 1206.560186,
+      "mean": 1528.7932502413796,
+      "p50": 1462.586174,
+      "p95": 2110.206071,
+      "p99": 2728.059265,
+      "max": 2728.059265
+    },
+    {
+      "name": "cold_create_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 1210.614709,
+      "mean": 1542.5619286896558,
+      "p50": 1486.251496,
+      "p95": 2126.304752,
+      "p99": 2756.485737,
+      "max": 2756.485737
+    },
+    {
+      "name": "cold_first_result_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 1310.906448,
+      "mean": 1696.3245458965519,
+      "p50": 1709.155489,
+      "p95": 2332.491202,
+      "p99": 3019.791339,
+      "max": 3019.791339
+    },
+    {
+      "name": "restore_ready_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 81.061908,
+      "mean": 158.5525628965517,
+      "p50": 143.96074,
+      "p95": 229.99319,
+      "p99": 630.421205,
+      "max": 630.421205
+    },
+    {
+      "name": "restore_create_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 84.32819,
+      "mean": 167.98425044827584,
+      "p50": 148.732819,
+      "p95": 233.477859,
+      "p99": 633.853621,
+      "max": 633.853621
+    },
+    {
+      "name": "restore_first_result_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 208.446702,
+      "mean": 321.3795883793104,
+      "p50": 303.256194,
+      "p95": 551.815892,
+      "p99": 830.933147,
+      "max": 830.933147
+    },
+    {
+      "name": "warm_ready_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 0.075503,
+      "mean": 0.19295479310344832,
+      "p50": 0.147216,
+      "p95": 0.464897,
+      "p99": 0.578362,
+      "max": 0.578362
+    },
+    {
+      "name": "warm_create_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 0.54736,
+      "mean": 1.4552241724137929,
+      "p50": 1.172598,
+      "p95": 3.587674,
+      "p99": 6.76016,
+      "max": 6.76016
+    },
+    {
+      "name": "warm_first_result_ms",
+      "unit": "ms",
+      "count": 29,
+      "min": 44.94443,
+      "mean": 132.56898051724139,
+      "p50": 125.127017,
+      "p95": 225.686417,
+      "p99": 246.884011,
+      "max": 246.884011
+    }
+  ],
+  "scalars": {
+    "warm_retries": 0
+  },
+  "errors": 0,
+  "notes": [
+    "the first successful cycle of each mode is a warm-up and is not recorded, so with no errors each series has n-1 samples",
+    "\u003cmode\u003e_ready_ms is the start_latency in the CreateSandbox response: node agent receives Create -\u003e sandbox ready",
+    "\u003cmode\u003e_create_ms is the client-side CreateSandbox round trip",
+    "\u003cmode\u003e_first_result_ms is CreateSandbox sent -\u003e exit event of the Exec of print(\"hello\")",
+    "a cycle with any failed call (create, Exec, destroy) or a start path other than the forced one counts in errors and gives no sample; a destroy that fails after such a failure counts as one more error",
+    "warm_retries counts forced-warm creates retried after FailedPrecondition (stale warm count); a retried attempt is not a sample and its successor's clock starts at its own Create"
+  ]
+}

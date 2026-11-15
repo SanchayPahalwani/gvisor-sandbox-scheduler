@@ -1,0 +1,51 @@
+{
+  "name": "throughput",
+  "command": "bin/loadgen throughput --out results/throughput.json",
+  "started_at": "2026-11-15T16:14:44.484908611Z",
+  "seconds": 61.215122737,
+  "params": {
+    "code": "print(\"hello\")",
+    "cpu_millis": 500,
+    "duration": "1m0s",
+    "memory_mib": 256,
+    "start_mode": "auto",
+    "workers": 8
+  },
+  "series": [
+    {
+      "name": "first_result_ms",
+      "unit": "ms",
+      "count": 433,
+      "min": 140.694419,
+      "mean": 1024.1952209930719,
+      "p50": 787.462428,
+      "p95": 2659.331377,
+      "p99": 3915.829118,
+      "max": 4807.425529
+    },
+    {
+      "name": "ready_ms",
+      "unit": "ms",
+      "count": 433,
+      "min": 0.067628,
+      "mean": 436.4697096374134,
+      "p50": 1.286273,
+      "p95": 1659.876395,
+      "p99": 2552.61147,
+      "max": 3241.57695
+    }
+  ],
+  "scalars": {
+    "sandboxes_per_sec": 7.0734155326341215,
+    "share_cold": 0,
+    "share_restore": 0.44110854503464203,
+    "share_warm": 0.558891454965358
+  },
+  "errors": 0,
+  "notes": [
+    "sandboxes_per_sec is completed create -\u003e Exec -\u003e destroy cycles divided by the wall time from the first create to the end of the last cycle",
+    "share_* is the fraction of completed cycles whose sandbox started on that path (started_as)",
+    "first_result_ms is CreateSandbox sent -\u003e exit event of print(\"hello\"); ready_ms is the start_latency in the response",
+    "a cycle with any failed call counts in errors and in no other figure; a destroy that fails after such a failure counts as one more error"
+  ]
+}

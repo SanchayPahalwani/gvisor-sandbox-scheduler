@@ -81,15 +81,15 @@ The block below is written by `make results` from the JSON files under `results/
 <!-- results:begin -->
 | Metric | Value | Source |
 | --- | --- | --- |
-| Start latency, cold (ready p50 / p95) | not run | `start.json` |
-| Start latency, restore (ready p50 / p95) | not run | `start.json` |
-| Start latency, warm (ready p50 / p95) | not run | `start.json` |
-| Throughput (create, Exec, destroy) | not run | `throughput.json` |
-| Sandboxes per node | not run | `density.json` |
-| Placement, default policy, fill scenario | not run | `schedsim.json` |
-| Group-loss recovery (local failure-domain test) | not run | `grouploss.json, grouploss-retry.json` |
+| Start latency, cold (ready p50 / p95) | 1463 / 2110 ms | `start.json` |
+| Start latency, restore (ready p50 / p95) | 144 / 230 ms | `start.json` |
+| Start latency, warm (ready p50 / p95) | 0.1 / 0.5 ms | `start.json` |
+| Throughput (create, Exec, destroy) | 7.1 sandboxes/s (8 workers, 1m0s) | `throughput.json` |
+| Sandboxes per node | 20 live sandboxes, with restore-start p95 staying within 2x of the first step's | `density.json` |
+| Placement, default policy, fill scenario | 38253 decisions/s | `schedsim.json` |
+| Group-loss recovery (local failure-domain test) | 3567 ms without retry, 3905 ms with retry | `grouploss.json, grouploss-retry.json` |
 
-Hardware: hardware not run (results/hardware.json missing).
+Hardware: MacBook Pro, Apple M3 Pro, 6 performance + 6 efficiency cores, 18 GiB, macOS 26.5.2; VM: 4 vCPUs, 5910 MiB, Linux 6.8.0-147-generic, Ubuntu 24.04.5 LTS, runsc version release-20261102.0, go1.27.4, virtualization apple. Full tables, commands and caveats: [docs/results.md](docs/results.md).
 <!-- results:end -->
 
 The benchmarks are meant to run on one laptop: an Apple M3 Pro (arm64) with one Lima VM (Apple Virtualization.framework, Ubuntu 24.04 arm64, 4 vCPU, 6 GiB). All nodes are processes in that VM and share its vCPUs; their capacity is declared with flags. gVisor is runsc release-20261102.0 on the systrap platform, the only platform the benchmarks use; Go is 1.27.4. `make hardware` records the exact machine in `results/hardware.json` (`make bench` runs it first), and `make results` prints it under every table. `make results` also writes `docs/results.md` with the full tables, commands and caveats; that file does not exist until the benchmarks have run. [docs/design.md](docs/design.md#11-benchmarks) says what each benchmark measures and how to read it.

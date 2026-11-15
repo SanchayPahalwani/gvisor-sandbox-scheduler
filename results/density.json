@@ -1,0 +1,142 @@
+{
+  "name": "density",
+  "command": "bin/loadgen density --out results/density.json",
+  "started_at": "2026-11-15T16:15:47.811741596Z",
+  "seconds": 137.431814599,
+  "params": {
+    "code": "print(\"hello\")",
+    "cpu_millis": 250,
+    "memory_mib": 192,
+    "node": "a1",
+    "per_step": 10,
+    "start_mode": "restore",
+    "steps": [
+      5,
+      10,
+      20,
+      30,
+      40,
+      50,
+      60
+    ],
+    "ttl": "30m0s"
+  },
+  "series": [],
+  "scalars": {
+    "baseline_start_p95_ms": 448.221332,
+    "max_live_within_2x": 20
+  },
+  "rows": [
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 310.827555,
+      "exec_p95_ms": 708.774521,
+      "failed": 0,
+      "live": 5,
+      "lost": 0,
+      "node_mem_available_mib": 5038,
+      "start_n": 10,
+      "start_p50_ms": 278.1432,
+      "start_p95_ms": 448.221332,
+      "step": 5,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 287.373967,
+      "exec_p95_ms": 518.148212,
+      "failed": 0,
+      "live": 10,
+      "lost": 0,
+      "node_mem_available_mib": 4650,
+      "start_n": 10,
+      "start_p50_ms": 262.907504,
+      "start_p95_ms": 643.105989,
+      "step": 10,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 394.650649,
+      "exec_p95_ms": 701.213761,
+      "failed": 0,
+      "live": 20,
+      "lost": 0,
+      "node_mem_available_mib": 4103,
+      "start_n": 10,
+      "start_p50_ms": 209.182088,
+      "start_p95_ms": 424.803483,
+      "step": 20,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 460.458585,
+      "exec_p95_ms": 745.460161,
+      "failed": 0,
+      "live": 30,
+      "lost": 0,
+      "node_mem_available_mib": 3663,
+      "start_n": 10,
+      "start_p50_ms": 244.868243,
+      "start_p95_ms": 1057.516831,
+      "step": 30,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 322.953365,
+      "exec_p95_ms": 546.789165,
+      "failed": 0,
+      "live": 40,
+      "lost": 0,
+      "node_mem_available_mib": 3061,
+      "start_n": 10,
+      "start_p50_ms": 307.815739,
+      "start_p95_ms": 894.932749,
+      "step": 40,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 295.870195,
+      "exec_p95_ms": 485.258682,
+      "failed": 0,
+      "live": 50,
+      "lost": 0,
+      "node_mem_available_mib": 2540,
+      "start_n": 10,
+      "start_p50_ms": 248.502759,
+      "start_p95_ms": 1830.123665,
+      "step": 50,
+      "unconfirmed": 0
+    },
+    {
+      "exec_n": 10,
+      "exec_p50_ms": 325.273564,
+      "exec_p95_ms": 589.096289,
+      "failed": 0,
+      "live": 60,
+      "lost": 0,
+      "node_mem_available_mib": 1937,
+      "start_n": 10,
+      "start_p50_ms": 207.795505,
+      "start_p95_ms": 1265.774918,
+      "step": 60,
+      "unconfirmed": 0
+    }
+  ],
+  "errors": 0,
+  "notes": [
+    "the ramp reached the last step (60) without a failure",
+    "start_* is the start_latency in the CreateSandbox response of a forced restore (node agent receives Create -\u003e ready), from per_step create -\u003e Exec -\u003e destroy cycles run while the step's sandboxes are live",
+    "exec_* is Exec sent -\u003e exit event of print(\"hello\") in a live sandbox picked at random",
+    "live is the number of sandboxes this run created and kept at that step",
+    "lost counts kept sandboxes that GetSandbox, after the step's measurements, did not show READY at the incarnation they were created at; a restarted sandbox answers Execs again, so Exec success alone would hide it",
+    "unconfirmed counts kept sandboxes whose GetSandbox call failed after the step's measurements, so their state is not known",
+    "failed counts failed creates, restore starts and Execs at that step, and each lost or unconfirmed sandbox",
+    "max_live_within_2x is the live count of the last step before the first one with a failure or with start_p95_ms \u003e 2 x baseline_start_p95_ms (the first step's)",
+    "node_mem_available_mib is MemAvailable from /proc/meminfo on the machine loadgen runs on (the VM that runs the node), read after the step's sandboxes were created",
+    "start_p95_ms was above 2 x baseline at step 30; max_live_within_2x counts only the steps before it"
+  ]
+}
