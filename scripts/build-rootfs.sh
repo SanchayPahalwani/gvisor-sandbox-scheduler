@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Builds the python sandbox root filesystem into /var/lib/gss/rootfs/python (Linux only).
-# The build ID in /var/lib/gss/rootfs/python.id is a sha256 over the Dockerfile, zygote.py
-# and the pyfork binary; the build is skipped when it already matches, unless FORCE=1.
+# The build ID in /var/lib/gss/rootfs/python.id is a sha256 over the Dockerfile, zygote.py,
+# the pyfork binary and this script; the build is skipped when it already matches, unless
+# FORCE=1. A new tree replaces the old one, which is then removed, so the script refuses
+# to build one while any gss-* systemd unit is active (the cluster is up: its sandboxes
+# and warm pools use the tree); FORCE=1 overrides that too.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -40,6 +43,19 @@ id=$(cat "$ctx/Dockerfile" "$ctx/zygote.py" "$ctx/pyfork" scripts/build-rootfs.s
 if [[ "${FORCE:-0}" != 1 ]] && sudo test -d "$dest" && [[ "$(sudo cat "$idfile" 2>/dev/null || true)" == "$id" ]]; then
 	echo "rootfs $dest is up to date ($id)"
 	exit 0
+fi
+
+# Never swap the tree under a running cluster. Failed units are not counted: their
+# sandboxes went with them. Without systemd there is no cluster (scripts/cluster.sh
+# needs it).
+if [[ "${FORCE:-0}" != 1 ]] && command -v systemctl >/dev/null 2>&1; then
+	units=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading 'gss-*' 2>/dev/null |
+		awk '{print $1}') || units=""
+	if [[ -n "$units" ]]; then
+		echo "build-rootfs.sh: the cluster is running; run \`make down\` first (or FORCE=1)" >&2
+		echo "build-rootfs.sh: active units: ${units//$'\n'/ }" >&2
+		exit 1
+	fi
 fi
 
 if [[ "$(basename "$CLI")" == nerdctl ]]; then

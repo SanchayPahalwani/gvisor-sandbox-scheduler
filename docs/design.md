@@ -183,7 +183,7 @@ D5 (no emulation, [section 1](#where-it-runs)) completes the picture: the platfo
 
 **D14. The rootfs comes from a Dockerfile, built with rootless nerdctl in the VM.**
 
-- *Choice.* [images/python/Dockerfile](../images/python/Dockerfile) is `python:3.13-slim` plus numpy 2.5.4 and pandas 3.1.1 (pinned), a uid 1000 user, `/work`, `/gss/zygote.py` and `/gss/pyfork`. [scripts/build-rootfs.sh](../scripts/build-rootfs.sh) builds it with the rootless nerdctl that Lima ships and exports it to `/var/lib/gss/rootfs/python`. The build ID, a sha256 over the Dockerfile, `zygote.py`, the `pyfork` binary and the script, goes in `python.id`; the build is skipped when it matches.
+- *Choice.* [images/python/Dockerfile](../images/python/Dockerfile) is `python:3.13-slim` plus numpy 2.5.4 and pandas 3.1.1 (pinned), a uid 1000 user, `/work`, `/gss/zygote.py` and `/gss/pyfork`. [scripts/build-rootfs.sh](../scripts/build-rootfs.sh) builds it with the rootless nerdctl that Lima ships and exports it to `/var/lib/gss/rootfs/python`. The build ID, a sha256 over the Dockerfile, `zygote.py`, the `pyfork` binary and the script, goes in `python.id`; the build is skipped when it matches. A new tree replaces the old one, which is removed at once, so the script refuses to build while any `gss-*` systemd unit is active (`FORCE=1` overrides).
 - *Why.* A Dockerfile is the form most readers know, and exporting the image to a directory makes "an OCI bundle is a directory plus `config.json`" concrete. The host's Docker is not used.
 - *Alternative.* Pulling layers from a registry and unpacking them, as Ray Sandboxes does (per prior-art), or a debootstrap tree.
 - *What would change it.* Many images or many machines: then a content-addressed image store with pulls and a local cache.
@@ -737,7 +737,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 - A process that leaves its process group can outlive an Exec timeout until the TTL or a Destroy; a background process that holds stdout or stderr open delays the end of the Exec stream by up to 2 s.
 - A program over its memory limit usually ends the sandbox (D32).
 - A claimed pool sandbox shows the pool's default memory in `/proc/meminfo` (D16).
-- The rootfs `FROM` tag is not pinned to a digest, and `make rootfs` swaps the tree with two renames and removes the old one at once: rebuild it only with the cluster down.
+- The rootfs `FROM` tag is not pinned to a digest. `make rootfs` swaps the tree with two renames and removes the old one at once; it refuses while a `gss-*` systemd unit is active, but it does not see agents started outside systemd (the integration tests start their own), and `FORCE=1` skips the check.
 - Old checkpoint images for keys no longer in use are never removed.
 - If `runsc --version` fails when an agent starts, the image key stays empty and the node starts sandboxes cold until it restarts.
 - The zygote treats a timeout or environment that is a falsy non-number (an empty string, for example) as absent; `pyfork` never sends one.
