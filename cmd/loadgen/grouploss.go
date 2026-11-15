@@ -100,8 +100,8 @@ func policyNote(policy, loseGroup string) string {
 	case "":
 		return "the scheduler's placement policy was not recorded (--sched-policy not given)"
 	case "spread":
-		return fmt.Sprintf("the scheduler ran with --policy spread (spec D35) so the sessions land on both groups: "+
-			"under bin-packing all sessions fit on one node, and losing group %s would affect none of them", loseGroup)
+		return fmt.Sprintf("the scheduler ran with --policy spread (spec D35), which splits the sessions evenly between the groups on every run: "+
+			"under the default policy the split depends on warm-pool refill and heartbeat timing, so the number of sessions lost with group %s would vary from run to run", loseGroup)
 	}
 	return "the scheduler ran with --policy " + policy
 }

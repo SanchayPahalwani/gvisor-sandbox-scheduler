@@ -8,8 +8,9 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cluster=scripts/cluster.sh
 loadgen=bin/loadgen
-# Spec D35: under bin-packing all sessions fit on one node, so the scheduler runs with
-# the spread policy and the sessions land on both groups. loadgen records it.
+# Spec D35: under the default policy the split of sessions between the groups depends on
+# warm-pool refill and heartbeat timing, so the sessions lost would vary from run to run;
+# the spread policy gives an even split every run. loadgen records the policy.
 policy=spread
 
 if [[ "$(uname -s)" != Linux ]]; then

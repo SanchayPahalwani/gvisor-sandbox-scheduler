@@ -158,7 +158,7 @@ func TestGroupLossMetrics(t *testing.T) {
 				t.Errorf("summary does not start with the local failure-domain line:\n%s", summary.String())
 			}
 			// Spec D35: both the notes and the summary say the spread policy was used, and why.
-			const why = "under bin-packing all sessions fit on one node"
+			const why = "depends on warm-pool refill and heartbeat timing"
 			for name, text := range map[string]string{"notes": notes, "summary": summary.String()} {
 				if !strings.Contains(text, "spread") || !strings.Contains(text, why) {
 					t.Errorf("%s do not say the spread policy was used and why:\n%s", name, text)
