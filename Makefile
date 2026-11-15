@@ -6,8 +6,10 @@ UNAME := $(shell uname -s)
 PKG ?= ./...
 RUN ?= .
 # Variables forwarded into the VM invocation. Append new ones here. The GSS_* ones are
-# the cluster topology read by scripts/cluster.sh (an empty one means its default).
-FORWARD_VARS := PKG RUN FORCE GSS_NODES GSS_NODE_CPU GSS_NODE_MEM GSS_NODE_MAX GSS_POOL GSS_SCHED_ARGS
+# the cluster topology read by scripts/cluster.sh (an empty one means its default);
+# OTEL_EXPORTER_OTLP_ENDPOINT turns on OTLP export in the units it starts (spec 9),
+# and the benchmark targets refuse to run with it set (spec D25).
+FORWARD_VARS := PKG RUN FORCE GSS_NODES GSS_NODE_CPU GSS_NODE_MEM GSS_NODE_MAX GSS_POOL GSS_SCHED_ARGS OTEL_EXPORTER_OTLP_ENDPOINT
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
 LINUX_TARGETS := build test-integration rootfs bench bench-start bench-throughput bench-density bench-grouploss up down status demo

@@ -19,11 +19,13 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 )
 
 const usage = `usage: gssctl [--scheduler ADDR] <command> [flags]
@@ -57,6 +59,8 @@ spec flags:
 -c CODE runs Python code in a fork of the primed interpreter, -f FILE runs
 the code in FILE the same way, and -- ARGV... runs ARGV as a new process.
 Run "gssctl <command> -h" for a command's flags.
+
+With OTEL_EXPORTER_OTLP_ENDPOINT set, gssctl exports a trace of each call.
 `
 
 const (
@@ -80,6 +84,8 @@ const (
 	execSlack      = 30 * time.Second
 	destroyTimeout = 30 * time.Second
 	queryTimeout   = 10 * time.Second
+	// flushTimeout bounds the export, at exit, of what telemetry still holds.
+	flushTimeout = 2 * time.Second
 )
 
 // Exit codes of gssctl's own failures; run and exec otherwise exit with the program's.
@@ -105,6 +111,20 @@ func main() { os.Exit(gssctl(os.Args[1:])) }
 func gssctl(args []string) int {
 	ctx, stop := notifyContext(context.Background())
 	defer stop()
+	// Telemetry exports only while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec section
+	// 9); unset, Setup installs nothing and the flush is a no-op.
+	shutdown, err := telemetry.Setup(ctx, "gssctl")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gssctl: %v\n", err)
+		return exitFail
+	}
+	defer func() {
+		fctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+		defer cancel()
+		if err := shutdown(fctx); err != nil {
+			fmt.Fprintf(os.Stderr, "gssctl: telemetry flush failed: %v\n", err)
+		}
+	}()
 	c := &cli{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, now: time.Now, dial: dial}
 	return c.main(ctx, args)
 }
@@ -135,10 +155,13 @@ func notifyContext(parent context.Context) (context.Context, func()) {
 	}
 }
 
+// dial connects to the scheduler with the otelgrpc client handler: with telemetry
+// on, each call is the root span of its trace (spec section 9).
 func dial(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxMsgSize), grpc.MaxCallRecvMsgSize(maxMsgSize)))
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxMsgSize), grpc.MaxCallRecvMsgSize(maxMsgSize)),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 }
 
 // cli is one gssctl invocation, with its outputs, environment, clock and dialer.

@@ -253,7 +253,7 @@ func TestSignals(t *testing.T) {
 // below runs the test binary again as a gssctl process, with the arguments after "--".
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GSSCTL_HELPER_PROCESS") != "1" {
-		t.Skip("only as a child of TestRunBrokenPipeProcess")
+		t.Skip("only as the child of a *Process test")
 	}
 	args := os.Args
 	for i, a := range args {
@@ -265,10 +265,9 @@ func TestHelperProcess(t *testing.T) {
 	os.Exit(gssctl(args))
 }
 
-// A gssctl process whose stdout reader is gone (gssctl run ... | head -0) is not
-// killed by SIGPIPE: the write fails, the sandbox is destroyed, gssctl exits 1.
-func TestRunBrokenPipeProcess(t *testing.T) {
-	f := &fake{}
+// serveTCP serves f on a loopback port, for tests that run gssctl as a process.
+func serveTCP(t *testing.T, f *fake) string {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -277,15 +276,33 @@ func TestRunBrokenPipeProcess(t *testing.T) {
 	gssv1.RegisterSandboxServiceServer(srv, f)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
+	return lis.Addr().String()
+}
 
+// gssctlProcess is the command that runs gssctl with args as a child process, with
+// OTEL_EXPORTER_OTLP_ENDPOINT set to otel (empty: telemetry off).
+func gssctlProcess(otel string, args ...string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0], append([]string{"-test.run=^TestHelperProcess$", "--"}, args...)...)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "OTEL_") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GSSCTL_HELPER_PROCESS=1", "OTEL_EXPORTER_OTLP_ENDPOINT="+otel)
+	return cmd
+}
+
+// A gssctl process whose stdout reader is gone (gssctl run ... | head -0) is not
+// killed by SIGPIPE: the write fails, the sandbox is destroyed, gssctl exits 1.
+func TestRunBrokenPipeProcess(t *testing.T) {
+	f := &fake{}
+	addr := serveTCP(t, f)
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.Close() // no reader: the first write to stdout raises SIGPIPE
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--",
-		"--scheduler", lis.Addr().String(), "run", "-c", "print(1)")
-	cmd.Env = append(os.Environ(), "GSSCTL_HELPER_PROCESS=1")
+	cmd := gssctlProcess("", "--scheduler", addr, "run", "-c", "print(1)")
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = w, &stderr
 	err = cmd.Run()
@@ -296,6 +313,44 @@ func TestRunBrokenPipeProcess(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "broken pipe") {
 		t.Errorf("stderr = %q, want the write error", stderr.String())
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if strings.Join(f.destroys, " ") != "sb-1" {
+		t.Errorf("destroys = %q, want [sb-1]", f.destroys)
+	}
+}
+
+// With OTLP export on and no collector listening, gssctl still runs the program and
+// exits with its code; the flush at exit gives up after flushTimeout and says so.
+func TestRunTelemetryOnProcess(t *testing.T) {
+	f := &fake{}
+	f.exitCode = 3
+	addr := serveTCP(t, f)
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector := "http://" + dead.Addr().String()
+	dead.Close() // nothing listens there now
+	cmd := gssctlProcess(collector, "--scheduler", addr, "run", "-c", "print(1)")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	start := time.Now()
+	err = cmd.Run()
+	took := time.Since(start)
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 3 {
+		t.Errorf("gssctl ended with %v, want exit status 3; stderr %q", err, stderr.String())
+	}
+	if stdout.String() != "1\n" {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "telemetry flush failed") {
+		t.Errorf("stderr = %q, want the failed flush reported", stderr.String())
+	}
+	if took > flushTimeout+5*time.Second {
+		t.Errorf("gssctl took %v; the flush must give up after %v", took, flushTimeout)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
