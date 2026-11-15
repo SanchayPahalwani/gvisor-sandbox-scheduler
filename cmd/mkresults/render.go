@@ -526,7 +526,7 @@ func renderGroupLoss(in *Inputs) string {
 	}
 	switch policy {
 	case "spread":
-		b.WriteString("The scheduler ran with the spread policy (spec D35): under the default bin-packing policy the sessions fill group a's nodes first, so losing group b would affect few or none of them.\n\n")
+		b.WriteString("The scheduler ran with the spread policy (spec D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.\n\n")
 	case "":
 		b.WriteString("The run did not record the scheduler's placement policy; spec D35 requires the spread policy for this test.\n\n")
 	default:
@@ -665,7 +665,19 @@ func Summary(in *Inputs) string {
 		v = part(a, "without retry") + ", " + part(c, "with retry")
 	}
 	add("Group-loss recovery (local failure-domain test)", v, "grouploss.json, grouploss-retry.json")
-	return table([]string{"Metric", "Value", "Source"}, rows) + "\nHardware: " + in.Hardware.line() + ". Full tables, commands and caveats: [docs/results.md](docs/results.md).\n"
+	out := table([]string{"Metric", "Value", "Source"}, rows) + "\nHardware: " + in.Hardware.line() + "."
+	if in.empty() {
+		// docs/results.md then holds nothing but "not run" and is not committed:
+		// no link to it.
+		return out + "\n"
+	}
+	return out + " Full tables, commands and caveats: [docs/results.md](docs/results.md).\n"
+}
+
+// empty reports whether no results file was found.
+func (in *Inputs) empty() bool {
+	return in.Hardware == nil && in.Start == nil && in.Throughput == nil && in.Density == nil &&
+		in.GroupLoss == nil && in.GroupLossRetry == nil && in.Sim == nil
 }
 
 const (

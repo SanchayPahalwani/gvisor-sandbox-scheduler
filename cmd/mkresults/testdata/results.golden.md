@@ -107,7 +107,7 @@ Notes from the run:
 
 Local failure-domain test: both node groups are processes in one VM on one laptop. It says nothing about networks, regions or providers.
 
-The scheduler ran with the spread policy (spec D35): under the default bin-packing policy the sessions fill group a's nodes first, so losing group b would affect few or none of them.
+The scheduler ran with the spread policy (spec D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.
 
 | Metric | Without retry | With retry |
 | --- | --- | --- |

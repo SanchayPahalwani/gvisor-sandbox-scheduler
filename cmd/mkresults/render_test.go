@@ -90,6 +90,27 @@ func TestRenderMissingFiles(t *testing.T) {
 	}
 }
 
+// TestSummaryLink: the README block links to docs/results.md only when some
+// results file exists. With none, docs/results.md says nothing but "not run" and
+// is not committed, so a link to it would be dead.
+func TestSummaryLink(t *testing.T) {
+	const link = "[docs/results.md](docs/results.md)"
+	if s := Summary(&Inputs{}); strings.Contains(s, link) {
+		t.Errorf("summary with no results files links to docs/results.md:\n%s", s)
+	}
+	in, err := Load(fixtures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := Summary(in); !strings.Contains(s, link) {
+		t.Errorf("summary with results files lacks the link to docs/results.md:\n%s", s)
+	}
+	// One file is enough for the link: the full tables then have something in them.
+	if s := Summary(&Inputs{Sim: in.Sim}); !strings.Contains(s, link) {
+		t.Errorf("summary with only schedsim.json lacks the link to docs/results.md:\n%s", s)
+	}
+}
+
 const readmeIn = "# Title\n\nintro\n\n<!-- results:begin -->\nold table\n<!-- results:end -->\n\nrest\n"
 
 func TestReadmeMarkers(t *testing.T) {

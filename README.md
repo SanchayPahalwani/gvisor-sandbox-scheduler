@@ -87,7 +87,7 @@ The block below is written by `make results` from the JSON files under `results/
 | Placement, default policy, fill scenario | not run | `schedsim.json` |
 | Group-loss recovery (local failure-domain test) | not run | `grouploss.json, grouploss-retry.json` |
 
-Hardware: hardware not run (results/hardware.json missing). Full tables, commands and caveats: [docs/results.md](docs/results.md).
+Hardware: hardware not run (results/hardware.json missing).
 <!-- results:end -->
 
 The benchmarks are meant to run on one laptop: an Apple M3 Pro (arm64) with one Lima VM (Apple Virtualization.framework, Ubuntu 24.04 arm64, 4 vCPU, 6 GiB). All nodes are processes in that VM and share its vCPUs; their capacity is declared with flags. gVisor is runsc release-20261102.0 on the systrap platform, the only platform the benchmarks use; Go is 1.27.4. `make hardware` records the exact machine in `results/hardware.json`, and `make results` prints it under every table. `make results` also writes `docs/results.md` with the full tables, commands and caveats; that file does not exist until the benchmarks have run. [docs/design.md](docs/design.md#11-benchmarks) says what each benchmark measures and how to read it.

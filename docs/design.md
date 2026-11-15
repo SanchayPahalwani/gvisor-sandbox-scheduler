@@ -111,16 +111,16 @@ The first question for untrusted code is what stands between it and the host ker
 | Isolation boundary | The host kernel itself. The workload's system calls go to the shared host kernel, filtered by seccomp and scoped by namespaces. | A user-space application kernel (the sentry) implements the Linux system calls for the workload. The sentry runs on the host kernel and uses a much smaller set of host calls. | Hardware virtualization through KVM: a guest kernel per sandbox, and a virtual machine monitor with a minimal device model. |
 | Start time class | A process start. | A process start plus the boot of the sentry. | A VM boot, or a resume from a VM snapshot. |
 | Memory overhead | Nothing beyond the workload. | The sentry and its helper processes, per sandbox. | A guest kernel and the monitor, per sandbox. |
-| Syscall compatibility | Complete: it is the host kernel. | gVisor's own implementation of the Linux interface. Most programs run; some system calls, flags and `/proc` files are missing or behave differently. | Complete inside the guest, which runs a real Linux kernel. |
+| Syscall compatibility | The host kernel's, minus whatever the seccomp profile blocks (container runtimes apply a default profile that denies some calls). | gVisor's own implementation of the Linux interface. Most programs run; some system calls, flags and `/proc` files are missing or behave differently. | Complete inside the guest, which runs a real Linux kernel. |
 | Needs KVM | No. | No on the systrap platform used here; yes on its KVM platform ([section 3](#3-platform-systrap-kvm-or-ptrace)). | Yes. |
-| Snapshot support | Not in runc itself; checkpointing goes through CRIU, an external tool. | Built in: `runsc checkpoint` and `runsc restore` of the whole sandbox. A restore on another machine needs the CPU features present at checkpoint time. | Built in: full and diff snapshots of the VM. |
+| Snapshot support | `runc checkpoint` and `runc restore`, which rely on CRIU, a separate tool that has to be installed. | Built in: `runsc checkpoint` and `runsc restore` of the whole sandbox. A restore on another machine needs the CPU features present at checkpoint time. | Built in: full and diff snapshots of the VM. |
 | Used by, per prior-art | OpenSandbox (its default runtime) | `kubernetes-sigs/agent-sandbox` and GKE Sandbox through RuntimeClass, Agent Substrate, Ray Sandboxes, OpenSandbox, Modal (selectable) | E2B, Vercel Sandbox, Fly.io Machines, Cloudflare Containers, OpenSandbox Fast Sandbox |
 
-Sources: [prior-art.md](prior-art.md), sections "gVisor and runsc", "gVisor checkpoint/restore", "Firecracker", "Kata Containers" and the agent sandbox table. The runc snapshot entry (CRIU) is general knowledge, not from prior-art. The start time, memory and compatibility rows describe how each design works by construction; none of them is a measurement, and this repository measures gVisor only.
+Sources: [prior-art.md](prior-art.md), sections "gVisor and runsc", "gVisor checkpoint/restore", "Firecracker", "Kata Containers" and the agent sandbox table. The runc entries (CRIU, the seccomp profile) are general knowledge, not from prior-art. The start time, memory and compatibility rows describe how each design works by construction; none of them is a measurement, and this repository measures gVisor only.
 
 ### Why gVisor here
 
-- *No KVM.* The Lima guest has no `/dev/kvm`. Firecracker would need nested virtualization; gVisor's systrap platform runs in an ordinary VM, and should need nothing more than a plain hosted CI runner (the CI integration job has not run yet).
+- *No KVM needed.* As configured, the Lima guest exposes no `/dev/kvm`. That is a configuration choice, not a hard limit: Apple's Virtualization.framework offers nested virtualization on M3 and later ([section 3](#3-platform-systrap-kvm-or-ptrace)), so Firecracker could be tried here. What gVisor's systrap platform gives is that it runs in an ordinary VM without it, and should need nothing more than a plain hosted CI runner (the CI integration job has not run yet). The reasons below carry the decision.
 - *An OCI runtime.* `runsc` takes a bundle directory and a `config.json` and applies the cgroup limits itself. The node agent stays an OCI-level program, which is also the shape of the Kubernetes route (RuntimeClass, [section 9](#9-mapping-to-kubernetes)).
 - *Checkpoint and restore are part of the runtime.* A checkpoint of a running sandbox restores into a different cgroup, with different limits and a different network namespace (all three observed during design). That is what makes the restore start path possible ([section 6](#6-start-paths)).
 - *Process-sized sandboxes.* Many sandboxes have to fit in a 6 GiB VM next to each other.
@@ -169,7 +169,7 @@ D5 (no emulation, [section 1](#where-it-runs)) completes the picture: the platfo
 - *Choice.* [internal/runsc](../internal/runsc/cli.go) runs the `runsc` binary for create, start, restore, checkpoint, exec, kill, delete, state, list and version. The same top-level flags (`--root`, `--network`, `--overlay2=none`) go on every command for a given sandbox, because gVisor requires that for restore. The manager is written against a `Runtime` interface, with an in-memory fake for unit tests.
 - *Why.* The CLI is gVisor's documented and stable surface. Every call is a child span (`runsc.create`, `runsc.restore`, ...), so a trace shows where start time goes. The fake keeps the manager testable on macOS.
 - *Alternative.* containerd with the gVisor shim, which is the route on Kubernetes ([section 9](#9-mapping-to-kubernetes)), or importing gVisor's Go packages. The shim would hide the steps this project exists to show; gVisor's internal packages are not a stable API.
-- *Costs found while building.* One process start per call. `runsc` matches container IDs by prefix, so IDs are made prefix-free by construction: `<sandbox-id>_<incarnation>_` for sandboxes, `warm_<hex>_` for the pool, `img_<key>_<pid>_` for the image builder, and sandbox IDs may not contain `_`. `runsc exec` exits 128 when it fails itself, which is also a valid exit code of a program, so on every exit 128 the wrapper asks `runsc state` before it trusts the code.
+- *Costs found while building.* One process start per call. `runsc` matches container IDs by prefix, so IDs are made prefix-free by construction: `<sandbox-id>_<incarnation>_` for sandboxes started cold or restored, `warm_<hex>_` for the pool (a claimed pool sandbox keeps that ID, with its bundle and cgroup), `img_<key>_<pid>_` for the image builder; sandbox IDs may not contain `_`, and `warm` and `img` are reserved, so no ID can be a prefix of another. `runsc exec` exits 128 when it fails itself, which is also a valid exit code of a program, so on every exit 128 the wrapper asks `runsc state` before it trusts the code.
 - *What would change it.* Running under Kubernetes (use the shim), or start rates at which a process start per call matters.
 
 ### 4.2 Root filesystem
@@ -239,7 +239,7 @@ The agent reads the child's stdout and stderr and sends them as `ExecEvent`s of 
 - *The statuses.* `NotFound` for an unknown sandbox and for one whose destroy has started when the Exec arrives; `Unavailable` for a sandbox still starting, and for an Exec already running when its sandbox is destroyed or lost; `Internal` for any other runtime failure; `InvalidArgument` and `Canceled` as usual.
 - *Why.* A client must never mistake a lost sandbox for an exit code. A made-up code such as 137 or -1 cannot be told apart from the program's own. Output already streamed stays valid; the status only says the exit was not seen.
 - *Alternative.* Always end with an exit event that carries a "lost" flag. Simpler for clients that ignore errors, but "did this run?" then lives in a field a client can forget to read.
-- *The gateway keeps the same rule.* It relays the node's events, never invents an exit, and sends nothing after one ([gateway.Exec](../internal/gateway/gateway.go)).
+- *The gateway inherits the rule from the node.* It relays whatever the node sends and never invents an exit ([gateway.Exec](../internal/gateway/gateway.go)). Nothing follows an exit because the node sends nothing after its exit; once an exit has gone by, the way the node's stream ends no longer changes the result.
 - *What would change it.* A client API that wants an explicit "exit unknown" marker in the stream, for example a batch interface. The marker would be a field of its own, still never an exit code.
 
 ### 4.6 Timeouts
@@ -272,14 +272,14 @@ The agent reads the child's stdout and stderr and sends them as `ExecEvent`s of 
 
 **D32. A program over its memory limit usually ends the sandbox; both outcomes are reported.**
 
-- *Choice.* The agent reports both cases. After each Exec it reads `memory.events`. If `oom_kill` went up and the program exited 137, the exit is marked `oom_killed` and the sandbox is checked once. If the sandbox process is gone, the sandbox is removed: the Exec that was running gets `Unavailable` and the next one gets `NotFound`.
+- *Choice.* The agent reports both cases. It reads the cgroup's `oom_kill` counter (in `memory.events`) before and after each Exec. An exit 137 with a raised counter is returned as that exit with `oom_killed`, and the sandbox is checked once, without waiting; if its process is gone the sandbox is removed, and the next Exec gets `NotFound`. A runtime error, or an exit 128 with a raised counter, can mean the sentry died: the agent then re-checks for a moment (D33), removes the sandbox if it is gone, and ends the Exec with `Unavailable` instead of an exit event.
 - *Why both.* In the hand spike the OOM killer took the over-limit process and the sandbox kept working. In the later development runs at 192 MiB and 256 MiB it took the sentry each time, which ends the sandbox. Which process the kernel picks is not under the agent's control.
 - *Alternative.* Give the workload a memory budget inside gVisor that is smaller than the cgroup's, so gVisor stops the program before the host kernel has to choose. Not tried.
 - *What would change it.* Long sessions in which losing the sandbox and its files on one bad allocation is unacceptable.
 
 **D33. The agent, not the `runsc` wrapper, recognises an OOM-killed sentry.**
 
-- *Choice.* When `oom_kill` rose during an Exec, the agent re-reads the sandbox state for up to 2 s, because `runsc` briefly still reports a dead sentry as running, and then removes the sandbox (`exitStatus` and `removeIfGone` in [exec.go](../internal/nodeagent/exec.go)).
+- *Choice.* The wait applies only when the Exec did not end with an exit the agent can trust: a runtime error that says the container is not running, or a runtime error or an exit 128 (`runsc`'s own failure code) while `oom_kill` rose. Then the agent re-reads the sandbox state every 50 ms for up to 2 s, because `runsc` briefly still reports a dead sentry as running, removes the sandbox if it is gone, and returns `Unavailable` (`exitStatus` and `removeIfGone` in [exec.go](../internal/nodeagent/exec.go)). An exit 137 with a raised `oom_kill` is checked once, without the wait, and the Exec still returns its exit event.
 - *Why.* The agent has the cgroup counters. The wrapper stays a thin, generic layer over the CLI.
 - *Alternative.* Teach the wrapper about cgroups.
 - *What would change it.* A `runsc` that reported a killed sentry at once and distinctly. The wrapper could then map it, and the 2 s re-check could go.
@@ -319,7 +319,7 @@ Two details came out of review:
 - *The connection mark.* A /30 is reused after its sandbox is destroyed, and conntrack entries are keyed by addresses and ports, not by interface. Without the mark, a new sandbox could take over a flow that the previous holder of the address had opened, to a destination the new sandbox was not allowed to reach. Every accepted flow now carries the generation of the sandbox that opened it, and only live (veth, generation) pairs pass.
 - *The source check lives in nftables.* Strict reverse-path filtering per veth did not hold on the VM, because the host's `net.ipv4.conf.all.rp_filter` value overrides the per-interface one. The node owns its table, so the check moved there.
 
-Hostnames in the allowlist are resolved once by the agent at create time and written to the sandbox's `/etc/hosts`. The sandbox gets no resolver: UDP is dropped and only the listed TCP destinations are accepted. That closes DNS as an exfiltration channel and makes the policy an IP-level fact that nftables can enforce. The costs: a host whose address changes during the sandbox's life stops resolving; IPv4 only; TCP only.
+Hostnames in the allowlist are resolved once by the agent at create time and written to the sandbox's `/etc/hosts`. The sandbox gets no resolver: UDP is dropped and only the listed TCP destinations are accepted. That closes DNS as an exfiltration channel and makes the policy an IP-level fact that nftables can enforce. The costs: a host whose address changes during the sandbox's life still resolves, to the old pinned address, and new connections to it fail, since the allowlist holds only that address too; IPv4 only; TCP only.
 
 Alternatives:
 
@@ -433,7 +433,7 @@ Egress sandboxes always take the cold or restore path, because the warm pool hol
 - *Alternative.* A persistent store, or a replicated log.
 - *What would change it.* High availability. Two schedulers need a leader: a lease in a small consistent store, with the standby rebuilding its state from heartbeats exactly as a restarted scheduler does. Audit requirements would need a durable log as well.
 
-Sandbox states: a create adds the sandbox as `PENDING`; `Reserve` moves it to `STARTING` at the next incarnation; `Commit` moves it to `READY`. A dead node or missing reports move it to `LOST`, and the rescheduler takes it from `LOST` back to `STARTING` at a higher incarnation. `FAILED` and `DESTROYED` are final, and their IDs are remembered for 10 minutes (tombstones), so a late report of a destroyed sandbox is answered with a destroy instead of being adopted.
+Sandbox states: a create adds the sandbox as `PENDING`; `Reserve` moves it to `STARTING` at the next incarnation; `Commit` moves it to `READY`. A dead node or missing reports move it to `LOST`, and the rescheduler takes it from `LOST` back to `STARTING` at a higher incarnation. `FAILED` and `DESTROYED` are final, and their IDs are remembered for 10 minutes (tombstones), so a report of a destroyed sandbox within those 10 minutes is answered with a destroy instead of being adopted. A report that comes later is adopted ([section 13](#scheduler)).
 
 ### 7.4 Registration, heartbeats and one failure threshold
 
@@ -551,8 +551,9 @@ When the detector declares a node dead ([reschedule.go](../internal/gateway/resc
 
 For each heartbeat the scheduler compares the node's list with its own table ([heartbeat.go](../internal/cluster/heartbeat.go)):
 
-- Reported, unknown, not recently destroyed: *adopt* it as `READY` on that node, with the TTL the node reports. This is what rebuilds the table after a scheduler restart.
-- Reported, but the scheduler has it on another node, at another incarnation, or as `PENDING`, `LOST`, `FAILED` or `DESTROYED`: put its ID in the answer's destroy list.
+- Reported and tombstoned (destroyed or failed within the last 10 minutes): put its ID in the answer's destroy list.
+- Reported and unknown: *adopt* it as `READY` on that node, with the TTL the node reports. This is what rebuilds the table after a scheduler restart. "Unknown" also covers a sandbox destroyed more than 10 minutes ago, whose tombstone has expired; see the limit in [section 13](#scheduler).
+- Reported, but the scheduler has it on another node, at another incarnation, or as `PENDING` or `LOST`: put its ID in the answer's destroy list.
 - In the table as `READY` on this node but missing from two heartbeats in a row: `LOST`, then rescheduled. That covers a sandbox that died on its own, for example a sentry killed for memory.
 
 Two rules came from review:
@@ -562,7 +563,7 @@ Two rules came from review:
 
 ### 8.4 A partition that heals
 
-If a dead node comes back (it was a partition, not a crash), its next heartbeat makes it ready again with its allocations reset, and lists sandboxes that the scheduler has already moved. The answer tells it to destroy them. If it had lost contact for longer than a sandbox's TTL, its own reaper has already destroyed the sandbox at TTL plus 10 s.
+If a dead node comes back (it was a partition, not a crash), its next heartbeat makes it ready again with its allocations reset, and lists sandboxes that the scheduler has already moved. The answer tells it to destroy them, as long as the scheduler still knows each ID: a sandbox that was moved and then destroyed more than 10 minutes before the node came back has lost its tombstone, and the stale copy is adopted instead ([section 13](#scheduler)). If it had lost contact for longer than a sandbox's TTL, its own reaper has already destroyed the sandbox at TTL plus 10 s.
 
 ### 8.5 Agent restart
 
@@ -582,9 +583,9 @@ The state is soft (D18). Nodes get `NotFound` on their next heartbeat, register 
 **D35. The local failure-domain test runs the scheduler with the spread policy.**
 
 - *Choice.* `group-loss.sh` starts the scheduler with `--policy spread`; every other benchmark uses the default.
-- *Why.* Bin-packing piles the sessions onto the fullest nodes, which are the first ones by ID, in group `a`. Killing group `b` would then affect few of them or none, and how many would depend on placement timing (when each node's warm pool refilled) rather than on the recovery being measured. Spread places them evenly across all four nodes, and the test then measures how the scheduler detects and recovers from losing half of them.
+- *Why.* The sessions start in `AUTO` mode with no egress, so the `WarmPool` score applies at the same weight as `BinPack`, and every warm commit lowers the scheduler's cached warm count for that node until its next heartbeat refreshes it. With every pool full and no heartbeat in between, the creates go two to each node in turn (`a1`, `a1`, `a2`, `a2`, `b1`, `b1`, `b2`, `b2`) and the rest by packing. Under the default policy the split between the groups therefore depends on when each pool refills and when each heartbeat arrives, not on the recovery being measured, and the number of sessions the test loses would vary from run to run. (`loadgen` refuses a run in which a group got no session.) Spread splits them evenly across the four nodes on every run, and the test then measures how the scheduler detects and recovers from losing half of them.
 - *Alternative.* Keep the default policy and constrain half the sessions to group `b` with `node_group`. But that is a hard constraint: those sessions could never move to group `a`, and would wait for the dead group until their TTL.
-- *What would change it.* A question about what the default policy does under failure. That is a different test: with packing, a node loss affects fewer sessions, but all of them at once.
+- *What would change it.* A question about what the default policy does under failure. That is a different test, and its answer would carry the same timing dependence, so it would need many runs rather than one.
 
 It is a local failure-domain test. Both groups share one kernel, one disk and one laptop. It exercises the scheduler's detection and rescheduling logic and says nothing about networks, regions or providers; the results table carries that sentence.
 
@@ -602,11 +603,12 @@ The same system built on Kubernetes would keep the ideas and swap most of the pa
 | `NodeGroup` filter | `nodeSelector` or required node affinity on a label |
 | Scorers with weights | Score plugins, `NormalizeScore`, plugin weights in the scheduler profile. The scorers here already return 0 to 100, so there is no normalisation step. |
 | `BinPack` | `NodeResourcesFit` with the `MostAllocated` scoring strategy |
-| The spread policy (`LeastAllocated`) | `NodeResourcesFit` with `LeastAllocated`, the default strategy |
-| `GroupAffinity` | Preferred inter-pod affinity, or topology spread constraints |
+| The spread policy (`LeastAllocated`) | `NodeResourcesFit` with `LeastAllocated`, the default strategy; topology spread constraints, to spread across groups |
+| `GroupAffinity` | Preferred inter-pod affinity, with `topologyKey` set to the group label |
 | `WarmPool` | No built-in counterpart: a custom Score plugin, or a warm pool controller such as the `SandboxWarmPool` extension of `kubernetes-sigs/agent-sandbox` |
 | `NodeHealth` | No direct counterpart; the closest are taints that controllers put on unhealthy nodes |
-| `cluster.State.Reserve`, `Commit`, `Unreserve` | The Reserve extension point (and the scheduler's assume cache), Bind (writing the binding to the API server), Unreserve |
+| `cluster.State.Reserve`, `Unreserve` | The Reserve extension point (and the scheduler's assume cache), Unreserve |
+| The synchronous node `CreateSandbox` call, then `Commit` | Bind writes the binding to the API server before the kubelet starts the pod. Here the node call is both the bind and the start, and `Commit` is closer to the pod reporting Ready. |
 | `SampleSize` | `percentageOfNodesToScore` |
 | Failure detector: one threshold of 3 s | Node lifecycle controller: the node goes NotReady after a grace period, and taint-based eviction removes its pods later, after each pod's toleration. Two thresholds (D19). |
 | A rescheduled sandbox keeps its ID, incarnation plus one | A controller (ReplicaSet, StatefulSet) creates a replacement pod; a StatefulSet keeps the name |
@@ -619,21 +621,25 @@ What is first-class here and would be extra work there: choosing a start path pe
 
 ## 10. Observability
 
-Every binary sets up OpenTelemetry through [internal/telemetry](../internal/telemetry/telemetry.go): OTLP over gRPC for traces and metrics, turned on only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a no-op otherwise. Only that package installs SDK providers; everything else uses the global tracer and meter named `gss`. gRPC clients and servers use the `otelgrpc` stats handlers, which carry the trace context across both hops, so one `gssctl run` is one trace from the client to `runsc`.
+`gssctl`, `loadgen`, `nodeagent` and `scheduler` set up OpenTelemetry through [internal/telemetry](../internal/telemetry/telemetry.go): OTLP over gRPC for traces and metrics, turned on only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a no-op otherwise. Only that package installs SDK providers; everything else uses the global tracer and meter named `gss`. gRPC clients and servers use the `otelgrpc` stats handlers, which carry the trace context across both hops, so one RPC is one trace from the client to `runsc`. `gssctl` starts no span of its own, so one `gssctl run` makes three traces, one per call: the create (down to the `runsc` calls on the node), the Exec, and the Destroy.
 
 The trace of a create:
 
 ```
-SandboxService/CreateSandbox                (client)
+SandboxService/CreateSandbox                (the client's RPC span, the root)
   gateway.create
     sched.place        nodes.total, nodes.feasible, node.chosen, score.<plugin> of the winner
     NodeService/CreateSandbox
       node.create      start.mode (and start.fallback after a failed restore)
-        pool.claim  |  runsc.create + runsc.restore  |  runsc.create + runsc.start
-        netpolicy.setup                     (egress only)
-        sandbox.ready
-          runsc.exec                        (the readiness probe)
-        runsc.state
+        warm path:
+          pool.claim                        (no runsc call)
+        restore and cold paths, in order:
+          netpolicy.setup                   (egress only)
+          runsc.create
+          runsc.restore | runsc.start
+          sandbox.ready
+            runsc.exec                      (the readiness probe)
+          runsc.state
 ```
 
 Other spans: `gateway.exec`, `node.exec` and `runsc.exec` for an Exec; `gateway.reschedule`; `pool.fill` for a refill; `node.image` for an image build; `node.destroy` with `destroy.reason` (request, ttl, exited, retry, replaced, close, yield).
@@ -755,6 +761,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 - One process, no high availability, and it is in the data path of every Exec (D8, D18).
 - A restart loses requests in flight and the tombstones of recently destroyed IDs; an adopted sandbox's spec shows the TTL that was left at adoption.
+- Tombstones last 10 minutes, but a TTL can be 60. A node cut off for more than 10 minutes after the scheduler destroyed one of its sandboxes (directly, or after moving it elsewhere) still holds the old copy; when it heals and reports it, the scheduler no longer knows the ID, adopts the copy as `READY`, and keeps it until the TTL the node reports. Until then it holds room on the node, and an Exec by that ID would run in the stale copy. Tombstones as long as the maximum TTL would close this.
 - One failure threshold (D19); a node that was only briefly unreachable loses its sandboxes (section 8.3).
 - `DestroySandbox` skips the direct node call for a `LOST` sandbox; in a narrow window that can skip one destroy that the next heartbeat then performs.
 - The placement record keeps nodes considered, nodes feasible and the top three; per-filter rejection counts appear only when no node fits, so `gssctl explain` cannot say why other nodes were filtered out of a successful placement.
