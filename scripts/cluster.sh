@@ -37,7 +37,8 @@ gssctl=$repo/bin/gssctl
 sched_addr=127.0.0.1:7000
 sched_unit=gss-scheduler.service
 up_timeout=120 # seconds
-cgroup_dir=/sys/fs/cgroup/gss
+cgroup_root=/sys/fs/cgroup
+cgroup_dir=$cgroup_root/gss
 run_dir=/run/gss
 
 # Names this project gives: node IDs as cmd/nodeagent accepts them, sandbox namespaces
@@ -460,23 +461,55 @@ status() {
 	"$gssctl" --scheduler "$sched_addr" nodes
 }
 
-# kill_nodes ID... sends SIGKILL to the node agents first, all at once, and then kills
-# each node's cgroup subtree, so that its sandboxes die with it (spec D3).
+# kill_nodes ID... kills nodes as a crash would (spec D3): SIGKILL to the node agents,
+# all at once, then whatever is left in each agent's unit, then each node's cgroup
+# subtree, so that its sandboxes die with it.
+#
+# systemctl kill signals the main process only: the unit's cgroup also holds gVisor's
+# runsc-fd-parking helpers, and the default --kill-whom=all fails on them with EINVAL
+# (seen with systemd 255). The unit's own cgroup.kill takes those. A failure in one step
+# does not skip the next; kill_nodes fails at the end if any step failed.
 kill_nodes() {
-	local id units=()
+	local id unit cg i rc=0 units=() unit_cgroups=()
 	for id in "$@"; do
-		if ! unit_running "gss-node-$id.service"; then
+		unit=gss-node-$id.service
+		if ! unit_running "$unit"; then
 			die "node $id is not running (no unit gss-node-$id)"
 		fi
-		units+=("gss-node-$id.service")
+		units+=("$unit")
+		# Read before the kill: the unit ends with its agent and is collected.
+		cg=$(systemctl show --property=ControlGroup --value "$unit" 2>/dev/null || true)
+		unit_cgroups+=("$cg")
 	done
-	sudo systemctl kill --signal=KILL "${units[@]}"
-	for id in "$@"; do
-		if [[ -e $cgroup_dir/$id/cgroup.kill ]]; then
-			echo 1 | sudo tee "$cgroup_dir/$id/cgroup.kill" >/dev/null
+	sudo systemctl kill --kill-whom=main --signal=KILL "${units[@]}" || rc=1
+	for ((i = 0; i < ${#units[@]}; i++)); do
+		cg=${unit_cgroups[i]}
+		# Only the unit's own cgroup, never a parent such as the root.
+		if [[ $cg == /*/"${units[i]}" ]]; then
+			kill_cgroup "$cgroup_root$cg" || rc=1
+		elif [[ -n $cg ]]; then
+			say "${units[i]}: control group \"$cg\" is not the unit's own; not killed"
+			rc=1
 		fi
 	done
+	for id in "$@"; do
+		kill_cgroup "$cgroup_dir/$id" || rc=1
+	done
+	if [[ $rc -ne 0 ]]; then
+		die "kill: a step failed for node(s) $* (see above); some of their processes may still run"
+	fi
 	say "killed node(s) $* and their sandboxes"
+}
+
+# kill_cgroup DIR kills every process in the cgroup DIR and below (cgroup.kill). A
+# cgroup that is gone, or goes meanwhile, is not an error: its processes are gone too.
+kill_cgroup() {
+	[[ -e $1/cgroup.kill ]] || return 0
+	if echo 1 | sudo tee "$1/cgroup.kill" >/dev/null 2>&1 || [[ ! -e $1/cgroup.kill ]]; then
+		return 0
+	fi
+	say "could not write $1/cgroup.kill"
+	return 1
 }
 
 kill_node() {
