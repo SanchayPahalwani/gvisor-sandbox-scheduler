@@ -16,7 +16,9 @@ import (
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bundle"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -242,7 +244,9 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	if mode == gssv1.StartMode_START_MODE_WARM {
 		miss, err := m.claim(ctx, id, inc, spec)
 		if err == nil {
-			return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(time.Since(begin))}, nil
+			latency := time.Since(begin)
+			m.recordStart(ctx, mode, latency)
+			return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(latency)}, nil
 		}
 		if !miss || spec.GetStartMode() != gssv1.StartMode_START_MODE_AUTO {
 			return nil, err
@@ -286,7 +290,15 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 	m.mu.Lock()
 	e.state = stateReady
 	m.mu.Unlock()
+	m.recordStart(ctx, mode, latency)
 	return &gssv1.NodeCreateResponse{StartedAs: mode, ReadyLatency: durationpb.New(latency)}, nil
+}
+
+// recordStart records a Create that succeeded on the path mode in
+// gss_start_duration_seconds, with the latency its response carries.
+func (m *Manager) recordStart(ctx context.Context, mode gssv1.StartMode, latency time.Duration) {
+	telemetry.StartDuration().Record(ctx, latency.Seconds(), metric.WithAttributes(
+		telemetry.KeyMode.String(modeName(mode)), telemetry.KeyNode.String(m.cfg.NodeID)))
 }
 
 // chooseMode is the whole start-path policy (spec 7.3). AUTO takes the warm
@@ -562,6 +574,20 @@ func (m *Manager) List() []*gssv1.NodeSandbox {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Id < out[j].Id })
 	return out
+}
+
+// Live is the number of live sandboxes (starting or ready), the ones List
+// returns: the gss_sandboxes gauge.
+func (m *Manager) Live() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, e := range m.sandboxes {
+		if e.state == stateStarting || e.state == stateReady {
+			n++
+		}
+	}
+	return n
 }
 
 // Close refuses new Creates, ends a pool start in flight, stops the loops

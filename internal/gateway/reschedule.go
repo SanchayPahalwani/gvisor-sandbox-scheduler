@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -16,6 +17,10 @@ import (
 // the reschedules in flight; Run returns once they and the destroys it
 // started are done. Run once per Server.
 func (s *Server) Run(ctx context.Context) {
+	// Both counters start at 0, so the first reschedule and the first death
+	// show on the dashboard as a step from 0 rather than as a new series.
+	telemetry.Reschedules().Add(ctx, 0)
+	telemetry.NodeDeaths().Add(ctx, 0)
 	s.mu.Lock()
 	s.runCtx = ctx
 	s.dispatchLocked() // what heartbeats queued before Run
@@ -74,6 +79,9 @@ func (s *Server) tick(ctx context.Context) {
 	r := s.state.Tick()
 	for _, id := range r.DeadNodes {
 		s.log.Warn("node dead", "node", id)
+	}
+	if len(r.DeadNodes) > 0 {
+		telemetry.NodeDeaths().Add(ctx, int64(len(r.DeadNodes)))
 	}
 	if len(r.Lost) > 0 {
 		s.log.Warn("sandboxes lost", "count", len(r.Lost), "sandboxes", r.Lost)
@@ -138,6 +146,7 @@ func (s *Server) reschedule(ctx context.Context, id string) {
 		s.mu.Unlock()
 	}()
 	ctx, span := startSpan(ctx, "gateway.reschedule", attribute.String("sandbox.id", id))
+	telemetry.Reschedules().Add(ctx, 1)
 	_, err := s.placeAndStart(ctx, id, false)
 	switch status.Code(err) {
 	case codes.OK:

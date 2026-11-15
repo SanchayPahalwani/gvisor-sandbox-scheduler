@@ -36,6 +36,8 @@ import (
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/netpolicy"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/nodeagent"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
 )
 
@@ -218,8 +220,17 @@ type node struct {
 
 // run starts the node and serves until ctx ends (a signal) or the server
 // fails, then shuts the node down. stop restores the default signal
-// handling, so that a second signal ends the process.
+// handling, so that a second signal ends the process. Telemetry is
+// exported while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec 9) and flushed
+// last.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
+	shutdownTelemetry, err := telemetry.Setup(ctx, "gss-nodeagent",
+		attribute.String("node.id", o.nodeID), attribute.String("node.group", o.group))
+	if err != nil {
+		stop()
+		return err
+	}
+	defer flushTelemetry(shutdownTelemetry, o.nodeID)
 	n, signalled, err := start(ctx, stop, o)
 	if err != nil {
 		if signalled {
@@ -229,6 +240,11 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		return err
 	}
 	defer n.unlock()
+	if err := telemetry.RegisterNodeGauges(o.nodeID,
+		func() int64 { return int64(n.m.Live()) },
+		func() int64 { return int64(n.m.WarmReady()) }); err != nil {
+		slog.Warn("no node gauges", "node", o.nodeID, "err", err)
+	}
 
 	srv := grpc.NewServer(nodeagent.ServerOptions()...)
 	gssv1.RegisterNodeServiceServer(srv, nodeagent.NewServer(n.m))
@@ -391,6 +407,16 @@ func (n *node) startHeartbeats() (stop func() error, err error) {
 		<-done
 		return conn.Close()
 	}, nil
+}
+
+// flushTelemetry exports what telemetry still holds, bounded by
+// drainTimeout.
+func flushTelemetry(shutdown func(context.Context) error, nodeID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		slog.Warn("telemetry flush failed", "node", nodeID, "err", err)
+	}
 }
 
 func (n *node) unlock() {

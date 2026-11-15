@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,8 +35,11 @@ const (
 // helloCode is the program every start measurement runs.
 const helloCode = `print("hello")`
 
+// dial connects to the scheduler with the otelgrpc client handler: with
+// telemetry on, each call is the root span of its trace (spec 9).
 func dial(addr string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }

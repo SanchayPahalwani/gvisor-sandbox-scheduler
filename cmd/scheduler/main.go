@@ -26,6 +26,7 @@ import (
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/cluster"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/gateway"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/sched"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 	"google.golang.org/grpc"
 )
 
@@ -118,6 +119,16 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	return o, nil
 }
 
+// flushTelemetry exports what telemetry still holds, bounded by
+// drainTimeout.
+func flushTelemetry(shutdown func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		slog.Warn("telemetry flush failed", "err", err)
+	}
+}
+
 // newPolicy returns the placement policy the options name.
 func newPolicy(o *options) *sched.Policy {
 	var p *sched.Policy
@@ -132,7 +143,15 @@ func newPolicy(o *options) *sched.Policy {
 
 // run serves until ctx ends (a signal) or the server fails. stop restores
 // the default signal handling, so that a second signal ends the process.
+// Telemetry is exported while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec 9)
+// and flushed last.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
+	shutdownTelemetry, err := telemetry.Setup(ctx, "gss-scheduler")
+	if err != nil {
+		stop()
+		return err
+	}
+	defer flushTelemetry(shutdownTelemetry)
 	lis, err := net.Listen("tcp", o.listen)
 	if err != nil {
 		stop()
@@ -149,6 +168,9 @@ func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 		defer c.Close()
 	}
 	gw := gateway.New(state, newPolicy(o), nodes, gcfg)
+	if err := telemetry.RegisterClusterGauges(gw.NodeCounts); err != nil {
+		slog.Warn("no gss_nodes gauge", "err", err)
+	}
 
 	srv := grpc.NewServer(gateway.ServerOptions()...)
 	gssv1.RegisterSandboxServiceServer(srv, gw)

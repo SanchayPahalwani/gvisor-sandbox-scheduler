@@ -17,7 +17,9 @@ import (
 
 	gssv1 "github.com/SanchayPahalwani/gvisor-sandbox-scheduler/api/v1"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/runsc"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -79,6 +81,7 @@ type execRun struct {
 // also kills the process. A destroy of the sandbox ends the Exec and does not
 // wait for it.
 func (m *Manager) Exec(ctx context.Context, req *gssv1.ExecRequest, send func(*gssv1.ExecEvent) error) (err error) {
+	begin := time.Now()
 	ctx, span := startSpan(ctx, "node.exec", attribute.String("sandbox.id", req.GetSandboxId()))
 	defer func() { endSpan(span, err) }()
 
@@ -121,6 +124,9 @@ func (m *Manager) Exec(ctx context.Context, req *gssv1.ExecRequest, send func(*g
 		attribute.Int("exec.exit_code", int(exit.GetCode())),
 		attribute.Bool("exec.timed_out", exit.GetTimedOut()),
 		attribute.Bool("exec.oom_killed", exit.GetOomKilled()))
+	// Measured once the exit status is known, before it is sent: the time
+	// the node took, not the client's reading of the last event.
+	telemetry.ExecDuration().Record(ctx, time.Since(begin).Seconds(), metric.WithAttributes(telemetry.KeyKind.String(p.kind)))
 	return send(&gssv1.ExecEvent{Event: &gssv1.ExecEvent_Exit{Exit: exit}})
 }
 

@@ -126,3 +126,13 @@ hardware:
 # Renders docs/results.md and the README table from results/*.json (spec call D26).
 results:
 	go run ./cmd/mkresults --results results --out docs/results.md --readme README.md
+
+# Observability container (spec call D24): grafana/otel-lgtm as the rootless nerdctl
+# container gss-obs in the VM, Grafana on port 3300 with deploy/grafana/dashboard.json.
+# Not Linux targets: on macOS scripts/obs.sh runs itself in the VM.
+.PHONY: obs-up obs-down
+obs-up:
+	scripts/obs.sh up
+
+obs-down:
+	scripts/obs.sh down

@@ -21,10 +21,12 @@ import (
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/cluster"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/nodeagent"
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/sched"
+	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/telemetry"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -243,8 +245,9 @@ func (s *Server) placeAndStart(ctx context.Context, id string, fresh bool) (*gss
 		d, err := s.place(ctx, sb, exclude)
 		if err != nil {
 			if len(failed) > 0 {
-				return nil, s.createFailed(id, fresh, failed)
+				return nil, s.createFailed(ctx, id, fresh, failed)
 			}
+			placementFailed(ctx, noFitReason(err))
 			msg := err.Error()
 			if len(refused) > 0 {
 				msg += " (" + strings.Join(refused, "; ") + ")"
@@ -272,6 +275,7 @@ func (s *Server) placeAndStart(ctx context.Context, id string, fresh bool) (*gss
 			if code == codes.FailedPrecondition && fresh {
 				// A forced start mode the node cannot serve: no other node is
 				// tried, and the node is not at fault.
+				placementFailed(ctx, reasonNodeError)
 				return nil, s.fail(id, fresh, err)
 			}
 			if code != codes.FailedPrecondition {
@@ -281,7 +285,7 @@ func (s *Server) placeAndStart(ctx context.Context, id string, fresh bool) (*gss
 			failed = append(failed, d.NodeID+": "+msg)
 			exclude[d.NodeID] = true
 			if len(failed) >= s.cfg.MaxAttempts {
-				return nil, s.createFailed(id, fresh, failed)
+				return nil, s.createFailed(ctx, id, fresh, failed)
 			}
 			continue
 		}
@@ -318,14 +322,45 @@ func (s *Server) fail(id string, fresh bool, err error) error {
 }
 
 // createFailed is the error once node Creates failed on every node tried.
-func (s *Server) createFailed(id string, fresh bool, failed []string) error {
+func (s *Server) createFailed(ctx context.Context, id string, fresh bool, failed []string) error {
+	placementFailed(ctx, reasonNodeError)
 	return s.fail(id, fresh, status.Errorf(codes.Unavailable, "sandbox %s: create failed on %d node(s): %s",
 		id, len(failed), strings.Join(failed, "; ")))
+}
+
+// The reasons of gss_placement_failures_total other than a filter name.
+const (
+	reasonNoNodes   = "no_nodes"   // no node registered
+	reasonNodeError = "node_error" // the node Create calls failed
+)
+
+// placementFailed counts a placement that ended without a started sandbox.
+func placementFailed(ctx context.Context, reason string) {
+	telemetry.PlacementFailures().Add(ctx, 1, metric.WithAttributes(telemetry.KeyReason.String(reason)))
+}
+
+// noFitReason is the reason a placement found no node: the filter that
+// rejected the most nodes (the first by name on a tie), which NoFitError's
+// message starts with, or no_nodes.
+func noFitReason(err error) string {
+	var nf *sched.NoFitError
+	if !errors.As(err, &nf) {
+		return reasonNoNodes // Place fails only with a NoFitError
+	}
+	reason, most := reasonNoNodes, 0
+	for name, n := range nf.Rejected {
+		if n > most || (n == most && n > 0 && name < reason) {
+			reason, most = name, n
+		}
+	}
+	return reason
 }
 
 // place runs the policy over the current view, traced as sched.place.
 func (s *Server) place(ctx context.Context, sb *gssv1.Sandbox, exclude map[string]bool) (*sched.Decision, error) {
 	_, span := startSpan(ctx, "sched.place")
+	begin := time.Now()
+	defer func() { telemetry.PlacementDuration().Record(ctx, time.Since(begin).Seconds()) }()
 	spec := sb.GetSpec()
 	nodes, affinity := s.state.View(spec)
 	mode := spec.GetStartMode()
@@ -581,6 +616,28 @@ func (s *Server) ListSandboxes(ctx context.Context, req *gssv1.ListSandboxesRequ
 
 func (s *Server) ListNodes(ctx context.Context, req *gssv1.ListNodesRequest) (*gssv1.ListNodesResponse, error) {
 	return &gssv1.ListNodesResponse{Nodes: s.state.Nodes()}, nil
+}
+
+// NodeCounts is the number of registered nodes by [group, state] (state
+// "ready" or "dead"), with both states of every group present: the
+// gss_nodes gauge.
+func (s *Server) NodeCounts() map[[2]string]int64 {
+	out := map[[2]string]int64{}
+	for _, n := range s.state.Nodes() {
+		g := n.GetInfo().GetGroup()
+		for _, st := range []string{"ready", "dead"} {
+			if _, ok := out[[2]string{g, st}]; !ok {
+				out[[2]string{g, st}] = 0
+			}
+		}
+		out[[2]string{g, nodeStateName(n.GetState())}]++
+	}
+	return out
+}
+
+// nodeStateName is a node state without its enum prefix, in lower case.
+func nodeStateName(st gssv1.NodeState) string {
+	return strings.ToLower(strings.TrimPrefix(st.String(), "NODE_STATE_"))
 }
 
 // Register adds or updates a node and tells it how often to heartbeat.
