@@ -236,10 +236,10 @@ The agent reads the child's stdout and stderr and sends them as `ExecEvent`s of 
 **D34. An Exec stream ends with exactly one exit event only when the program's exit was seen; otherwise it ends with a gRPC status and no exit event.**
 
 - *Choice.* The node and the gateway send an exit event only for an exit they saw; every other ending is a gRPC status.
-- *The statuses.* `NotFound` for an unknown sandbox and for one whose destroy has started when the Exec arrives; `Unavailable` for a sandbox still starting, and for an Exec already running when its sandbox is destroyed or lost; `Internal` for any other runtime failure; `InvalidArgument` and `Canceled` as usual.
+- *The statuses.* `NotFound` for an unknown sandbox and for one whose destroy has started when the Exec arrives; `Unavailable` for a sandbox still starting, and for an Exec already running when its sandbox is destroyed or lost; `Internal` for any other runtime failure; `InvalidArgument` and `Canceled` as usual. Through the scheduler, an Exec for a sandbox that is not `READY` yet (starting, or being moved) waits for it, bounded by the request's deadline and a 15 s cap, and ends with `DeadlineExceeded` if it is still not `READY` then.
 - *Why.* A client must never mistake a lost sandbox for an exit code. A made-up code such as 137 or -1 cannot be told apart from the program's own. Output already streamed stays valid; the status only says the exit was not seen.
 - *Alternative.* Always end with an exit event that carries a "lost" flag. Simpler for clients that ignore errors, but "did this run?" then lives in a field a client can forget to read.
-- *The gateway inherits the rule from the node.* It relays whatever the node sends and never invents an exit ([gateway.Exec](../internal/gateway/gateway.go)). Nothing follows an exit because the node sends nothing after its exit; once an exit has gone by, the way the node's stream ends no longer changes the result.
+- *The gateway inherits the rule from the node.* It relays whatever the node sends and never invents an exit ([gateway.Exec](../internal/gateway/gateway.go)). Nothing follows an exit because the node sends nothing after its exit; once an exit has gone by, the way the node's stream ends no longer changes the result. When its own state ends an Exec that is running (D37), the status is `Unavailable` whatever the state says, with the state's reason in the message (destroyed, TTL expired, lost, moved); a `NotFound` stays `NotFound` only when the node itself answered it and the state has the sandbox destroyed or no longer knows it.
 - *What would change it.* A client API that wants an explicit "exit unknown" marker in the stream, for example a batch interface. The marker would be a field of its own, still never an exit code.
 
 ### 4.6 Timeouts
@@ -542,7 +542,7 @@ When the detector declares a node dead ([reschedule.go](../internal/gateway/resc
 
 **D37. A proxied Exec also watches the scheduler's own state.**
 
-- *Choice.* While it relays a node's Exec stream, the gateway checks the state every 250 ms and ends the stream with `Unavailable` as soon as the sandbox is no longer `READY` on that node at that incarnation ([gateway.watch](../internal/gateway/gateway.go)). Keepalive on the node connections stays at 10 s.
+- *Choice.* While it relays a node's Exec stream, the gateway checks the state every 250 ms and ends the stream with `Unavailable` as soon as the sandbox is no longer `READY` on that node at that incarnation, a destroy or a TTL expiry included ([gateway.watch](../internal/gateway/gateway.go)). Keepalive on the node connections stays at 10 s.
 - *Why.* The first design relied on gRPC keepalive pings every 2 s to notice a node that vanished without closing its connection. grpc-go raises any client ping interval below 10 s to 10 s, so keepalive alone would leave such an Exec hanging for 10 s or more. The state watch bounds it by the 3 s failure threshold.
 - *Alternative.* Application-level pings on the stream, or a node-side push.
 - *What would change it.* Nothing in grpc-go's floor is likely to; the watch is also what tells an Exec that its sandbox moved, which keepalive cannot.

@@ -998,30 +998,51 @@ func TestExecExitThenLost(t *testing.T) {
 	}
 }
 
-// TestExecEndsWhenSandboxDestroyed: a destroy ends a proxied Exec with
-// NotFound even if the node's stream does not end.
+// TestExecEndsWhenSandboxDestroyed: a destroy or a TTL expiry ends a
+// proxied Exec that is already running with Unavailable and the state's
+// reason (spec D34), even if the node's stream does not end.
 func TestExecEndsWhenSandboxDestroyed(t *testing.T) {
-	e := newEnv(t, nil)
-	e.register("n1")
-	sb := e.mustCreate(nil)
-	e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
-		return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("started")}, hold: true}, nil
-	})
-	stream, err := e.sc.Exec(ctx(t), &gssv1.ExecRequest{SandboxId: sb.GetId()})
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name string
+		end  func(e *env, id string)
+		msg  string
+	}{
+		{"destroy", func(e *env, id string) {
+			if _, err := e.sc.DestroySandbox(ctx(t), &gssv1.DestroySandboxRequest{SandboxId: id}); err != nil {
+				t.Fatal(err)
+			}
+		}, "was destroyed during the exec"},
+		{"ttl expiry", func(e *env, id string) {
+			e.clock.advance(gssv1.DefaultTTL + time.Second)
+			e.state.Tick()
+		}, "was destroyed during the exec (ttl expired)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.register("n1")
+			sb := e.mustCreate(nil)
+			e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
+				return &fakeStream{ctx: ctx, events: []*gssv1.ExecEvent{stdout("started")}, hold: true}, nil
+			})
+			stream, err := e.sc.Exec(ctx(t), &gssv1.ExecRequest{SandboxId: sb.GetId()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stream.Recv(); err != nil {
+				t.Fatal(err)
+			}
+			tc.end(e, sb.GetId())
+			_, err = recvAll(stream)
+			wantCode(t, err, codes.Unavailable, "Exec of a sandbox that ended meanwhile")
+			if want := "sandbox " + sb.GetId() + " " + tc.msg; status.Convert(err).Message() != want {
+				t.Errorf("message %q, want %q", status.Convert(err).Message(), want)
+			}
+		})
 	}
-	if _, err := stream.Recv(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.sc.DestroySandbox(ctx(t), &gssv1.DestroySandboxRequest{SandboxId: sb.GetId()}); err != nil {
-		t.Fatal(err)
-	}
-	_, err = recvAll(stream)
-	wantCode(t, err, codes.NotFound, "Exec of a sandbox destroyed meanwhile")
 }
 
-// TestWatchEnd covers every way the state can end a proxied Exec.
+// TestWatchEnd covers every way the state can end a proxied Exec that is
+// running: always Unavailable, with the state's reason (spec D34).
 func TestWatchEnd(t *testing.T) {
 	was := &gssv1.Sandbox{Id: "sb-1", NodeId: "n1", Incarnation: 1, State: gssv1.SandboxState_SANDBOX_STATE_READY}
 	with := func(f func(*gssv1.Sandbox)) *gssv1.Sandbox {
@@ -1043,12 +1064,15 @@ func TestWatchEnd(t *testing.T) {
 		{"restarted", with(func(sb *gssv1.Sandbox) { sb.Incarnation, sb.State = 2, gssv1.SandboxState_SANDBOX_STATE_STARTING }),
 			codes.Unavailable, "sandbox sb-1 lost on node n1: moved to node n1 (incarnation 2)"},
 		{"destroyed", with(func(sb *gssv1.Sandbox) {
+			sb.State, sb.Message = gssv1.SandboxState_SANDBOX_STATE_DESTROYED, "destroyed"
+		}), codes.Unavailable, "sandbox sb-1 was destroyed during the exec"},
+		{"expired", with(func(sb *gssv1.Sandbox) {
 			sb.State, sb.Message = gssv1.SandboxState_SANDBOX_STATE_DESTROYED, "ttl expired"
-		}), codes.NotFound, "sandbox sb-1 was destroyed (ttl expired)"},
+		}), codes.Unavailable, "sandbox sb-1 was destroyed during the exec (ttl expired)"},
 		{"failed", with(func(sb *gssv1.Sandbox) {
 			sb.State, sb.Message = gssv1.SandboxState_SANDBOX_STATE_FAILED, "no node fits"
-		}), codes.FailedPrecondition, "no node fits"},
-		{"gone", nil, codes.NotFound, "sandbox sb-1 not found"},
+		}), codes.Unavailable, "sandbox sb-1 failed during the exec: no node fits"},
+		{"gone", nil, codes.Unavailable, "sandbox sb-1 is no longer known to the scheduler"},
 	} {
 		err := watchEnd(was, tc.cur, tc.cur != nil)
 		if got := status.Convert(err); got.Code() != tc.code || got.Message() != tc.msg {
@@ -1256,31 +1280,38 @@ func TestExecNothingAfterExit(t *testing.T) {
 	}
 }
 
-// TestExecNodeNotFound: a node that does not know the sandbox ends the Exec
-// as the scheduler's state says: lost while the state still has it here,
-// lost when the state marked it LOST, NotFound when it was destroyed.
+// TestExecNodeNotFound: a node that does not know the sandbox never ran
+// the Exec, which ends as the scheduler's state says: lost while the state
+// still has it here, lost when the state marked it LOST, NotFound when it
+// was destroyed (its destroy started before the Exec reached the node, spec
+// D34), even if the watcher saw the destroy first.
 func TestExecNodeNotFound(t *testing.T) {
 	e := newEnv(t, nil)
 	e.register("n1")
+	destroy := func(id string) {
+		_, _ = e.srv.DestroySandbox(context.Background(), &gssv1.DestroySandboxRequest{SandboxId: id})
+	}
 	for _, tc := range []struct {
 		name   string
-		before func(id string) // runs just before the node answers NotFound
+		before func(ctx context.Context, id string) // runs just before the node answers NotFound
 		code   codes.Code
 		msg    string
 	}{
-		{"still READY", func(string) {}, codes.Unavailable, "lost on node n1: the node no longer has it"},
-		{"marked LOST", func(string) {
+		{"still READY", func(context.Context, string) {}, codes.Unavailable, "lost on node n1: the node no longer has it"},
+		{"marked LOST", func(context.Context, string) {
 			e.clock.advance(3300 * time.Millisecond) // n1 misses its heartbeats
 			e.state.Tick()
 		}, codes.Unavailable, "lost on node n1: marked LOST by the scheduler"},
-		{"destroyed", func(id string) {
-			_, _ = e.srv.DestroySandbox(context.Background(), &gssv1.DestroySandboxRequest{SandboxId: id})
+		{"destroyed", func(_ context.Context, id string) { destroy(id) }, codes.NotFound, "was destroyed"},
+		{"destroyed, watcher first", func(ctx context.Context, id string) {
+			destroy(id)
+			<-ctx.Done() // the watcher has cancelled the node stream
 		}, codes.NotFound, "was destroyed"},
 	} {
 		e.register("n1") // alive again for the create
 		sb := e.mustCreate(nil)
 		e.nodes.setExec(func(ctx context.Context, a string, req *gssv1.ExecRequest) (grpc.ServerStreamingClient[gssv1.ExecEvent], error) {
-			tc.before(req.GetSandboxId())
+			tc.before(ctx, req.GetSandboxId())
 			return &fakeStream{ctx: ctx, end: status.Error(codes.NotFound, "sandbox "+req.GetSandboxId()+" not found")}, nil
 		})
 		_, err := e.exec(sb.GetId())

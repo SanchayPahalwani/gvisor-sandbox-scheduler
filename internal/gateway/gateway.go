@@ -449,10 +449,11 @@ type watchCause struct{ err error }
 
 func (w watchCause) Error() string { return w.err.Error() }
 
-// Exec waits for the sandbox to be READY and proxies the node's Exec
-// stream (spec D8, D34): events as they come; the node's status if the
-// stream ends with one; Unavailable if the sandbox is lost on the way.
-// No exit event is ever made up, and nothing follows one that was sent.
+// Exec waits for the sandbox to be READY (DeadlineExceeded after
+// ExecWaitCap) and proxies the node's Exec stream (spec D8, D34): events as
+// they come; the node's status if the stream ends with one; Unavailable if
+// the sandbox is lost, destroyed or expires while the Exec runs. No exit
+// event is ever made up, and nothing follows one that was sent.
 func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[gssv1.ExecEvent]) (err error) {
 	ctx, span := startSpan(stream.Context(), "gateway.exec", attribute.String("sandbox.id", req.GetSandboxId()))
 	defer func() { endSpan(span, err) }()
@@ -487,27 +488,43 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 		// nothing follows it (spec D34).
 		return nil
 	}
+	st := status.Convert(err)
+	if st.Code() == codes.NotFound {
+		// The node itself answered: it never ran the Exec. Checked before the
+		// watcher, which may have seen the same destroy a moment earlier.
+		return s.notOnNode(sb, st)
+	}
 	var wc watchCause
 	if errors.As(context.Cause(nctx), &wc) {
 		return wc.err
 	}
-	st := status.Convert(err)
-	switch st.Code() {
-	case codes.Unavailable:
+	if st.Code() == codes.Unavailable {
 		// The node went away (the transport failed) or the node itself says
 		// the sandbox stopped: either way this copy is lost.
 		return status.Errorf(codes.Unavailable, "%s: %s", lost, st.Message())
-	case codes.NotFound:
-		// The node does not know the sandbox: the state says why.
-		cur, ok := s.state.Get(sb.GetId())
-		if werr := watchEnd(sb, cur, ok); werr != nil {
-			return werr // LOST or moved, destroyed, failed
-		}
-		// Still READY there for the scheduler: the agent restarted, and its
-		// heartbeats will get the sandbox moved.
-		return status.Errorf(codes.Unavailable, "%s: the node no longer has it (%s)", lost, st.Message())
 	}
 	return st.Err()
+}
+
+// notOnNode is how an Exec ends when the node answered NotFound for sb,
+// which the state had READY there when the Exec began. If the state has it
+// destroyed or no longer knows it, its destroy started before the Exec
+// reached the node: NotFound (spec D34). Otherwise it was lost.
+func (s *Server) notOnNode(sb *gssv1.Sandbox, st *status.Status) error {
+	id := sb.GetId()
+	cur, ok := s.state.Get(id)
+	switch {
+	case !ok:
+		return status.Errorf(codes.NotFound, "sandbox %s not found", id)
+	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_DESTROYED:
+		return status.Error(codes.NotFound, "sandbox "+id+" was destroyed"+destroyReason(cur))
+	}
+	if err := watchEnd(sb, cur, ok); err != nil {
+		return err // LOST, moved or failed: Unavailable
+	}
+	// Still READY there for the scheduler: the agent restarted, and its
+	// heartbeats will get the sandbox moved.
+	return status.Errorf(codes.Unavailable, "%s: the node no longer has it (%s)", lostMsg(sb), st.Message())
 }
 
 func lostMsg(sb *gssv1.Sandbox) string {
@@ -538,7 +555,8 @@ func (s *Server) waitReady(ctx context.Context, id string) (*gssv1.Sandbox, erro
 // on its node at its incarnation (spec D37): grpc-go will not ping a
 // connection more often than every 10 s, so an Exec to a node that vanished
 // without closing its connection would otherwise hang that long; with
-// this, the node timeout bounds it.
+// this, the node timeout bounds it. The Exec ends with watchEnd's
+// Unavailable.
 func (s *Server) watch(ctx context.Context, cancel context.CancelCauseFunc, sb *gssv1.Sandbox) {
 	t := time.NewTicker(s.cfg.TickInterval)
 	defer t.Stop()
@@ -558,19 +576,17 @@ func (s *Server) watch(ctx context.Context, cancel context.CancelCauseFunc, sb *
 
 // watchEnd is the status an Exec on was ends with, given the state's
 // current copy cur (ok false: gone), or nil while was is still current.
+// The Exec was running, so whatever the state says, the status is
+// Unavailable (spec D34) and the message carries the state's reason.
 func watchEnd(was, cur *gssv1.Sandbox, ok bool) error {
 	id, lost := was.GetId(), lostMsg(was)
 	switch {
 	case !ok:
-		return status.Errorf(codes.NotFound, "sandbox %s not found", id)
+		return status.Errorf(codes.Unavailable, "sandbox %s is no longer known to the scheduler", id)
 	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_DESTROYED:
-		msg := "sandbox " + id + " was destroyed"
-		if m := cur.GetMessage(); m != "" && m != "destroyed" {
-			msg += " (" + m + ")"
-		}
-		return status.Error(codes.NotFound, msg)
+		return status.Error(codes.Unavailable, "sandbox "+id+" was destroyed during the exec"+destroyReason(cur))
 	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_FAILED:
-		return status.Error(codes.FailedPrecondition, cur.GetMessage())
+		return status.Errorf(codes.Unavailable, "sandbox %s failed during the exec: %s", id, cur.GetMessage())
 	case cur.GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST:
 		return status.Errorf(codes.Unavailable, "%s: marked LOST by the scheduler", lost)
 	case cur.GetNodeId() == "":
@@ -579,6 +595,15 @@ func watchEnd(was, cur *gssv1.Sandbox, ok bool) error {
 		return status.Errorf(codes.Unavailable, "%s: moved to node %s (incarnation %d)", lost, cur.GetNodeId(), cur.GetIncarnation())
 	}
 	return nil
+}
+
+// destroyReason is " (<the state's message>)" for a destroyed sandbox, such
+// as " (ttl expired)", or "" after a client's destroy.
+func destroyReason(sb *gssv1.Sandbox) string {
+	if m := sb.GetMessage(); m != "" && m != "destroyed" {
+		return " (" + m + ")"
+	}
+	return ""
 }
 
 // DestroySandbox destroys a sandbox, whatever incarnation is live. The
