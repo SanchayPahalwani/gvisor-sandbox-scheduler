@@ -154,7 +154,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (node) (gss_sandboxes)",
+          "expr": "max by (node) (gss_sandboxes)",
           "legendFormat": "{{node}}"
         }
       ]
@@ -199,7 +199,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (node) (gss_warm_pool_ready)",
+          "expr": "max by (node) (gss_warm_pool_ready)",
           "legendFormat": "{{node}}"
         }
       ]
@@ -334,7 +334,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (group, state) (gss_nodes)",
+          "expr": "max by (group, state) (gss_nodes)",
           "legendFormat": "{{group}} {{state}}"
         }
       ]
