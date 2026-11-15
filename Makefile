@@ -5,17 +5,21 @@ UNAME := $(shell uname -s)
 
 PKG ?= ./...
 RUN ?= .
-# Variables forwarded into the VM invocation. Append new ones here.
-FORWARD_VARS := PKG RUN FORCE
+# Variables forwarded into the VM invocation. Append new ones here. The GSS_* ones are
+# the cluster topology read by scripts/cluster.sh (an empty one means its default).
+FORWARD_VARS := PKG RUN FORCE GSS_NODES GSS_NODE_CPU GSS_NODE_MEM GSS_NODE_MAX GSS_POOL GSS_SCHED_ARGS
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
-LINUX_TARGETS := build test-integration rootfs bench bench-start bench-throughput bench-density bench-grouploss
+LINUX_TARGETS := build test-integration rootfs bench bench-start bench-throughput bench-density bench-grouploss up down status demo
 
 .PHONY: vm vm-stop vm-delete proto test lint sim hardware results $(LINUX_TARGETS)
 
 ifeq ($(UNAME),Darwin)
 $(LINUX_TARGETS):
 	limactl shell --workdir $(CURDIR) gss -- make $@ $(FORWARD)
+
+# The demo starts the VM first if it is not running.
+demo: vm
 
 vm:
 	@if ! limactl list -q 2>/dev/null | grep -qx gss; then \
@@ -47,6 +51,30 @@ test-integration:
 
 rootfs:
 	scripts/build-rootfs.sh
+
+# Local cluster (spec section 11): one scheduler and one node agent per entry of
+# GSS_NODES, as transient systemd units. scripts/cluster.sh lists its settings.
+# up returns once every node is READY with its warm pool full.
+up: build
+	scripts/cluster.sh up
+
+down:
+	scripts/cluster.sh down
+
+status:
+	scripts/cluster.sh status
+
+# Builds, builds the sandbox rootfs if it is missing or stale, brings the cluster up
+# (four nodes in groups a and b by default) and runs the two examples through gssctl.
+# Each run prints the program's output, then the node, the start path and the latency.
+demo: build rootfs
+	scripts/cluster.sh up
+	@echo
+	bin/gssctl run -f examples/hello.py
+	@echo
+	bin/gssctl run -f examples/pandas_demo.py
+	@echo
+	@echo "The cluster is still running: make status shows it, make down stops it."
 
 # Benchmarks (spec section 10). Each one starts from a fresh cluster so runs do not
 # share state, and refuses to run with OTLP export on or the gss-obs observability
