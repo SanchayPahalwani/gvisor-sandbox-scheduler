@@ -773,7 +773,6 @@ Why the local failure-domain test says nothing about these: it kills processes i
 ### Observability and tooling
 
 - Each metric instrument is looked up on every call instead of once.
-- The gauge panels sum by node; after an agent restart the old and new series can both count for a few minutes. `max by (node)` would fix it.
 - A placement that fails with an empty rejection map is labelled `no_nodes`.
 - The observability container publishes its OTLP ports on every interface of the VM.
 - `schedsim`'s table has no column for the fill level reached; it is in the JSON only. The throughput rows print 0.0 when a run had no successful cycle (a true zero, but easy to misread).
