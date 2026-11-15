@@ -14,7 +14,7 @@
     {
       "name": "first_result_ms",
       "unit": "ms",
-      "count": 1873,
+      "count": 470,
       "min": 10,
       "mean": 50,
       "p50": 40.2,
@@ -25,7 +25,7 @@
     {
       "name": "ready_ms",
       "unit": "ms",
-      "count": 1873,
+      "count": 470,
       "min": 5,
       "mean": 30,
       "p50": 25.1,
@@ -35,7 +35,7 @@
     }
   ],
   "scalars": {
-    "sandboxes_per_sec": 31.07,
+    "sandboxes_per_sec": 7.79,
     "share_warm": 0.912,
     "share_restore": 0.088,
     "share_cold": 0

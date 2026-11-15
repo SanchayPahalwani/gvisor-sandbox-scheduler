@@ -278,7 +278,7 @@ func (s *Server) placeAndStart(ctx context.Context, id string, fresh bool) (*gss
 				placementFailed(ctx, reasonNodeError)
 				return nil, s.fail(id, fresh, err)
 			}
-			if code != codes.FailedPrecondition {
+			if !refusal(code) {
 				s.state.RecordResult(d.NodeID, false)
 			}
 			s.log.Warn("node create failed", "sandbox", id, "node", d.NodeID, "incarnation", inc, "code", code, "err", msg)
@@ -310,6 +310,19 @@ func (s *Server) placeAndStart(ctx context.Context, id string, fresh bool) (*gss
 		sb, _ = s.state.Get(id)
 		return sb, nil
 	}
+}
+
+// refusal reports whether a node Create error is the node declining the
+// request rather than failing at it: a start mode it cannot serve, no room by
+// its own count (a destroy it has not finished yet, for example), a request
+// it rejects, or an ID it still holds. A refusal does not lower the node's
+// health; the node is still excluded and another one tried.
+func refusal(code codes.Code) bool {
+	switch code {
+	case codes.FailedPrecondition, codes.ResourceExhausted, codes.InvalidArgument, codes.AlreadyExists:
+		return true
+	}
+	return false
 }
 
 // fail ends a placement with err. A client's create also moves the sandbox
@@ -606,15 +619,17 @@ func destroyReason(sb *gssv1.Sandbox) string {
 	return ""
 }
 
-// DestroySandbox destroys a sandbox, whatever incarnation is live. The
-// node's Destroy is bounded by destroyTimeout; if it fails, the node's next
-// heartbeat answer lists the ID. A LOST sandbox's node is dead or no longer
-// has it, so it is not called at all: the heartbeat answer covers it. An
-// unknown ID is not an error.
+// DestroySandbox destroys a sandbox: whatever incarnation is live when the
+// request's incarnation is 0, otherwise only if the scheduler's incarnation
+// is that one or older (a newer one is left alone, and the call succeeds).
+// The node's Destroy is bounded by destroyTimeout; if it fails, the node's
+// next heartbeat answer lists the ID. A LOST sandbox's node is dead or no
+// longer has it, so it is not called at all: the heartbeat answer covers
+// it. An unknown ID is not an error.
 func (s *Server) DestroySandbox(ctx context.Context, req *gssv1.DestroySandboxRequest) (*gssv1.DestroySandboxResponse, error) {
 	id := req.GetSandboxId()
 	before, _ := s.state.Get(id)
-	nodeID, existed := s.state.Destroy(id)
+	nodeID, existed := s.state.DestroyUpTo(id, req.GetIncarnation())
 	wasLost := before.GetState() == gssv1.SandboxState_SANDBOX_STATE_LOST && before.GetNodeId() == nodeID
 	if existed && nodeID != "" && !wasLost {
 		if addr, ok := s.state.NodeAddress(nodeID); ok {

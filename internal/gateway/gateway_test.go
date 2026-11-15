@@ -450,6 +450,8 @@ func TestCreateInvalid(t *testing.T) {
 	}
 	_, err = e.create(&gssv1.SandboxSpec{StartMode: 9})
 	wantCode(t, err, codes.InvalidArgument, "start_mode 9")
+	_, err = e.create(&gssv1.SandboxSpec{Ttl: durationpb.New(5 * time.Second)})
+	wantCode(t, err, codes.InvalidArgument, "ttl 5s")
 	if got := e.state.List(); len(got) != 0 {
 		t.Errorf("state.List = %v, want empty", got)
 	}
@@ -521,6 +523,34 @@ func TestCreateRetriesOtherNode(t *testing.T) {
 	}
 	if e.node("n2").GetHealth() != 1 {
 		t.Errorf("n2 health = %v, want 1", e.node("n2").GetHealth())
+	}
+}
+
+// TestCreateRefusalKeepsHealth: a node that refuses a create (full by its
+// own count, a request it rejects, an ID it still holds) is excluded and the
+// create goes to another node, but its health is not lowered.
+func TestCreateRefusalKeepsHealth(t *testing.T) {
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.InvalidArgument, codes.AlreadyExists} {
+		t.Run(code.String(), func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.register("n1")
+			e.register("n2")
+			e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+				if a == addr("n1") {
+					return nil, status.Error(code, "refused")
+				}
+				return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+			})
+			if sb := e.mustCreate(nil); sb.GetNodeId() != "n2" {
+				t.Errorf("placed on %s, want n2", sb.GetNodeId())
+			}
+			if calls := e.nodes.createCalls(); len(calls) != 2 || calls[0].addr != addr("n1") {
+				t.Errorf("Create calls = %v, want n1 then n2", calls)
+			}
+			if h := e.node("n1").GetHealth(); h != 1 {
+				t.Errorf("n1 health = %v after %v, want 1", h, code)
+			}
+		})
 	}
 }
 
@@ -792,6 +822,50 @@ func TestDestroy(t *testing.T) {
 	}
 	_, err := e.exec(sb.GetId())
 	wantCode(t, err, codes.NotFound, "Exec of a destroyed sandbox")
+}
+
+// TestDestroyIncarnation: a client's destroy that names an incarnation
+// destroys the sandbox only if the scheduler's incarnation is that one or
+// older; otherwise it succeeds and does nothing (DestroySandboxRequest).
+func TestDestroyIncarnation(t *testing.T) {
+	e := newEnv(t, nil)
+	e.register("n1")
+	e.register("n2")
+	e.nodes.setCreate(func(ctx context.Context, a string, req *gssv1.NodeCreateRequest) (*gssv1.NodeCreateResponse, error) {
+		if a == addr("n1") && req.GetSandboxId() == "sb-000000000001" {
+			return nil, status.Error(codes.Internal, "runsc create failed")
+		}
+		return &gssv1.NodeCreateResponse{StartedAs: gssv1.StartMode_START_MODE_COLD}, nil
+	})
+	sb := e.mustCreate(nil) // n1 failed, so READY on n2 at incarnation 2
+	if sb.GetIncarnation() != 2 {
+		t.Fatalf("incarnation %d, want 2", sb.GetIncarnation())
+	}
+	destroy := func(id string, inc int32) {
+		t.Helper()
+		if _, err := e.sc.DestroySandbox(ctx(t), &gssv1.DestroySandboxRequest{SandboxId: id, Incarnation: inc}); err != nil {
+			t.Fatalf("DestroySandbox %s at %d: %v", id, inc, err)
+		}
+	}
+	destroy(sb.GetId(), 1)
+	if got := e.get(sb.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_READY {
+		t.Errorf("after a destroy of incarnation 1: %v, want READY", got.GetState())
+	}
+	if got := e.nodes.destroyCalls(); len(got) != 0 {
+		t.Errorf("node Destroy calls = %q, want none", got)
+	}
+	destroy(sb.GetId(), 2)
+	if got := e.get(sb.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+		t.Errorf("after a destroy of incarnation 2: %v, want DESTROYED", got.GetState())
+	}
+	if got, want := e.nodes.destroyCalls(), []string{addr("n2") + " " + sb.GetId() + " 0"}; !slices.Equal(got, want) {
+		t.Errorf("node Destroy calls = %q, want %q", got, want)
+	}
+	other := e.mustCreate(nil) // incarnation 1
+	destroy(other.GetId(), 5)
+	if got := e.get(other.GetId()); got.GetState() != gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+		t.Errorf("after a destroy of incarnation 5 of incarnation 1: %v, want DESTROYED", got.GetState())
+	}
 }
 
 func TestDestroyNodeUnreachable(t *testing.T) {

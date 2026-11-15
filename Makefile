@@ -23,6 +23,11 @@ $(LINUX_TARGETS):
 # The demo starts the VM first if it is not running.
 demo: vm
 
+# make bench captures the hardware on the host first (the host part and, through the
+# VM, the VM part) and tells scripts/bench-all.sh in the VM not to capture it again.
+bench: hardware
+bench: FORWARD += GSS_HARDWARE_CAPTURED=1
+
 vm:
 	@if ! limactl list -q 2>/dev/null | grep -qx gss; then \
 		limactl start --name=gss --tty=false --set '.mounts=[{"location":"$(CURDIR)","writable":true}]' lima/gss.yaml; \
@@ -112,8 +117,8 @@ bench-density: build
 	bin/loadgen density --out results/density.json
 	$(DENSITY_TOPOLOGY) scripts/cluster.sh down
 
-# Every benchmark in order, stopping at the first failure; does not start the
-# observability container.
+# The hardware capture, then every benchmark in order, stopping at the first failure;
+# does not start the observability container.
 bench:
 	scripts/bench-all.sh
 

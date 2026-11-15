@@ -54,7 +54,7 @@ spec flags:
   --group G          run on a node of group G
   --affinity KEY     prefer the group where sandboxes with KEY run
   --mode auto        start path: auto, cold, restore or warm
-  --ttl 10m          destroy the sandbox after this long (at most 60m)
+  --ttl 10m          destroy the sandbox after this long (10s to 60m)
 
 -c CODE runs Python code in a fork of the primed interpreter, -f FILE runs
 the code in FILE the same way, and -- ARGV... runs ARGV as a new process.

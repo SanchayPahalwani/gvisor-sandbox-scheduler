@@ -1,6 +1,7 @@
 package gssv1
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,10 @@ func TestValidateSpec(t *testing.T) {
 		{"memory above max", &SandboxSpec{Resources: res(500, 1<<40+1)}, "memory_bytes"},
 		{"upper boundaries", &SandboxSpec{Resources: res(256000, 1<<40)}, ""},
 		{"ttl 61m", &SandboxSpec{Resources: ok, Ttl: durationpb.New(61 * time.Minute)}, "ttl"},
+		{"ttl 9s", &SandboxSpec{Resources: ok, Ttl: durationpb.New(9 * time.Second)}, "ttl 9s is below the minimum 10s"},
+		{"ttl 10s", &SandboxSpec{Resources: ok, Ttl: durationpb.New(10 * time.Second)}, ""},
+		{"egress 64 entries", &SandboxSpec{Resources: ok, EgressAllow: entries(64)}, ""},
+		{"egress 65 entries", &SandboxSpec{Resources: ok, EgressAllow: entries(65)}, "egress_allow has 65 entries; the maximum is 64"},
 		{"ttl negative", &SandboxSpec{Resources: ok, Ttl: durationpb.New(-time.Second)}, "ttl"},
 		{"egress no port", &SandboxSpec{Resources: ok, EgressAllow: []string{"example.com"}}, "egress_allow"},
 		{"egress bad port", &SandboxSpec{Resources: ok, EgressAllow: []string{"10.0.0.0/8:99999"}}, "egress_allow"},
@@ -88,6 +93,35 @@ func TestValidateSpec(t *testing.T) {
 				t.Fatalf("error = %v, want mention of %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// entries returns n distinct valid egress entries.
+func entries(n int) []string {
+	var e []string
+	for i := range n {
+		e = append(e, fmt.Sprintf("10.0.%d.%d:443", i/256, i%256))
+	}
+	return e
+}
+
+// TestValidateNodeSpec: a node's Create carries what is left of the TTL,
+// which may be below MinTTL; every other limit is ValidateSpec's.
+func TestValidateNodeSpec(t *testing.T) {
+	ok := &Resources{CpuMillis: 500, MemoryBytes: 256 << 20}
+	if err := ValidateNodeSpec(&SandboxSpec{Resources: ok, Ttl: durationpb.New(5 * time.Second)}); err != nil {
+		t.Errorf("ttl 5s: %v", err)
+	}
+	for name, s := range map[string]*SandboxSpec{
+		"ttl negative":      {Resources: ok, Ttl: durationpb.New(-time.Second)},
+		"ttl 61m":           {Resources: ok, Ttl: durationpb.New(61 * time.Minute)},
+		"egress 65 entries": {Resources: ok, EgressAllow: entries(65)},
+		"cpu 99":            {Resources: &Resources{CpuMillis: 99, MemoryBytes: 256 << 20}},
+		"nil":               nil,
+	} {
+		if err := ValidateNodeSpec(s); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
 	}
 }
 

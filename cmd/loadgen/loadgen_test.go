@@ -661,10 +661,23 @@ func TestDensityVerdict(t *testing.T) {
 	if base != 0 || maxLive != 0 || !strings.Contains(strings.Join(notes, "\n"), "no successful restore start") {
 		t.Errorf("no starts: baseline %v max %d notes %q", base, maxLive, notes)
 	}
-	// A step over 2x, then one back within it: the largest qualifying step, and a note.
+	// Every step within 2x: the last one.
+	base, maxLive, notes = densityVerdict([]densityStep{ok(5, 10), ok(10, 15), ok(20, 20)})
+	if base != 10 || maxLive != 20 || len(notes) != 0 {
+		t.Errorf("all within: baseline %v max %d notes %q", base, maxLive, notes)
+	}
+	// A step over 2x, then one back within it: the verdict stops at the first step
+	// over (the latency must have stayed within 2x), and a note says so.
 	base, maxLive, notes = densityVerdict([]densityStep{ok(5, 10), ok(10, 25), ok(20, 18)})
-	if base != 10 || maxLive != 20 || !strings.Contains(strings.Join(notes, "\n"), "above 2 x baseline at steps [10]") {
+	if base != 10 || maxLive != 5 || !strings.Contains(strings.Join(notes, "\n"), "above 2 x baseline at step 10") {
 		t.Errorf("over then within: baseline %v max %d notes %q", base, maxLive, notes)
+	}
+	// A step with failures stops it too, even if later steps are fine.
+	failedMid := ok(10, 12)
+	failedMid.failed = 1
+	base, maxLive, notes = densityVerdict([]densityStep{ok(5, 10), failedMid, ok(20, 12)})
+	if base != 10 || maxLive != 5 || !strings.Contains(strings.Join(notes, "\n"), "step 10 had failures (1)") {
+		t.Errorf("failed then within: baseline %v max %d notes %q", base, maxLive, notes)
 	}
 }
 
@@ -713,5 +726,40 @@ func TestStartCommandWritesResults(t *testing.T) {
 	}
 	if err := run(context.Background(), []string{"bin/loadgen", "start", "--modes", "auto"}, io.Discard, io.Discard); err == nil {
 		t.Error("want an error for --modes auto")
+	}
+}
+
+// bigNodes answers ListNodes with one node whose ID is n bytes long.
+type bigNodes struct {
+	gssv1.UnimplementedSandboxServiceServer
+	n int
+}
+
+func (b bigNodes) ListNodes(context.Context, *gssv1.ListNodesRequest) (*gssv1.ListNodesResponse, error) {
+	return &gssv1.ListNodesResponse{Nodes: []*gssv1.Node{{Info: &gssv1.NodeInfo{Id: strings.Repeat("n", b.n)}}}}, nil
+}
+
+// TestDialMessageLimit: loadgen's connection takes messages up to the 20 MiB
+// the scheduler sends, as gssctl's does, not grpc-go's 4 MiB default.
+func TestDialMessageLimit(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.MaxSendMsgSize(maxMsgSize))
+	gssv1.RegisterSandboxServiceServer(srv, bigNodes{n: 8 << 20})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	conn, err := dial(lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	resp, err := gssv1.NewSandboxServiceClient(conn).ListNodes(context.Background(), &gssv1.ListNodesRequest{})
+	if err != nil {
+		t.Fatalf("ListNodes with an 8 MiB answer: %v", err)
+	}
+	if got := len(resp.GetNodes()[0].GetInfo().GetId()); got != 8<<20 {
+		t.Errorf("node ID of %d bytes, want %d", got, 8<<20)
 	}
 }

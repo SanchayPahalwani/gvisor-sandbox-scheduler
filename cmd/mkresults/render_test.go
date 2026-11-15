@@ -257,7 +257,8 @@ func TestFormats(t *testing.T) {
 		got, want string
 	}{
 		{fmtMS(14.24), "14.2"}, {fmtMS(99.96), "100"}, {fmtMS(100.4), "100"}, {fmtMS(1820.6), "1821"},
-		{fmtRate(512340.2), "512340"}, {fmtFrac(0.9123), "0.912"},
+		{fmtRate(512340.2), "512340"}, {fmtRate(31.07), "31"}, {fmtRate(10), "10"}, {fmtRate(9.96), "10"},
+		{fmtRate(2.43), "2.4"}, {fmtRate(0), "0.0"}, {fmtFrac(0.9123), "0.912"},
 	} {
 		if c.got != c.want {
 			t.Errorf("got %q want %q", c.got, c.want)

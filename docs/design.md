@@ -222,7 +222,7 @@ The process section is the same for every sandbox on a node. That is forced by r
 - *Choice.* `GSS_PRIME` defaults to `json, re, math, random, statistics, datetime, collections, itertools, functools, decimal, csv, io, numpy, pandas` (`bundle.DefaultPrime`).
 - *Why.* These are what short data-handling scripts written by a model tend to import. pandas is there on purpose: it is the import that makes the difference between a cold and a restored start visible. The results renderer prints the primed set beside the start latencies, so nobody reads them as "Python in general".
 - *Alternative.* An empty primed set (a restore would then save only the interpreter start), or several images with different sets.
-- *What would change it.* A different workload mix. The set is an environment variable and part of the image key (D36), so changing it builds a new image.
+- *What would change it.* A different workload mix. The agent passes the set to the zygote in `GSS_PRIME`, but neither `cmd/nodeagent` nor its environment can change it: changing it means editing `bundle.DefaultPrime` and rebuilding. The set is part of the image key (D36), so a change builds a new checkpoint image.
 
 ### 4.5 Exec paths and the stream contract
 
@@ -286,7 +286,7 @@ The agent reads the child's stdout and stderr and sends them as `ExecEvent`s of 
 
 ### 4.8 Lifetime and agent restarts
 
-Every sandbox has a TTL, default 10 min and at most 60 min, counted from the original create and not reset by rescheduling. The scheduler expires the sandbox at its TTL and tells the node to destroy it. The node's own reaper fires 10 s later, so a node that lost contact with the scheduler still cleans up. Destroy is `runsc delete --force` (kill, then delete), a kill of any process left in the cgroup, the network teardown, removal of the bundle and pid files, and removal of the cgroup. Each step is idempotent and remembered once done; a teardown that fails leaves the entry "broken", still counted against the node, and the liveness loop retries it.
+Every sandbox has a TTL, default 10 min, at least 10 s and at most 60 min, counted from the original create and not reset by rescheduling (so the TTL a node is given can be below 10 s; the node accepts it). The scheduler expires the sandbox at its TTL and tells the node to destroy it. The node's own reaper fires 10 s later, so a node that lost contact with the scheduler still cleans up. Destroy is `runsc delete --force` (kill, then delete), a kill of any process left in the cgroup, the network teardown, removal of the bundle and pid files, and removal of the cgroup. Each step is idempotent and remembered once done; a teardown that fails leaves the entry "broken", still counted against the node, and the liveness loop retries it.
 
 **D13. The node agent keeps no state across restarts.**
 
@@ -434,7 +434,7 @@ Egress sandboxes always take the cold or restore path, because the warm pool hol
 - *Alternative.* A persistent store, or a replicated log.
 - *What would change it.* High availability. Two schedulers need a leader: a lease in a small consistent store, with the standby rebuilding its state from heartbeats exactly as a restarted scheduler does. Audit requirements would need a durable log as well.
 
-Sandbox states: a create adds the sandbox as `PENDING`; `Reserve` moves it to `STARTING` at the next incarnation; `Commit` moves it to `READY`. A dead node or missing reports move it to `LOST`, and the rescheduler takes it from `LOST` back to `STARTING` at a higher incarnation. `FAILED` and `DESTROYED` are final, and their IDs are remembered for 10 minutes (tombstones), so a report of a destroyed sandbox within those 10 minutes is answered with a destroy instead of being adopted. A report that comes later is adopted ([section 13](#scheduler)).
+Sandbox states: a create adds the sandbox as `PENDING`; `Reserve` moves it to `STARTING` at the next incarnation; `Commit` moves it to `READY`. A dead node or missing reports move it to `LOST`, and the rescheduler takes it from `LOST` back to `STARTING` at a higher incarnation. `FAILED` and `DESTROYED` are final, and their IDs are remembered (tombstones) for the longest TTL plus 10 s, 60 min 10 s: as long as a copy can live on a node, whose own reaper fires at the sandbox's TTL plus 10 s. A report of a destroyed sandbox in that time is answered with a destroy instead of being adopted.
 
 ### 7.4 Registration, heartbeats and one failure threshold
 
@@ -469,7 +469,7 @@ A filter returns a bool, and the rejection reason is the filter's name. The alte
 | `BinPack` | 1.0 | `100 * ((alloc.cpu + req.cpu) / cap.cpu + (alloc.mem + req.mem) / cap.mem) / 2`: the mean of CPU and memory utilisation after placing the request. Fuller nodes score higher. |
 | `WarmPool` | 1.0 | 100 if the request can use a warm sandbox (no egress, start mode `AUTO` or `WARM`) and the node reports at least one, else 0. |
 | `GroupAffinity` | 0.5 | `100 * live sandboxes with the same affinity_key in this node's group / live sandboxes with that key`; 0 when the key is empty or unused. |
-| `NodeHealth` | 1.0 | `100 * health`. Health starts at 1 and after each node Create call becomes `0.8 * health + 0.2 * outcome`, with outcome 1 for success and 0 for failure (an exponentially weighted success rate, alpha 0.2). A `FailedPrecondition` answer, a start mode the node cannot serve, is not counted. |
+| `NodeHealth` | 1.0 | `100 * health`. Health starts at 1 and after each node Create call becomes `0.8 * health + 0.2 * outcome`, with outcome 1 for success and 0 for failure (an exponentially weighted success rate, alpha 0.2). A refusal is not counted: `FailedPrecondition` (a start mode the node cannot serve), `ResourceExhausted` (no room by the node's own count), `InvalidArgument` or `AlreadyExists`. |
 
 The total is the sum of weight times score; the highest total wins, and ties go to the lowest node ID. `Place` also returns, for tracing and for `gssctl explain`, the number of nodes considered, the number that passed the filters, and the weighted per-plugin scores of the top three candidates. The spread policy has one scorer, `LeastAllocated = 100 - BinPack`. `schedsim` also runs a first-fit policy (no scorers; the first feasible node wins) and a random one, as baselines.
 
@@ -508,10 +508,10 @@ The total is the sum of weight times score; the highest total wins, and ties go 
 `placeAndStart` in [gateway.go](../internal/gateway/gateway.go):
 
 1. `place` runs the policy over a snapshot of the state (`cluster.State.View`).
-2. `Reserve` re-checks capacity under the state's mutex, charges the request to the chosen node, moves the sandbox to `STARTING` at the next incarnation, and returns the TTL left.
+2. `Reserve` re-checks capacity under the state's mutex, charges the request to the chosen node, moves the sandbox to `STARTING` at the next incarnation, and returns the TTL left. The incarnation counts placements, not successful starts: a fresh create whose first node Create failed and that was placed again can be `READY` at incarnation 2 or 3, and a reschedule raises it again.
 3. The gateway calls the node's `CreateSandbox` with that incarnation and the remaining TTL, bounded by 60 s.
 4. On success: the node's health goes up, and `Commit` moves the sandbox to `READY` if it is still `STARTING` at that incarnation. If it is not (it was destroyed, expired or lost while it started), the gateway destroys that incarnation on the node. A commit of a warm start lowers the node's cached warm count, so the next placement does not count on the same warm sandbox before the next heartbeat.
-5. On failure: `Unreserve` releases the room, the node's health goes down (except after `FailedPrecondition`), the node is excluded, and the gateway places again, up to 3 failed node Creates. A `Reserve` conflict (another create took the room since the snapshot, or the node died) excludes the node without counting as a failed attempt. A forced start mode the node cannot serve (`FailedPrecondition`) on a client's create is returned at once and does not lower the node's health.
+5. On failure: `Unreserve` releases the room, the node's health goes down (except after a refusal: `FailedPrecondition`, `ResourceExhausted`, `InvalidArgument` or `AlreadyExists`), the node is excluded, and the gateway places again, up to 3 failed node Creates. A `Reserve` conflict (another create took the room since the snapshot, or the node died) excludes the node without counting as a failed attempt. A forced start mode the node cannot serve (`FailedPrecondition`) on a client's create is returned at once and does not lower the node's health.
 
 **Reserve before calling the node.**
 
@@ -552,19 +552,19 @@ When the detector declares a node dead ([reschedule.go](../internal/gateway/resc
 
 For each heartbeat the scheduler compares the node's list with its own table ([heartbeat.go](../internal/cluster/heartbeat.go)):
 
-- Reported and tombstoned (destroyed or failed within the last 10 minutes): put its ID in the answer's destroy list.
-- Reported and unknown: *adopt* it as `READY` on that node, with the TTL the node reports. This is what rebuilds the table after a scheduler restart. "Unknown" also covers a sandbox destroyed more than 10 minutes ago, whose tombstone has expired; see the limit in [section 13](#scheduler).
+- Reported and tombstoned (destroyed or failed within the last 60 min 10 s, the longest TTL plus the node reaper's 10 s): put its ID in the answer's destroy list.
+- Reported and unknown: *adopt* it as `READY` on that node, with the TTL the node reports. This is what rebuilds the table after a scheduler restart.
 - Reported, but the scheduler has it on another node, at another incarnation, or as `PENDING` or `LOST`: put its ID in the answer's destroy list.
 - In the table as `READY` on this node but missing from two heartbeats in a row: `LOST`, then rescheduled. That covers a sandbox that died on its own, for example a sentry killed for memory.
 
 Two rules came from review:
 
-- *A destroy carries an incarnation* (0 means whatever is live). An ID-only destroy from a stale view could remove a newer incarnation that had landed on the same node. The node's heartbeat loop destroys only the incarnation it reported.
+- *A destroy carries an incarnation* (0 means whatever is live). An ID-only destroy from a stale view could remove a newer incarnation that had landed on the same node. The node's heartbeat loop destroys only the incarnation it reported. A client's `DestroySandbox` takes one too, with the same rule: a sandbox at a newer incarnation than the one named is left alone, and the call succeeds.
 - *A `LOST` sandbox reported again by its old node is destroyed there and rescheduled fresh, not restored to `READY`.* That keeps `Commit` the only way to `READY` and keeps the incarnation contract simple. The cost: a node that was unreachable only briefly loses sandboxes that were still alive.
 
 ### 8.4 A partition that heals
 
-If a dead node comes back (it was a partition, not a crash), its next heartbeat makes it ready again with its allocations reset, and lists sandboxes that the scheduler has already moved. The answer tells it to destroy them, as long as the scheduler still knows each ID: a sandbox that was moved and then destroyed more than 10 minutes before the node came back has lost its tombstone, and the stale copy is adopted instead ([section 13](#scheduler)). If it had lost contact for longer than a sandbox's TTL, its own reaper has already destroyed the sandbox at TTL plus 10 s.
+If a dead node comes back (it was a partition, not a crash), its next heartbeat makes it ready again with its allocations reset, and lists sandboxes that the scheduler has already moved. The answer tells it to destroy them: a moved sandbox that was then destroyed keeps its tombstone for the longest TTL plus 10 s, as long as a copy can live on a node. If the node had lost contact for longer than a sandbox's TTL, its own reaper has already destroyed the sandbox at TTL plus 10 s.
 
 ### 8.5 Agent restart
 
@@ -688,7 +688,7 @@ Nothing has been measured yet. This section says what will be measured, how, and
 | Placement | `make sim` (`schedsim`) | 1,000 synthetic nodes in 4 groups (20 % 8 CPU / 32 GiB, 50 % 16 CPU / 64 GiB, 30 % 32 CPU / 128 GiB), requests drawn from four sizes, fixed seed. *Fill*: place until 70 % of fleet CPU is requested. *Churn*: then 50,000 remove-one-add-one steps. Default, spread, first-fit and random policies, and the default with sampling of 100 | Placement decisions per second (one goroutine, policy only); packing efficiency (requested over capacity of the binding resource on nodes that hold at least one sandbox); share of fleet CPU on empty nodes; nodes used, next to a lower bound |
 | Local failure-domain test | `make bench-grouploss` (`scripts/group-loss.sh`) | [Section 8.7](#87-the-local-failure-domain-test) | Detection time, time to recover, requests lost, without and with client retries |
 
-`make bench` runs them all in order and stops at the first failure; each benchmark that needs a cluster starts from a fresh one. `make hardware` records the machine. The density step sizes, worker counts and durations above are the commands' defaults.
+`make bench` first records the machine, as `make hardware` does, then runs them all in order and stops at the first failure; each benchmark that needs a cluster starts from a fresh one. The density step sizes, worker counts and durations above are the commands' defaults.
 
 *Hardware class.* One laptop: an Apple M3 Pro (arm64), with one Lima VM (Apple Virtualization.framework, Ubuntu 24.04 arm64, 4 vCPU, 6 GiB). gVisor is `runsc` release-20261102.0 on the systrap platform; Go 1.27.4.
 
@@ -745,7 +745,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 ### Network
 
-- Allowlisted hostnames are pinned at create time; IPv4 and TCP only; no DNS (D12).
+- Allowlisted hostnames are pinned at create time; IPv4 and TCP only; no DNS (D12); at most 64 allowlist entries.
 - A drop policy on another forward-hook chain, such as the one Docker sets, drops all sandbox egress. The agent only warns about it at start; a chain added later, or one whose rules drop the traffic, is not seen.
 - Egress sandboxes never come from the warm pool (D16).
 - The veth name carries 16 bits of the node prefix; a collision between two nodes is detected and refuses the second node, so it fails closed.
@@ -763,11 +763,11 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 - One process, no high availability, and it is in the data path of every Exec (D8, D18).
 - A restart loses requests in flight and the tombstones of recently destroyed IDs; an adopted sandbox's spec shows the TTL that was left at adoption.
-- Tombstones last 10 minutes, but a TTL can be 60. A node cut off for more than 10 minutes after the scheduler destroyed one of its sandboxes (directly, or after moving it elsewhere) still holds the old copy; when it heals and reports it, the scheduler no longer knows the ID, adopts the copy as `READY`, and keeps it until the TTL the node reports. Until then it holds room on the node, and an Exec by that ID would run in the stale copy. Tombstones as long as the maximum TTL would close this.
 - One failure threshold (D19); a node that was only briefly unreachable loses its sandboxes (section 8.3).
 - `DestroySandbox` skips the direct node call for a `LOST` sandbox; in a narrow window that can skip one destroy that the next heartbeat then performs.
 - The placement record keeps nodes considered, nodes feasible and the top three; per-filter rejection counts appear only when no node fits, so `gssctl explain` cannot say why other nodes were filtered out of a successful placement.
 - Health counts only node Create results.
+- Tombstones are kept for 60 min 10 s, so the table holds every sandbox destroyed in that time (they are not listed, but `GetSandbox` returns them).
 - When a node reports a sandbox at a different incarnation from the scheduler's, that report keeps the scheduler's copy from counting as missing; once the node has destroyed the stale copy the count starts, so detection is delayed, not lost. Allocation releases are clamped at zero, which would hide a double release.
 
 ### Observability and tooling
@@ -776,7 +776,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 - The gauge panels sum by node; after an agent restart the old and new series can both count for a few minutes. `max by (node)` would fix it.
 - A placement that fails with an empty rejection map is labelled `no_nodes`.
 - The observability container publishes its OTLP ports on every interface of the VM.
-- `schedsim`'s table has no column for the fill level reached; it is in the JSON only. The throughput rows print 0 when a run had no successful cycle (a true zero, but easy to misread).
+- `schedsim`'s table has no column for the fill level reached; it is in the JSON only. The throughput rows print 0.0 when a run had no successful cycle (a true zero, but easy to misread).
 - `bundle.Spec` does not validate its input; only `bundle.Write` does.
 
 ### Tests that are thin
@@ -788,7 +788,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 ### What to do next
 
-1. Start the VM, run `make test-integration`, `make demo`, `make bench` and `make results`, and check the dashboard. Commit `results/*.json` and the rendered `docs/results.md`.
+1. Start the VM, run `make test-integration`, `make demo`, `make bench` (which runs `make hardware` first) and `make results`, and check the dashboard. Commit `results/*.json`, including `results/hardware.json`, and the rendered `docs/results.md`.
 2. Push the repository and let both CI jobs run; record which ones passed in the README.
 3. Re-read D21 (weights) and D16 (pool size) against the measured start latencies.
 4. mTLS between the scheduler and the nodes, with node certificates; then authentication for clients.

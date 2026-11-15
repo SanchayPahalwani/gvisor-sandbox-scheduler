@@ -15,7 +15,7 @@ func TestParseFlagsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := options{
-		nodeID: "n-1", group: "default", listen: ":7101",
+		nodeID: "n-1", group: "default", listen: "127.0.0.1:7101",
 		cpuMillis: 4000, memoryBytes: 2048 << 20, maxSandboxes: 16, warmPoolSize: 2,
 		rootfs: "/var/lib/gss/rootfs/python", stateDir: "/var/lib/gss/nodes/n-1",
 		runscRoot: "/run/gss/n-1", checkpointDir: "/var/lib/gss/checkpoints",

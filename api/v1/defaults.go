@@ -20,7 +20,10 @@ const (
 	MaxMemoryBytes     int64 = 1 << 40
 
 	DefaultTTL = 10 * time.Minute
+	MinTTL     = 10 * time.Second // what a client may ask for; see ValidateNodeSpec
 	MaxTTL     = 60 * time.Minute
+
+	MaxEgressAllow = 64 // entries in egress_allow
 )
 
 // ApplyDefaults fills zero-valued fields of s in place.
@@ -42,10 +45,18 @@ func ApplyDefaults(s *SandboxSpec) {
 	}
 }
 
-// ValidateSpec checks s against the limits above. Call ApplyDefaults first;
-// a zero cpu_millis or memory_bytes is an error here, while a nil or zero ttl
-// is accepted (ApplyDefaults sets it). A nil spec is an error.
-func ValidateSpec(s *SandboxSpec) error {
+// ValidateSpec checks a client's s against the limits above. Call
+// ApplyDefaults first; a zero cpu_millis or memory_bytes is an error here,
+// while a nil or zero ttl is accepted (ApplyDefaults sets it). A nil spec is
+// an error.
+func ValidateSpec(s *SandboxSpec) error { return validate(s, MinTTL) }
+
+// ValidateNodeSpec is ValidateSpec for the spec of a node's Create, whose
+// ttl is what is left of the sandbox's: it may be below MinTTL, after a
+// reschedule or even just after a client's create of exactly MinTTL.
+func ValidateNodeSpec(s *SandboxSpec) error { return validate(s, 0) }
+
+func validate(s *SandboxSpec, minTTL time.Duration) error {
 	if s == nil {
 		return fmt.Errorf("spec is required")
 	}
@@ -71,9 +82,15 @@ func ValidateSpec(s *SandboxSpec) error {
 		if ttl < 0 {
 			return fmt.Errorf("ttl %v is negative", ttl)
 		}
+		if ttl > 0 && ttl < minTTL {
+			return fmt.Errorf("ttl %v is below the minimum %v", ttl, minTTL)
+		}
 		if ttl > MaxTTL {
 			return fmt.Errorf("ttl %v exceeds the maximum %v", ttl, MaxTTL)
 		}
+	}
+	if n := len(s.EgressAllow); n > MaxEgressAllow {
+		return fmt.Errorf("egress_allow has %d entries; the maximum is %d", n, MaxEgressAllow)
 	}
 	for _, e := range s.EgressAllow {
 		if err := validateEgress(e); err != nil {

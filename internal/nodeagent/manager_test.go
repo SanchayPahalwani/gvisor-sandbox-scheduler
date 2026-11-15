@@ -328,6 +328,8 @@ func TestCreateInvalid(t *testing.T) {
 	}
 	// The longest valid ID works.
 	e.mustCreate(t, strings.Repeat("a", 40), 1, nil)
+	// A TTL below gssv1.MinTTL is what is left of a rescheduled sandbox's: accepted.
+	e.mustCreate(t, "sb-2", 2, &gssv1.SandboxSpec{Ttl: durationpb.New(5 * time.Second)})
 }
 
 func TestRunscIDPrefixFree(t *testing.T) {

@@ -32,13 +32,19 @@ const (
 	staleWarmPause   = 500 * time.Millisecond
 )
 
+// maxMsgSize bounds a gRPC message each way, as in gssctl: the scheduler sends
+// up to nodeagent.MaxMessageBytes (20 MiB), more than grpc-go's 4 MiB default.
+const maxMsgSize = 20 << 20
+
 // helloCode is the program every start measurement runs.
 const helloCode = `print("hello")`
 
-// dial connects to the scheduler with the otelgrpc client handler: with
-// telemetry on, each call is the root span of its trace (spec 9).
+// dial connects to the scheduler with the otelgrpc client handler (with
+// telemetry on, each call is the root span of its trace, spec 9) and
+// gssctl's message limits.
 func dial(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxMsgSize), grpc.MaxCallRecvMsgSize(maxMsgSize)),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 }
 

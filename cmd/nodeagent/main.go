@@ -125,7 +125,7 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	var egress string
 	fs.StringVar(&o.nodeID, "node-id", "", "node ID (required): 1 to 32 characters of [A-Za-z0-9-], starting with a letter or digit")
 	fs.StringVar(&o.group, "group", "default", "node group label")
-	fs.StringVar(&o.listen, "listen", ":7101", "gRPC listen address")
+	fs.StringVar(&o.listen, "listen", "127.0.0.1:7101", "gRPC listen address")
 	fs.StringVar(&o.advertise, "advertise", "", "address the scheduler reaches this node at (default 127.0.0.1:<listen port>)")
 	fs.StringVar(&o.scheduler, "scheduler", "", "scheduler address to register with (default: none, the node runs standalone)")
 	fs.Int64Var(&o.cpuMillis, "cpu-millis", 4000, "declared CPU capacity in millicores")

@@ -227,7 +227,7 @@ func (m *Manager) Create(ctx context.Context, req *gssv1.NodeCreateRequest) (res
 		spec = proto.Clone(req.GetSpec()).(*gssv1.SandboxSpec)
 	}
 	gssv1.ApplyDefaults(spec)
-	if err := gssv1.ValidateSpec(spec); err != nil {
+	if err := gssv1.ValidateNodeSpec(spec); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	egress := len(spec.GetEgressAllow()) > 0

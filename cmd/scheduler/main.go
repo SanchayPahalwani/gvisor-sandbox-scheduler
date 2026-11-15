@@ -69,7 +69,7 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	fs.SetOutput(out)
 	o := &options{}
 	d := sched.DefaultWeights
-	fs.StringVar(&o.listen, "listen", ":7000", "gRPC listen address")
+	fs.StringVar(&o.listen, "listen", "127.0.0.1:7000", "gRPC listen address")
 	fs.DurationVar(&o.nodeTimeout, "node-timeout", 3*time.Second, "a node without a heartbeat for this long is dead (spec D19)")
 	fs.DurationVar(&o.heartbeatInterval, "heartbeat-interval", time.Second, "heartbeat interval told to nodes at registration")
 	fs.Float64Var(&o.weights.BinPack, "w-binpack", d.BinPack, "weight of the BinPack score (binpack policy)")

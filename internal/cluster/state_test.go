@@ -233,6 +233,45 @@ func TestCommitWarmLowersWarmCount(t *testing.T) {
 	}
 }
 
+// TestDestroyUpTo: a destroy that names an incarnation leaves a sandbox at a
+// higher one alone; the same or a higher incarnation, or 0, destroys it.
+func TestDestroyUpTo(t *testing.T) {
+	s, _ := newState()
+	s.Register(nodeInfo("n1", "a", 4000))
+	s.Add("sb-1", spec())
+	inc, _, err := s.Reserve("sb-1", "n1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Unreserve("sb-1", inc, "node create failed") // the incarnation stays at 1
+	place2 := func() {
+		inc, _, err := s.Reserve("sb-1", "n1", nil)
+		if err != nil || !s.Commit("sb-1", inc, gssv1.StartMode_START_MODE_COLD, time.Second) {
+			t.Fatalf("second placement: %d, %v", inc, err)
+		}
+	}
+	place2()
+	if nodeID, existed := s.DestroyUpTo("sb-1", 1); existed || nodeID != "" {
+		t.Errorf("DestroyUpTo(1) of incarnation 2 = %q, %v; want nothing done", nodeID, existed)
+	}
+	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_READY || sb.Incarnation != 2 {
+		t.Fatalf("after DestroyUpTo(1): %v at %d, want READY at 2", sb.State, sb.Incarnation)
+	}
+	if nodeID, existed := s.DestroyUpTo("sb-1", 2); !existed || nodeID != "n1" {
+		t.Errorf("DestroyUpTo(2) = %q, %v; want n1, true", nodeID, existed)
+	}
+	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+		t.Errorf("after DestroyUpTo(2): %v, want DESTROYED", sb.State)
+	}
+	if n := node(t, s, "n1"); n.Sandboxes != 0 || n.Allocated.CpuMillis != 0 {
+		t.Errorf("node after the destroy: %v", n)
+	}
+	place(t, s, "sb-2", "n1", spec())
+	if _, existed := s.DestroyUpTo("sb-2", 7); !existed {
+		t.Error("DestroyUpTo(7) of incarnation 1: want it destroyed")
+	}
+}
+
 func TestDestroyFreesOnce(t *testing.T) {
 	s, _ := newState()
 	s.Register(nodeInfo("n1", "a", 4000))

@@ -23,16 +23,19 @@ import (
 // Config holds the failure-detection and health parameters.
 type Config struct {
 	NodeTimeout   time.Duration // a READY node silent for longer than this is DEAD
-	TombstoneTTL  time.Duration // how long a destroyed ID is remembered
+	TombstoneTTL  time.Duration // how long a destroyed or failed ID is remembered
 	MissedReports int           // consecutive heartbeats a READY sandbox may be absent from
 	HealthAlpha   float64       // EWMA weight of the newest Create result
 }
 
-// DefaultConfig returns the values from the spec.
+// DefaultConfig returns the values from the spec. Tombstones last the
+// longest TTL plus the node reaper's 10 s grace, as long as a copy of a
+// destroyed sandbox can live on a node cut off from the scheduler, so a
+// report of that copy is answered with a destroy instead of being adopted.
 func DefaultConfig() Config {
 	return Config{
 		NodeTimeout:   3 * time.Second,
-		TombstoneTTL:  10 * time.Minute,
+		TombstoneTTL:  gssv1.MaxTTL + 10*time.Second,
 		MissedReports: 2,
 		HealthAlpha:   0.2,
 	}
@@ -418,11 +421,17 @@ func (s *State) Fail(id, msg string) bool {
 // Destroy moves a sandbox to DESTROYED and tombstones it. nodeID is where it
 // was placed, if anywhere; existed is false if it was unknown or already
 // destroyed.
-func (s *State) Destroy(id string) (nodeID string, existed bool) {
+func (s *State) Destroy(id string) (nodeID string, existed bool) { return s.DestroyUpTo(id, 0) }
+
+// DestroyUpTo is Destroy for incarnation and older ones (0: any), the rule
+// of DestroySandboxRequest.incarnation and of the node agent's Destroy: a
+// sandbox at a higher incarnation is left alone, and existed is false.
+func (s *State) DestroyUpTo(id string, incarnation int32) (nodeID string, existed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.sandboxes[id]
-	if e == nil || e.sb.State == gssv1.SandboxState_SANDBOX_STATE_DESTROYED {
+	if e == nil || e.sb.State == gssv1.SandboxState_SANDBOX_STATE_DESTROYED ||
+		(incarnation != 0 && e.sb.Incarnation > incarnation) {
 		return "", false
 	}
 	nodeID = e.sb.NodeId

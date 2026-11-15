@@ -47,7 +47,7 @@ Primed set (the node agent's default, `bundle.DefaultPrime`): json,re,math,rando
 | --- | --- |
 | Workers | 8 |
 | Duration | 1m0s |
-| Sandboxes per second | 31 |
+| Sandboxes per second | 7.8 |
 | Share started warm | 0.912 |
 | Share started by restore | 0.088 |
 | Share started cold | 0.000 |
@@ -62,7 +62,7 @@ Primed set (the node agent's default, `bundle.DefaultPrime`): json,re,math,rando
 
 ## Sandboxes per node
 
-Highest step with no failure and a restore-start p95 within 2x the first step's (260 ms): 200 live sandboxes. What stopped the ramp: step 4 (300 live) stopped the ramp: 2 restore starts failed.
+Highest step up to which no step had a failure and the restore-start p95 stayed within 2x the first step's (260 ms): 200 live sandboxes. What stopped the ramp: step 4 (300 live) stopped the ramp: 2 restore starts failed.
 
 | Step | Live | Start p50 (ms) | Start p95 (ms) | Exec p50 (ms) | Exec p95 (ms) | Failed | Lost | Unconfirmed | Node MemAvailable (MiB) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

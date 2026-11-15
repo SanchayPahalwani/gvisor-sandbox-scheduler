@@ -24,7 +24,7 @@ func TestParseFlagsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := options{
-		listen: ":7000", nodeTimeout: 3 * time.Second, heartbeatInterval: time.Second,
+		listen: "127.0.0.1:7000", nodeTimeout: 3 * time.Second, heartbeatInterval: time.Second,
 		weights:    sched.Weights{BinPack: 1, WarmPool: 1, GroupAffinity: 0.5, NodeHealth: 1},
 		sampleSize: 0, rescheduleConcurrency: 8, policy: "binpack",
 	}

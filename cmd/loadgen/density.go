@@ -230,7 +230,7 @@ func runDensity(ctx context.Context, c gssv1.SandboxServiceClient, cfg densityCo
 		"lost counts kept sandboxes that GetSandbox, after the step's measurements, did not show READY at the incarnation they were created at; a restarted sandbox answers Execs again, so Exec success alone would hide it",
 		"unconfirmed counts kept sandboxes whose GetSandbox call failed after the step's measurements, so their state is not known",
 		"failed counts failed creates, restore starts and Execs at that step, and each lost or unconfirmed sandbox",
-		"max_live_within_2x is the largest live count of a step with no failures and start_p95_ms <= 2 x baseline_start_p95_ms (the first step's)",
+		"max_live_within_2x is the live count of the last step before the first one with a failure or with start_p95_ms > 2 x baseline_start_p95_ms (the first step's)",
 		"node_mem_available_mib is MemAvailable from /proc/meminfo on the machine loadgen runs on (the VM that runs the node), read after the step's sandboxes were created",
 	}
 	r.Notes = append(r.Notes, verdictNotes...)
@@ -263,9 +263,10 @@ func (s densityStep) row() map[string]any {
 	return row
 }
 
-// densityVerdict returns the first step's start p95 (the baseline), the largest live
-// count of a step with no failures and start p95 within 2x of it, and notes on how
-// the verdict came out.
+// densityVerdict returns the first step's start p95 (the baseline); the live count of
+// the last step before the first one with a failure, no restore start, or a start p95
+// above 2x the baseline (the latency must have stayed within 2x, spec section 10); and
+// notes on how the verdict came out.
 func densityVerdict(steps []densityStep) (baseline float64, maxLive int, notes []string) {
 	if len(steps) == 0 {
 		return 0, 0, nil
@@ -278,19 +279,21 @@ func densityVerdict(steps []densityStep) (baseline float64, maxLive int, notes [
 	if first.failed > 0 {
 		return baseline, 0, []string{fmt.Sprintf("the first step had %d failures; its restore starts give the baseline, but no step qualifies, so max_live_within_2x is 0", first.failed)}
 	}
-	var over []int
 	for _, s := range steps {
-		if s.failed > 0 || s.start.Count == 0 {
-			continue
+		var why string
+		switch {
+		case s.failed > 0:
+			why = fmt.Sprintf("step %d had failures (%d)", s.step, s.failed)
+		case s.start.Count == 0:
+			why = fmt.Sprintf("step %d had no successful restore start", s.step)
+		case s.start.P95 > 2*baseline:
+			why = fmt.Sprintf("start_p95_ms was above 2 x baseline at step %d", s.step)
 		}
-		if s.start.P95 > 2*baseline {
-			over = append(over, s.step)
-			continue
+		if why != "" {
+			notes = append(notes, why+"; max_live_within_2x counts only the steps before it")
+			break
 		}
-		maxLive = max(maxLive, s.live)
-	}
-	if len(over) > 0 {
-		notes = append(notes, fmt.Sprintf("start_p95_ms was above 2 x baseline at steps %v", over))
+		maxLive = s.live
 	}
 	return baseline, maxLive, notes
 }

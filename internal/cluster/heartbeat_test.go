@@ -193,24 +193,31 @@ func TestDeadNodeReturns(t *testing.T) {
 	}
 }
 
+// TestTombstoneExpiry: a destroyed ID is remembered for the longest TTL plus
+// the node reaper's 10 s, as long as a copy can live on a node, so a node
+// cut off for that long is still told to destroy its copy when it heals; a
+// report after that is adopted.
 func TestTombstoneExpiry(t *testing.T) {
+	if got, want := DefaultConfig().TombstoneTTL, gssv1.MaxTTL+10*time.Second; got != want {
+		t.Fatalf("TombstoneTTL = %v, want %v", got, want)
+	}
 	s, c := newState()
 	s.Register(nodeInfo("n1", "a", 4000))
 	place(t, s, "sb-1", "n1", spec())
 	s.Destroy("sb-1")
-	c.advance(9 * time.Minute)
+	c.advance(gssv1.MaxTTL + 10*time.Second)
 	s.Tick()
 	if r := s.Heartbeat(report("n1", reported("sb-1", 1))); !reflect.DeepEqual(r.Destroy, []string{"sb-1"}) {
-		t.Fatalf("at +9m: Destroy = %v", r.Destroy)
+		t.Fatalf("at +60m10s: Destroy = %v", r.Destroy)
 	}
-	c.advance(time.Minute + time.Second)
+	c.advance(time.Second)
 	s.Tick()
 	if _, ok := s.Get("sb-1"); ok {
 		t.Fatal("destroyed sandbox still in table after tombstone expiry")
 	}
 	r := s.Heartbeat(report("n1", reported("sb-1", 1)))
 	if len(r.Destroy) != 0 {
-		t.Fatalf("after 10m: Destroy = %v", r.Destroy)
+		t.Fatalf("after 60m11s: Destroy = %v", r.Destroy)
 	}
 	if sb := get(t, s, "sb-1"); sb.State != gssv1.SandboxState_SANDBOX_STATE_READY {
 		t.Fatalf("not adopted: %v", sb)

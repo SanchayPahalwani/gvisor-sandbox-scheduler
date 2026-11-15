@@ -23,7 +23,7 @@
 #   GSS_NODE_MAX    most sandboxes per node (default 16)
 #   GSS_POOL        warm sandboxes per node (default 2)
 #   GSS_SCHED_ARGS  extra scheduler flags, split on spaces, e.g. "--policy spread" (spec D35);
-#                   the scheduler keeps its default --listen :7000, where the nodes and
+#                   the scheduler keeps its default --listen 127.0.0.1:7000, where the nodes and
 #                   gssctl reach it
 #   OTEL_EXPORTER_OTLP_ENDPOINT  passed to every unit when set (spec section 9)
 #

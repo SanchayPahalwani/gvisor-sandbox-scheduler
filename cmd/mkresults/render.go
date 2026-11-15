@@ -129,8 +129,8 @@ func Load(dir string) (*Inputs, error) {
 	return &in, nil
 }
 
-// Number formats: milliseconds one decimal under 100 and none above, rates none,
-// fractions three decimals.
+// Number formats: milliseconds one decimal under 100 and none above, rates one
+// decimal under 10 and none above, fractions three decimals.
 
 func fmtMS(v float64) string {
 	if v < 99.95 {
@@ -139,7 +139,13 @@ func fmtMS(v float64) string {
 	return fmt.Sprintf("%.0f", v)
 }
 
-func fmtRate(v float64) string { return fmt.Sprintf("%.0f", v) }
+func fmtRate(v float64) string {
+	if v < 9.95 {
+		return fmt.Sprintf("%.1f", v)
+	}
+	return fmt.Sprintf("%.0f", v)
+}
+
 func fmtFrac(v float64) string { return fmt.Sprintf("%.3f", v) }
 func fmtInt(v float64) string  { return fmt.Sprintf("%.0f", v) }
 
@@ -461,7 +467,7 @@ func renderDensity(in *Inputs) string {
 	var b strings.Builder
 	base, haveBase := r.Scalars["baseline_start_p95_ms"]
 	if haveBase && base > 0 {
-		fmt.Fprintf(&b, "Highest step with no failure and a restore-start p95 within 2x the first step's (%s ms): %s live sandboxes.", fmtMS(base), scalar(r, "max_live_within_2x", fmtInt))
+		fmt.Fprintf(&b, "Highest step up to which no step had a failure and the restore-start p95 stayed within 2x the first step's (%s ms): %s live sandboxes.", fmtMS(base), scalar(r, "max_live_within_2x", fmtInt))
 	} else {
 		b.WriteString("No baseline: the first step had no successful restore start, so no step counts as within 2x.")
 	}
@@ -635,7 +641,7 @@ func Summary(in *Inputs) string {
 	add("Throughput (create, Exec, destroy)", v, "throughput.json")
 	v = notRun
 	if r := in.Density; r != nil {
-		v = scalar(r, "max_live_within_2x", fmtInt) + " live sandboxes with restore-start p95 within 2x of the first step"
+		v = scalar(r, "max_live_within_2x", fmtInt) + " live sandboxes, with restore-start p95 staying within 2x of the first step's"
 	}
 	add("Sandboxes per node", v, "density.json")
 	v = notRun

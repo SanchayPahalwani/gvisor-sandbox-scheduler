@@ -428,7 +428,11 @@ func (c *e2eCluster) mustPrint4(id string) {
 	}
 }
 
-// containersOf lists the runsc containers of sandbox id under the node's root.
+// containersOf lists the runsc containers of sandbox id under the node's
+// root: those whose runsc ID starts with "<id>_", which is the ID of a cold
+// or restore start. A sandbox claimed from the warm pool keeps its pool ID
+// ("warm_..."), so a test that checks for leftovers with this creates its
+// sandbox with coldSpec.
 func (c *e2eCluster) containersOf(nodeID, id string) []string {
 	c.t.Helper()
 	rt := runsc.NewCLI(c.runsc, "/run/gss/"+nodeID)
@@ -448,6 +452,12 @@ func (c *e2eCluster) containersOf(nodeID, id string) []string {
 	return out
 }
 
+// coldSpec forces the cold path, so that the sandbox's runsc IDs are
+// "<id>_<incarnation>_" and containersOf finds them.
+func coldSpec() *gssv1.SandboxSpec {
+	return &gssv1.SandboxSpec{StartMode: gssv1.StartMode_START_MODE_COLD}
+}
+
 // writeCgroupKill writes 1 to dir/cgroup.kill: every process in the
 // cgroup's subtree is killed.
 func writeCgroupKill(dir string) error {
@@ -463,12 +473,18 @@ func writeCgroupKill(dir string) error {
 }
 
 // TestE2ECreateExecDestroy: through SandboxService, a sandbox is created,
-// runs code and is destroyed; both nodes are listed READY.
+// runs code and is destroyed; both nodes are listed READY. It starts cold:
+// the leftover check finds containers by the sandbox's own runsc ID, which a
+// warm claim would not use.
 func TestE2ECreateExecDestroy(t *testing.T) {
 	c := newE2E(t)
-	sb := c.create(nil)
-	if sb.GetIncarnation() != 1 || sb.GetNodeId() == "" || len(sb.GetPlacement().GetTop()) == 0 {
-		t.Errorf("sandbox = %v, want incarnation 1 on a node, with a placement", sb)
+	sb := c.create(coldSpec())
+	if sb.GetIncarnation() != 1 || sb.GetNodeId() == "" || len(sb.GetPlacement().GetTop()) == 0 ||
+		sb.GetStartedAs() != gssv1.StartMode_START_MODE_COLD {
+		t.Errorf("sandbox = %v, want incarnation 1 on a node, with a placement, started cold", sb)
+	}
+	if left := c.containersOf(sb.GetNodeId(), sb.GetId()); len(left) != 1 {
+		t.Errorf("runsc containers of %s before the destroy: %q, want one", sb.GetId(), left)
 	}
 	c.mustPrint4(sb.GetId())
 	c.destroy(sb.GetId())
@@ -532,10 +548,14 @@ func TestE2ENodeLoss(t *testing.T) {
 
 // TestE2EAgentRestart: an agent holding a sandbox is killed and started
 // again with the same node ID once the sandbox has moved: it is READY and
-// empty, and runsc has nothing of the sandbox under its root.
+// empty, and runsc has nothing of the sandbox under its root. The sandbox
+// starts cold, so that the leftover check by its runsc ID means something.
 func TestE2EAgentRestart(t *testing.T) {
 	c := newE2E(t)
-	sb := c.create(nil)
+	sb := c.create(coldSpec())
+	if left := c.containersOf(sb.GetNodeId(), sb.GetId()); len(left) != 1 {
+		t.Fatalf("runsc containers of %s before the kill: %q, want one", sb.GetId(), left)
+	}
 	holder, other := "a", "b"
 	if sb.GetNodeId() == c.ids["b"] {
 		holder, other = "b", "a"
