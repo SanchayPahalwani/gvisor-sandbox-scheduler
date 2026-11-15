@@ -44,6 +44,11 @@ jobs:
           /usr/local/bin/runsc --version
       - run: make build
       - run: CONTAINER_CLI=docker make rootfs
+      # Docker on the runner sets the iptables FORWARD policy to DROP. nftables forwards
+      # a packet only if every base chain on the forward hook accepts it, so that policy
+      # would drop all sandbox egress and fail the egress tests.
+      - name: Accept forwarded traffic
+        run: sudo iptables -P FORWARD ACCEPT
       # The target runs go under sudo with PATH, GOCACHE and GOMODCACHE passed through
       # env, so the Go from setup-go is found and root gets its own caches.
       - run: make test-integration

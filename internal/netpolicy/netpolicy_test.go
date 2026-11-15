@@ -1,9 +1,12 @@
 package netpolicy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"reflect"
@@ -53,6 +56,7 @@ func newTestManager(t *testing.T, cidr string, r *recorder) *Manager {
 		t.Fatal(err)
 	}
 	m.SetResolver(fakeResolver)
+	m.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	return m
 }
 
@@ -313,11 +317,12 @@ func TestInitAndClose(t *testing.T) {
 		"ip link del gf55f0123abcd",
 		"sysctl -w net.ipv4.ip_forward=1",
 		"nft -f -",
+		"nft -j list chains",
 	}
 	if !reflect.DeepEqual(r.cmds, want) {
 		t.Fatalf("Init commands:\n%s\nwant:\n%s", strings.Join(r.cmds, "\n"), strings.Join(want, "\n"))
 	}
-	if r.stdin[len(r.stdin)-1] != renderInit(m.names, m.cidr) {
+	if r.stdin[len(r.stdin)-2] != renderInit(m.names, m.cidr) {
 		t.Error("Init nft script differs from renderInit")
 	}
 
@@ -331,6 +336,67 @@ func TestInitAndClose(t *testing.T) {
 	}
 	if !reflect.DeepEqual(r.cmds[:last], want[1:6]) {
 		t.Errorf("Close cleanup commands %v, want %v", r.cmds[:last], want[1:6])
+	}
+}
+
+// TestInitWarnsAboutDropForward: nftables forwards a packet only if every
+// base chain on the forward hook accepts it, so Init warns about each IPv4
+// forward-hook base chain outside this node's table whose policy is drop
+// (Docker sets the iptables FORWARD policy to DROP). It still succeeds.
+func TestInitWarnsAboutDropForward(t *testing.T) {
+	chains := `{"nftables": [{"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
+	{"chain": {"family": "ip", "table": "filter", "name": "FORWARD", "handle": 2, "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}},
+	{"chain": {"family": "ip", "table": "filter", "name": "DOCKER-USER", "handle": 9}},
+	{"chain": {"family": "ip", "table": "filter", "name": "INPUT", "handle": 1, "type": "filter", "hook": "input", "prio": 0, "policy": "drop"}},
+	{"chain": {"family": "ip6", "table": "filter", "name": "FORWARD", "handle": 2, "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}},
+	{"chain": {"family": "inet", "table": "fw", "name": "fwd", "handle": 3, "type": "filter", "hook": "forward", "prio": 0, "policy": "accept"}},
+	{"chain": {"family": "inet", "table": "gss_a1", "name": "forward", "handle": 4, "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}},
+	{"chain": {"family": "inet", "table": "other", "name": "fwd", "handle": 5, "type": "filter", "hook": "forward", "prio": 10, "policy": "drop"}}]}`
+	for _, tc := range []struct {
+		name  string
+		out   string
+		fail  bool
+		warns []string // substrings, one WARN line each
+	}{
+		{"drop chains", chains, false, []string{`chain="ip filter FORWARD"`, `chain="inet other fwd"`}},
+		{"none", `{"nftables": [{"metainfo": {"version": "1.0.9"}}]}`, false, nil},
+		{"listing fails", "", true, []string{"cannot check the other forward-hook chains"}},
+		{"not JSON", "table ip filter {", false, []string{"cannot check the other forward-hook chains"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{out: map[string]string{"nft -j list chains": tc.out}}
+			if tc.fail {
+				r.fail = func(cmd string) error {
+					if cmd == "nft -j list chains" {
+						return errors.New("nft: boom")
+					}
+					return nil
+				}
+			}
+			m := newTestManager(t, "10.200.0.0/20", r)
+			var buf bytes.Buffer
+			m.log = slog.New(slog.NewTextHandler(&buf, nil))
+			if err := m.Init(context.Background()); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			var lines []string
+			for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				if l != "" {
+					lines = append(lines, l)
+				}
+			}
+			if len(lines) != len(tc.warns) {
+				t.Fatalf("log:\n%s\nwant %d WARN lines", buf.String(), len(tc.warns))
+			}
+			for i, w := range tc.warns {
+				if !strings.Contains(lines[i], "level=WARN") || !strings.Contains(lines[i], w) {
+					t.Errorf("log line %q: want a WARN with %q", lines[i], w)
+				}
+				if tc.out == chains && !strings.Contains(lines[i], "sandbox egress will be dropped") {
+					t.Errorf("log line %q does not say egress will be dropped", lines[i])
+				}
+			}
+		})
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -189,6 +190,35 @@ func parseComment(listing string) (nodeID string, cidr netip.Prefix, ok bool) {
 		return "", netip.Prefix{}, false
 	}
 	return m[1], p, true
+}
+
+// nftChain is a chain in `nft -j list chains` output. A base chain has a hook
+// and a policy; a regular chain has neither.
+type nftChain struct {
+	Family string `json:"family"`
+	Table  string `json:"table"`
+	Name   string `json:"name"`
+	Hook   string `json:"hook"`
+	Policy string `json:"policy"`
+}
+
+// parseChains reads the chains from `nft -j list chains` output.
+func parseChains(out string) ([]nftChain, error) {
+	var doc struct {
+		Nftables []struct {
+			Chain *nftChain `json:"chain"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		return nil, fmt.Errorf("parse nft -j list chains: %w", err)
+	}
+	var chains []nftChain
+	for _, o := range doc.Nftables {
+		if o.Chain != nil {
+			chains = append(chains, *o.Chain)
+		}
+	}
+	return chains, nil
 }
 
 // renderInit is the nft script that replaces this node's table with an empty one.

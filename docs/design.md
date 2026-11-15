@@ -313,6 +313,7 @@ How it works ([internal/netpolicy](../internal/netpolicy/rules.go)):
 - Forward chain, in order: drop traffic from one sandbox veth to another; accept established and related traffic only if the pair (interface, connection mark) is in the set of live pairs, checked in both directions; drop anything else going into a sandbox veth; for new traffic from a sandbox veth, jump to that sandbox's chain, which accepts TCP to each allowed prefix and port and sets the connection mark to the sandbox's generation number; drop the rest.
 - Input chain: drop everything from sandbox veths, so a sandbox cannot reach the node agent, the scheduler or anything else listening on the node.
 - Postrouting: masquerade the node's range on the way out.
+- Other tables: nftables forwards a packet only if every base chain on the forward hook accepts it, so a chain elsewhere whose policy is drop also drops sandbox egress. Docker sets the iptables `FORWARD` policy to drop, which is such a chain. The node agent does not change other tables; when it starts it lists the forward-hook chains and logs a warning naming each one whose policy is drop.
 
 Two details came out of review:
 
@@ -745,6 +746,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 ### Network
 
 - Allowlisted hostnames are pinned at create time; IPv4 and TCP only; no DNS (D12).
+- A drop policy on another forward-hook chain, such as the one Docker sets, drops all sandbox egress. The agent only warns about it at start; a chain added later, or one whose rules drop the traffic, is not seen.
 - Egress sandboxes never come from the warm pool (D16).
 - The veth name carries 16 bits of the node prefix; a collision between two nodes is detected and refuses the second node, so it fails closed.
 - The rule that drops traffic between two sandbox veths is covered by the text of the generated rules and a counter, not by a live test with crafted packets; the source-address check is tested with an ordinary connect from a second address.

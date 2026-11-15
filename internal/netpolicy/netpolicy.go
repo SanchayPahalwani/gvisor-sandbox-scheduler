@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os/exec"
@@ -47,6 +48,7 @@ type Manager struct {
 	cidr  netip.Prefix
 	slots int // number of /30s in cidr
 	run   Runner
+	log   *slog.Logger
 
 	// life is held shared by Setup and Teardown for their whole run and
 	// exclusively by Init and Close, so those never interleave with a
@@ -87,6 +89,7 @@ func New(nodeID string, cidr netip.Prefix, run Runner) (*Manager, error) {
 		cidr:    cidr.Masked(),
 		slots:   1 << bits,
 		run:     run,
+		log:     slog.Default(),
 		resolve: defaultResolve,
 		gen:     binary.BigEndian.Uint32(b[:]),
 		used:    map[int]string{},
@@ -108,8 +111,10 @@ func (m *Manager) SetResolver(resolve func(ctx context.Context, host string) ([]
 // Init removes this node's leftovers, enables net.ipv4.ip_forward and creates
 // the table. It refuses, changing nothing, when a table with this node's name
 // belongs to another node, another node's table covers an overlapping range,
-// or another node's veths share this node's prefix. It waits for in-flight
-// Setup and Teardown calls to finish (that wait does not observe ctx).
+// or another node's veths share this node's prefix. It warns about other
+// forward-hook chains that would drop sandbox egress (warnDropForward). It
+// waits for in-flight Setup and Teardown calls to finish (that wait does not
+// observe ctx).
 func (m *Manager) Init(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
@@ -132,7 +137,36 @@ func (m *Manager) Init(ctx context.Context) error {
 	m.mu.Lock()
 	m.inited = true
 	m.mu.Unlock()
+	m.warnDropForward(ctx)
 	return nil
+}
+
+// warnDropForward logs a warning for every IPv4 base chain on the forward
+// hook, outside this node's table, whose policy is drop. nftables forwards a
+// packet only if every base chain on the hook accepts it, so such a chain
+// drops sandbox egress unless one of its rules accepts that traffic. Docker
+// sets the iptables FORWARD policy to DROP, and with the nftables backend of
+// iptables that is the chain "ip filter FORWARD". A listing that fails is
+// logged too; neither fails Init.
+func (m *Manager) warnDropForward(ctx context.Context) {
+	out, err := m.run(ctx, "", "nft", "-j", "list", "chains")
+	var chains []nftChain
+	if err == nil {
+		chains, err = parseChains(out)
+	}
+	if err != nil {
+		m.log.Warn("netpolicy: cannot check the other forward-hook chains for a drop policy", "node", m.names.nodeID, "err", err)
+		return
+	}
+	for _, c := range chains {
+		if c.Hook != "forward" || c.Policy != "drop" || (c.Family != "ip" && c.Family != "inet") ||
+			(c.Family == "inet" && c.Table == m.names.table) {
+			continue
+		}
+		m.log.Warn("netpolicy: a forward-hook chain drops by default; sandbox egress will be dropped unless a rule there accepts it "+
+			"(for Docker's: sudo iptables -P FORWARD ACCEPT)",
+			"node", m.names.nodeID, "chain", c.Family+" "+c.Table+" "+c.Name, "egress_cidr", m.cidr.String())
+	}
 }
 
 // checkOtherNodes reads the owner comment of every inet gss_* table.

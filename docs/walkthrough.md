@@ -84,7 +84,7 @@ The sandbox just claimed was made earlier by the refill loop, [`fillOne`](../int
 
 [`startSandbox`](../internal/nodeagent/sandbox.go#L119) does, in order:
 
-1. Network setup, only for egress (not here): a namespace, a veth pair and an nftables chain from [`netpolicy.Setup`](../internal/netpolicy/netpolicy.go#L344) (D12).
+1. Network setup, only for egress (not here): a namespace, a veth pair and an nftables chain from [`netpolicy.Setup`](../internal/netpolicy/netpolicy.go#L378) (D12).
 2. [`bundle.Write`](../internal/bundle/bundle.go#L143): a directory under `<state-dir>/bundles/<runsc-id>/` with a `hosts` file and a `config.json` built by [`bundle.Spec`](../internal/bundle/bundle.go#L49). Read that function once: the read-only root (D10), tmpfs at `/work` and `/tmp`, uid 1000 with no capabilities, `RLIMIT_NOFILE` 1024, the cgroup path `/gss/<node>/<runsc-id>`, the CPU quota of `cpu_millis * 100` per 100000, and the memory limit. The process section is the same for every sandbox, because `runsc restore` refuses one whose arguments differ from the checkpoint's.
 3. `runsc create`, then `runsc start` (cold) or `runsc restore` (restore), stop 8.
 4. The readiness probe, stop 8.

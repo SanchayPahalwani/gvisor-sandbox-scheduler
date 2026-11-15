@@ -37,7 +37,7 @@ make vm      # create and start the Lima VM "gss" from lima/gss.yaml
 make demo    # build, build the sandbox rootfs, start a local cluster, run two examples
 ```
 
-`make demo` also starts the VM if it is not running; `make vm` on its own creates or starts the VM and runs nothing in it. On macOS every target that needs Linux re-runs itself inside the VM with `limactl shell`; on a Linux machine the same targets run directly (they need root through `sudo`, `runsc`, Go, nftables and iproute2, and `CONTAINER_CLI=docker` if you build the rootfs with Docker instead of nerdctl).
+`make demo` also starts the VM if it is not running; `make vm` on its own creates or starts the VM and runs nothing in it. On macOS every target that needs Linux re-runs itself inside the VM with `limactl shell`; on a Linux machine the same targets run directly (they need root through `sudo`, `runsc`, Go, nftables and iproute2, and `CONTAINER_CLI=docker` if you build the rootfs with Docker instead of nerdctl). On a Linux host that runs Docker, Docker sets the iptables `FORWARD` policy to drop, which also drops all sandbox egress (nftables forwards a packet only if every forward chain accepts it): run `sudo iptables -P FORWARD ACCEPT` first; the node agent logs a warning naming any such chain.
 
 After the demo:
 
