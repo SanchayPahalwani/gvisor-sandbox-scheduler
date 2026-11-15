@@ -14,3 +14,36 @@ jobs:
       - run: make lint
       - run: make test
       - run: go build ./...
+      - name: Scheduler simulation smoke
+        run: go run ./cmd/schedsim --nodes 200 --churn 2000 --out /tmp/sim.json
+  # This job has not run on a hosted runner yet: the repository has not been pushed.
+  # The gVisor systrap platform needs no KVM, so a plain hosted runner is enough.
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: integration-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables iproute2 jq python3
+      # Same release and checksum check as lima/gss.yaml.
+      - name: Install runsc
+        run: |
+          set -eux -o pipefail
+          GVISOR_RELEASE=20261102
+          URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/$(uname -m)"
+          cd "$(mktemp -d)"
+          wget -q "${URL}/gvisor.tar.zstd" "${URL}/gvisor.tar.zstd.sha512"
+          sha512sum -c gvisor.tar.zstd.sha512
+          sudo tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+          /usr/local/bin/runsc --version
+      - run: make build
+      - run: CONTAINER_CLI=docker make rootfs
+      # The target runs go under sudo with PATH, GOCACHE and GOMODCACHE passed through
+      # env, so the Go from setup-go is found and root gets its own caches.
+      - run: make test-integration
