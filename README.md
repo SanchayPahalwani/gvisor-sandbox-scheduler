@@ -49,7 +49,7 @@ make vm-stop  # stop the VM
 
 Rebuild the sandbox image only with the cluster down: after a change to `images/python` or `cmd/pyfork`, run `make down` before `make rootfs` or `make demo`. The build refuses to replace the tree while the cluster runs (`FORCE=1` overrides) and does nothing when the image is unchanged, so `make demo` still runs against a running cluster.
 
-Other targets: `make test` (unit tests, any OS), `make lint`, `make test-integration` (Linux, root, `runsc`; from macOS it runs in the VM), `make sim`, `make bench`, `make hardware`, `make results`, `make obs-up` and `make obs-down` (the `grafana/otel-lgtm` container: a development image, not a monitoring setup to keep), `make proto`, `make vm-delete`.
+Other targets: `make test` (unit tests, any OS; runs with the race detector when cgo is available, and without it, with a note, on a machine that has no C compiler), `make lint`, `make test-integration` (Linux, root, `runsc`; from macOS it runs in the VM), `make sim`, `make bench`, `make hardware`, `make results`, `make obs-up` and `make obs-down` (the `grafana/otel-lgtm` container: a development image, not a monitoring setup to keep), `make proto`, `make vm-delete`.
 
 ### What gets installed
 

@@ -141,8 +141,14 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 		api/v1/sandbox.proto
 
+# -race needs cgo; a Linux machine without a C compiler has cgo off, so skip it there.
 test:
-	go test -race ./...
+	@if [ "$$(go env CGO_ENABLED)" = "1" ]; then \
+		go test -race ./...; \
+	else \
+		echo "race detector skipped: cgo is off (no C compiler)"; \
+		go test ./...; \
+	fi
 
 lint:
 	@out="$$(gofmt -l $$(git ls-files '*.go'))"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
