@@ -526,7 +526,7 @@ func renderGroupLoss(in *Inputs) string {
 	}
 	switch policy {
 	case "spread":
-		b.WriteString("The scheduler ran with the spread policy (spec D35): under the default bin-packing policy all the sessions fit on the first node, so losing a group would affect none of them.\n\n")
+		b.WriteString("The scheduler ran with the spread policy (spec D35): under the default bin-packing policy the sessions fill group a's nodes first, so losing group b would affect few or none of them.\n\n")
 	case "":
 		b.WriteString("The run did not record the scheduler's placement policy; spec D35 requires the spread policy for this test.\n\n")
 	default:
