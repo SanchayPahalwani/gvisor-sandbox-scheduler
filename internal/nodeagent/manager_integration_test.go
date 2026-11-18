@@ -586,6 +586,11 @@ func TestRealWarmClaim(t *testing.T) {
 	if got := n.readCgroup(t, rid, "memory.max"); got != "536870912" {
 		t.Errorf("memory.max = %q, want 536870912", got)
 	}
+	// The claim rewrites only cpu.max and memory.max; swap stays off as the
+	// pool sandbox's bundle set it.
+	if got := n.readCgroup(t, rid, "memory.swap.max"); got != "0" {
+		t.Errorf("memory.swap.max = %q, want 0", got)
+	}
 	r := runExec(ctx, m, pyReq("sb-1", `import sys; print("pandas" in sys.modules)`), nil)
 	if exit := r.ok(t, "python in the claimed sandbox"); exit.GetCode() != 0 || r.stdout.String() != "True\n" {
 		t.Errorf("exit %v, stdout %q, stderr %q; want 0 and \"True\\n\"", exit, r.stdout.String(), r.stderr.String())

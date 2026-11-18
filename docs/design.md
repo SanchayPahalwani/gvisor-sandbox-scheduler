@@ -254,7 +254,7 @@ The agent reads the child's stdout and stderr and sends them as `ExecEvent`s of 
 
 ### 4.7 Limits and what happens over the memory limit
 
-`runsc` creates the sandbox's cgroup v2 from the bundle: `cpu.max` and `memory.max`. The sentry, its helper processes and the workload's memory are all charged to that one cgroup, and the host kernel's OOM killer picks the victim inside it.
+`runsc` creates the sandbox's cgroup v2 from the bundle: `cpu.max` and `memory.max`. Every sandbox runs with swap off (`memory.swap.max` 0, because the bundle's OCI `swap` equals its memory limit), so a host that has swap cannot let a sandbox go past its memory limit; this was found on a CI runner that has swap, where a 192 MiB sandbox held 1 GiB. The sentry, its helper processes and the workload's memory are all charged to that one cgroup, and the host kernel's OOM killer picks the victim inside it.
 
 **D30. The CPU limit is checked from the host's cgroup, not from inside the sandbox.**
 

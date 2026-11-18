@@ -50,6 +50,11 @@ func Spec(o Options) *specs.Spec {
 	quota := o.CPUMillis * 100
 	period := cpuPeriod
 	limit := o.MemoryBytes
+	// OCI swap is memory plus swap, so swap equal to the limit means no swap:
+	// runsc then sets the cgroup's memory.swap.max to 0. Left unset,
+	// memory.swap.max stays max, and on a host with swap a sandbox that
+	// reaches its limit spills into swap instead of being OOM-killed.
+	swap := limit
 	return &specs.Spec{
 		Version:  "1.0.2",
 		Root:     &specs.Root{Path: o.RootFS, Readonly: true},
@@ -84,7 +89,7 @@ func Spec(o Options) *specs.Spec {
 			CgroupsPath: CgroupPath(o.NodeID, o.ID),
 			Resources: &specs.LinuxResources{
 				CPU:    &specs.LinuxCPU{Quota: &quota, Period: &period},
-				Memory: &specs.LinuxMemory{Limit: &limit},
+				Memory: &specs.LinuxMemory{Limit: &limit, Swap: &swap},
 			},
 			Namespaces: []specs.LinuxNamespace{
 				{Type: specs.PIDNamespace},

@@ -49,8 +49,13 @@ func TestSpecLimits(t *testing.T) {
 		if cpu.Quota == nil || *cpu.Quota != c.quota || cpu.Period == nil || *cpu.Period != 100000 {
 			t.Errorf("%dm: cpu = %+v, want quota %d period 100000", c.millis, cpu, c.quota)
 		}
-		if m := s.Linux.Resources.Memory; m.Limit == nil || *m.Limit != o.MemoryBytes {
+		m := s.Linux.Resources.Memory
+		if m.Limit == nil || *m.Limit != o.MemoryBytes {
 			t.Errorf("memory = %+v, want limit %d", m, o.MemoryBytes)
+		}
+		// Swap equal to the limit: memory plus swap is the limit, so no swap.
+		if m.Swap == nil || m.Limit == nil || *m.Swap != *m.Limit {
+			t.Errorf("memory = %+v, want swap equal to the limit", m)
 		}
 	}
 }

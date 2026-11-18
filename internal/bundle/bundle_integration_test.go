@@ -145,7 +145,9 @@ func TestBundleInSandbox(t *testing.T) {
 		t.Errorf("probe output:\n%s\nwant:\n%s\nstderr: %s", stdout.String(), want, stderr.String())
 	}
 
-	for file, want := range map[string]string{"cpu.max": "50000 100000", "memory.max": "268435456"} {
+	// memory.swap.max 0: on a host with swap the sandbox still cannot go
+	// past memory.max.
+	for file, want := range map[string]string{"cpu.max": "50000 100000", "memory.max": "268435456", "memory.swap.max": "0"} {
 		raw, err := os.ReadFile(filepath.Join(cg, file))
 		if err != nil {
 			t.Errorf("%s: %v", file, err)

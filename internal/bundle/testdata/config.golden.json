@@ -91,7 +91,8 @@
   "linux": {
     "resources": {
       "memory": {
-        "limit": 268435456
+        "limit": 268435456,
+        "swap": 268435456
       },
       "cpu": {
         "quota": 50000,
