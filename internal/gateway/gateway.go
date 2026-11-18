@@ -1,7 +1,7 @@
-// Package gateway is the scheduler's gRPC face (spec 4 and 8): SandboxService
+// Package gateway is the scheduler's gRPC face: SandboxService
 // for clients and ClusterService for node agents. It places sandboxes with
 // sched, records them in cluster, starts them on node agents, proxies Exec
-// (spec D8) and restarts the sandboxes of dead nodes elsewhere (spec 8.4).
+// (D8) and restarts the sandboxes of dead nodes elsewhere.
 package gateway
 
 import (
@@ -39,7 +39,7 @@ import (
 // DefaultConfig's.
 type Config struct {
 	MaxAttempts           int           // node Create calls per placement before giving up
-	RescheduleConcurrency int           // reschedules in flight at once (spec 8.4)
+	RescheduleConcurrency int           // reschedules in flight at once
 	ExecWaitCap           time.Duration // longest an Exec waits for its sandbox to be READY
 	TickInterval          time.Duration // failure detection and TTL expiry period
 	RetryInterval         time.Duration // how often sandboxes without a node are placed again
@@ -218,8 +218,8 @@ func (s *Server) CreateSandbox(ctx context.Context, req *gssv1.CreateSandboxRequ
 	return s.placeAndStart(ctx, id, true)
 }
 
-// placeAndStart places sandbox id and starts it on the chosen node (spec
-// 8.3, binding), trying up to MaxAttempts nodes. fresh marks a client's
+// placeAndStart places sandbox id and starts it on the chosen node
+// (scoring, then binding), trying up to MaxAttempts nodes. fresh marks a client's
 // create: a sandbox that cannot be started is then FAILED, and the error is
 // the RPC's. For a reschedule the state is left for the retry loop. The
 // caller holds id in s.busy. Every error is a gRPC status: Aborted when the
@@ -463,7 +463,7 @@ type watchCause struct{ err error }
 func (w watchCause) Error() string { return w.err.Error() }
 
 // Exec waits for the sandbox to be READY (DeadlineExceeded after
-// ExecWaitCap) and proxies the node's Exec stream (spec D8, D34): events as
+// ExecWaitCap) and proxies the node's Exec stream (D8, D34): events as
 // they come; the node's status if the stream ends with one; Unavailable if
 // the sandbox is lost, destroyed or expires while the Exec runs. No exit
 // event is ever made up, and nothing follows one that was sent.
@@ -498,7 +498,7 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 	}
 	if err == io.EOF || exited {
 		// The result is in: however the stream ended after the exit event,
-		// nothing follows it (spec D34).
+		// nothing follows it (D34).
 		return nil
 	}
 	st := status.Convert(err)
@@ -522,7 +522,7 @@ func (s *Server) Exec(req *gssv1.ExecRequest, stream grpc.ServerStreamingServer[
 // notOnNode is how an Exec ends when the node answered NotFound for sb,
 // which the state had READY there when the Exec began. If the state has it
 // destroyed or no longer knows it, its destroy started before the Exec
-// reached the node: NotFound (spec D34). Otherwise it was lost.
+// reached the node: NotFound (D34). Otherwise it was lost.
 func (s *Server) notOnNode(sb *gssv1.Sandbox, st *status.Status) error {
 	id := sb.GetId()
 	cur, ok := s.state.Get(id)
@@ -565,7 +565,7 @@ func (s *Server) waitReady(ctx context.Context, id string) (*gssv1.Sandbox, erro
 }
 
 // watch ends an Exec's node stream once the state no longer has sb READY
-// on its node at its incarnation (spec D37): grpc-go will not ping a
+// on its node at its incarnation (D37): grpc-go will not ping a
 // connection more often than every 10 s, so an Exec to a node that vanished
 // without closing its connection would otherwise hang that long; with
 // this, the node timeout bounds it. The Exec ends with watchEnd's
@@ -590,7 +590,7 @@ func (s *Server) watch(ctx context.Context, cancel context.CancelCauseFunc, sb *
 // watchEnd is the status an Exec on was ends with, given the state's
 // current copy cur (ok false: gone), or nil while was is still current.
 // The Exec was running, so whatever the state says, the status is
-// Unavailable (spec D34) and the message carries the state's reason.
+// Unavailable (D34) and the message carries the state's reason.
 func watchEnd(was, cur *gssv1.Sandbox, ok bool) error {
 	id, lost := was.GetId(), lostMsg(was)
 	switch {
@@ -697,8 +697,8 @@ func (s *Server) Register(ctx context.Context, req *gssv1.RegisterRequest) (*gss
 	return &gssv1.RegisterResponse{HeartbeatInterval: durationpb.New(s.cfg.HeartbeatInterval)}, nil
 }
 
-// Heartbeat reconciles a node's report (spec 8.5). An unknown node gets
-// NotFound and registers again (spec D18). Sandboxes missing from the
+// Heartbeat reconciles a node's report. An unknown node gets
+// NotFound and registers again (D18). Sandboxes missing from the
 // node's reports go to the rescheduler.
 func (s *Server) Heartbeat(ctx context.Context, req *gssv1.HeartbeatRequest) (*gssv1.HeartbeatResponse, error) {
 	r := s.state.Heartbeat(req)

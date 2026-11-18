@@ -16,7 +16,7 @@ type HeartbeatResult struct {
 	Lost    []string // sandboxes that vanished from this node's reports
 }
 
-// Heartbeat reconciles a node's report with the sandbox table (spec 8.5).
+// Heartbeat reconciles a node's report with the sandbox table.
 func (s *State) Heartbeat(req *gssv1.HeartbeatRequest) HeartbeatResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,7 +124,7 @@ func (s *State) readopt(e *sandboxEntry, ns *gssv1.NodeSandbox, nodeID string, n
 // READY on this node at the reported incarnation. Otherwise the node must
 // destroy its copy: the sandbox is on another node, at another incarnation,
 // or LOST, PENDING, FAILED or DESTROYED. A LOST sandbox is never restored
-// here; it is rescheduled as a fresh incarnation (spec D19, D23), and
+// here; it is rescheduled as a fresh incarnation (D19, D23), and
 // destroying the old copy frees the node for it. Call with s.mu held.
 func (s *State) reportedHere(e *sandboxEntry, nodeID string, incarnation int32) bool {
 	if e.sb.NodeId != nodeID || e.sb.Incarnation != incarnation {

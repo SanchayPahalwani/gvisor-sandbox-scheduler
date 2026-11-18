@@ -7,8 +7,8 @@ PKG ?= ./...
 RUN ?= .
 # Variables forwarded into the VM invocation. Append new ones here. The GSS_* ones are
 # the cluster topology read by scripts/cluster.sh (an empty one means its default);
-# OTEL_EXPORTER_OTLP_ENDPOINT turns on OTLP export in the units it starts (spec 9),
-# and the benchmark targets refuse to run with it set (spec D25).
+# OTEL_EXPORTER_OTLP_ENDPOINT turns on OTLP export in the units it starts,
+# and the benchmark targets refuse to run with it set (D25).
 FORWARD_VARS := PKG RUN FORCE GSS_NODES GSS_NODE_CPU GSS_NODE_MEM GSS_NODE_MAX GSS_POOL GSS_SCHED_ARGS OTEL_EXPORTER_OTLP_ENDPOINT
 FORWARD := $(foreach v,$(FORWARD_VARS),$(v)='$(value $(v))')
 
@@ -85,14 +85,14 @@ demo: build rootfs
 
 # Benchmarks. Each one starts from a fresh cluster so runs do not
 # share state, and refuses to run with OTLP export on or the gss-obs observability
-# container running (spec call D25). start and throughput use the default four nodes;
+# container running (D25). start and throughput use the default four nodes;
 # density uses one large node with no warm pool.
 BENCH_NO_OTEL = if [ -n "$${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then \
-	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (spec call D25): unset it" >&2; exit 1; fi; \
+	echo "OTEL_EXPORTER_OTLP_ENDPOINT is set; benchmarks run with observability off (D25): unset it" >&2; exit 1; fi; \
 	if command -v nerdctl >/dev/null 2>&1 && nerdctl ps --format '{{.Names}}' 2>/dev/null | grep -qx gss-obs; then \
-	echo "the gss-obs observability container is running; benchmarks run with observability off (spec call D25): make obs-down" >&2; exit 1; fi
+	echo "the gss-obs observability container is running; benchmarks run with observability off (D25): make obs-down" >&2; exit 1; fi
 # GSS_SCHED_ARGS is cleared too: these benchmarks use the default placement policy
-# (only the group-loss test runs spread, spec D35).
+# (only the group-loss test runs spread, D35).
 DEFAULT_TOPOLOGY := env -u GSS_NODES -u GSS_NODE_CPU -u GSS_NODE_MEM -u GSS_NODE_MAX -u GSS_POOL -u GSS_SCHED_ARGS
 DENSITY_TOPOLOGY := env -u GSS_SCHED_ARGS GSS_NODES="a1:a:7101" GSS_NODE_CPU=64000 GSS_NODE_MEM=65536 GSS_NODE_MAX=200 GSS_POOL=0
 
@@ -122,7 +122,7 @@ bench-density: build
 bench:
 	scripts/bench-all.sh
 
-# Local failure-domain test (spec 8.6); the script brings its own clusters up and down.
+# Local failure-domain test; the script brings its own clusters up and down.
 bench-grouploss: build
 	@$(BENCH_NO_OTEL)
 	scripts/group-loss.sh
@@ -164,11 +164,11 @@ sim:
 hardware:
 	scripts/hardware.sh
 
-# Renders docs/results.md and the README table from results/*.json (spec call D26).
+# Renders docs/results.md and the README table from results/*.json (D26).
 results:
 	go run ./cmd/mkresults --results results --out docs/results.md --readme README.md
 
-# Observability container (spec call D24): grafana/otel-lgtm as the rootless nerdctl
+# Observability container (D24): grafana/otel-lgtm as the rootless nerdctl
 # container gss-obs in the VM, Grafana on port 3300 with deploy/grafana/dashboard.json.
 # Not Linux targets: on macOS scripts/obs.sh runs itself in the VM.
 .PHONY: obs-up obs-down

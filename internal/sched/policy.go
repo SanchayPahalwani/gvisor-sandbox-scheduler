@@ -159,7 +159,7 @@ func baseFilters() []FilterPlugin {
 // Weights are the DefaultPolicy scorer weights.
 type Weights struct{ BinPack, WarmPool, GroupAffinity, NodeHealth float64 }
 
-// DefaultWeights follows spec 8.3.
+// DefaultWeights are the scorer weights DefaultPolicy uses.
 var DefaultWeights = Weights{1, 1, 0.5, 1}
 
 // DefaultPolicy packs, prefers warm sandboxes, group affinity and healthy

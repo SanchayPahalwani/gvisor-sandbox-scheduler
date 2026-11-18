@@ -4,7 +4,7 @@
 //
 // run and exec exit with the program's exit code. gssctl's own failures exit
 // 1, among them an Exec that ended without the program's exit being seen
-// (spec D34: the stream ended with a gRPC status, which is printed); a bad
+// (D34: the stream ended with a gRPC status, which is printed); a bad
 // command line exits 2.
 package main
 
@@ -101,7 +101,7 @@ const (
 // stdout or stderr fails with EPIPE instead of killing the process; that write
 // error ends the run. It does not end the context: once SIGPIPE is caught, a write
 // to a broken gRPC connection raises it too, and that failure is the RPC's status
-// to report (spec D34), not an interruption.
+// to report (D34), not an interruption.
 var signals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE}
 
 func main() { os.Exit(gssctl(os.Args[1:])) }

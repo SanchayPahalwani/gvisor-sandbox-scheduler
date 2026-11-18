@@ -532,11 +532,11 @@ func renderGroupLoss(in *Inputs) string {
 	}
 	switch policy {
 	case "spread":
-		b.WriteString("The scheduler ran with the spread policy (spec D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.\n\n")
+		b.WriteString("The scheduler ran with the spread policy (D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.\n\n")
 	case "":
-		b.WriteString("The run did not record the scheduler's placement policy; spec D35 requires the spread policy for this test.\n\n")
+		b.WriteString("The run did not record the scheduler's placement policy; D35 requires the spread policy for this test.\n\n")
 	default:
-		fmt.Fprintf(&b, "The run recorded placement policy %q; spec D35 requires the spread policy for this test.\n\n", policy)
+		fmt.Fprintf(&b, "The run recorded placement policy %q; D35 requires the spread policy for this test.\n\n", policy)
 	}
 	type row struct {
 		label string
@@ -641,9 +641,9 @@ func renderCaveats(in *Inputs) string {
 		"Nodes are processes in one VM and share " + vcpus + ", so they compete for CPU with each other and with the load generator.",
 		"Node capacities are declared with flags, not measured.",
 		"gVisor runs on the systrap platform only; no other platform was tried.",
-		"Sandbox sizes are listed under each table; the smallest allowed size is 192 MiB (spec D31).",
+		"Sandbox sizes are listed under each table; the smallest allowed size is 192 MiB (D31).",
 		primedSentence(in.Start) + " The start-latency figures say nothing about other Python code or other packages.",
-		"Observability was off during the runs (spec D25): no OTLP export and no observability container.",
+		"Observability was off during the runs (D25): no OTLP export and no observability container.",
 		"A single run each. There are no repeats and no confidence intervals, so small differences between rows are not evidence.",
 	}
 	if densitySentence != "" {

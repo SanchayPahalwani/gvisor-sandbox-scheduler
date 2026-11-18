@@ -201,7 +201,7 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Create starts a sandbox and returns when it is ready, on the path
-// chooseMode picks (spec 7.3). The warm path claims a pool sandbox; when
+// chooseMode picks. The warm path claims a pool sandbox; when
 // the pool has emptied by then or the claim fails, AUTO takes the restore
 // or cold path instead, and a forced WARM fails. When a restore fails in
 // its own steps, in AUTO mode the restore is undone and the cold path runs
@@ -301,7 +301,7 @@ func (m *Manager) recordStart(ctx context.Context, mode gssv1.StartMode, latency
 		telemetry.KeyMode.String(modeName(mode)), telemetry.KeyNode.String(m.cfg.NodeID)))
 }
 
-// chooseMode is the whole start-path policy (spec 7.3). AUTO takes the warm
+// chooseMode is the whole start-path policy. AUTO takes the warm
 // pool for a no-network sandbox when it has a ready sandbox, else restores
 // when there is a checkpoint image, else starts cold. A forced mode that
 // cannot be served fails with FailedPrecondition rather than measuring a
@@ -665,7 +665,7 @@ func (m *Manager) loop(every time.Duration, fn func()) {
 
 // reapExpired destroys ready sandboxes whose ttl + TTLGrace has passed. The
 // scheduler expires sandboxes at their TTL; this is the backstop for a node
-// that lost contact with it (spec 6.6).
+// that lost contact with it.
 func (m *Manager) reapExpired() {
 	now := m.now()
 	m.mu.Lock()

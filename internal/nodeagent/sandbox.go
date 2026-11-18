@@ -110,7 +110,7 @@ const readyProbe = `{"code_len":4,"timeout_s":0,"env":{}}` + "\n" + "pass"
 // own stdout and stderr (the zygote's, not an Exec's).
 const containerLog = "container.log"
 
-// startSandbox runs a start path up to readiness (spec 7.3): network,
+// startSandbox runs a start path up to readiness: network,
 // bundle, runsc create, then runsc start (the cold path, imageDir "") or
 // runsc restore from the checkpoint image in imageDir, then the readiness
 // probe, bounded by ReadyTimeout (and after a restore also by
@@ -158,7 +158,7 @@ func (m *Manager) startSandbox(ctx context.Context, e *sandbox, imageDir string)
 	return "", nil
 }
 
-// waitReady runs the readiness probe (spec 6.3): a no-op python_code Exec,
+// waitReady runs the readiness probe: a no-op python_code Exec,
 // bounded by timeout. pyfork retries its connection to the zygote, so on a
 // cold start this one call returns when the interpreter is ready; a restored
 // zygote is already listening.

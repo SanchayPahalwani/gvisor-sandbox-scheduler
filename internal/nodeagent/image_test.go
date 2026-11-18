@@ -416,7 +416,7 @@ func TestEnsureImageRemovesStaleBuilds(t *testing.T) {
 }
 
 // An image is valid only for the rootfs that made it: without a build ID
-// there is none (spec D36).
+// there is none (D36).
 func TestImageNeedsRootfsID(t *testing.T) {
 	for name, content := range map[string]*string{"missing": nil, "empty": new(string)} {
 		ck := t.TempDir()

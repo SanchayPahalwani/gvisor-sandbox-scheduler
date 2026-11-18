@@ -529,7 +529,7 @@ func TestExecDuringDestroy(t *testing.T) {
 	}
 }
 
-// An Exec that arrives once a destroy has started gets NotFound (spec D34).
+// An Exec that arrives once a destroy has started gets NotFound (D34).
 func TestExecWhileDestroying(t *testing.T) {
 	e := readyEnv(t, nil)
 	e.rt.Delay["Delete"] = 300 * time.Millisecond

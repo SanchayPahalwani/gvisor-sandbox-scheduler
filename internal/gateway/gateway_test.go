@@ -1048,7 +1048,7 @@ func TestGRPCNodes(t *testing.T) {
 }
 
 // TestExecExitThenLost: once the exit event is through, a loss seen before
-// the stream's end does not add an error after it (spec D34).
+// the stream's end does not add an error after it (D34).
 func TestExecExitThenLost(t *testing.T) {
 	e := newEnv(t, nil).run()
 	e.register("n1")
@@ -1074,7 +1074,7 @@ func TestExecExitThenLost(t *testing.T) {
 
 // TestExecEndsWhenSandboxDestroyed: a destroy or a TTL expiry ends a
 // proxied Exec that is already running with Unavailable and the state's
-// reason (spec D34), even if the node's stream does not end.
+// reason (D34), even if the node's stream does not end.
 func TestExecEndsWhenSandboxDestroyed(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1116,7 +1116,7 @@ func TestExecEndsWhenSandboxDestroyed(t *testing.T) {
 }
 
 // TestWatchEnd covers every way the state can end a proxied Exec that is
-// running: always Unavailable, with the state's reason (spec D34).
+// running: always Unavailable, with the state's reason (D34).
 func TestWatchEnd(t *testing.T) {
 	was := &gssv1.Sandbox{Id: "sb-1", NodeId: "n1", Incarnation: 1, State: gssv1.SandboxState_SANDBOX_STATE_READY}
 	with := func(f func(*gssv1.Sandbox)) *gssv1.Sandbox {
@@ -1334,7 +1334,7 @@ func waitState(st *cluster.State, id string, want gssv1.SandboxState) bool {
 }
 
 // TestExecNothingAfterExit: once the exit event was sent, however the node
-// stream ends, the Exec ends cleanly (spec D34: nothing follows the exit).
+// stream ends, the Exec ends cleanly (D34: nothing follows the exit).
 func TestExecNothingAfterExit(t *testing.T) {
 	e := newEnv(t, nil)
 	e.register("n1")
@@ -1357,7 +1357,7 @@ func TestExecNothingAfterExit(t *testing.T) {
 // TestExecNodeNotFound: a node that does not know the sandbox never ran
 // the Exec, which ends as the scheduler's state says: lost while the state
 // still has it here, lost when the state marked it LOST, NotFound when it
-// was destroyed (its destroy started before the Exec reached the node, spec
+// was destroyed (its destroy started before the Exec reached the node,
 // D34), even if the watcher saw the destroy first.
 func TestExecNodeNotFound(t *testing.T) {
 	e := newEnv(t, nil)

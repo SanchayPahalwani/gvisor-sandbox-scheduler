@@ -40,7 +40,7 @@ const maxMsgSize = 20 << 20
 const helloCode = `print("hello")`
 
 // dial connects to the scheduler with the otelgrpc client handler (with
-// telemetry on, each call is the root span of its trace, spec 9) and
+// telemetry on, each call is the root span of its trace) and
 // gssctl's message limits.
 func dial(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -96,7 +96,7 @@ func listNodes(ctx context.Context, c gssv1.SandboxServiceClient) ([]*gssv1.Node
 }
 
 // execCode runs python code in sandbox id and returns when its exit event arrives.
-// Per spec D34 a stream that ends with a gRPC status, or without an exit event, did
+// Per D34 a stream that ends with a gRPC status, or without an exit event, did
 // not see the program exit: that is an error, returned with its status code. A
 // non-zero exit, a timeout or an OOM kill is an error too, since every program the
 // load generator runs prints one line and exits 0.

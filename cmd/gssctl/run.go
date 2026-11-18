@@ -15,7 +15,7 @@ import (
 var errOutput = errors.New("cannot write the program's output")
 
 // execStream runs req, copying the program's output to stdout and stderr as it
-// arrives, and returns its exit status and when it arrived. Per spec D34 a stream
+// arrives, and returns its exit status and when it arrived. Per D34 a stream
 // that ends without an exit event did not see the program exit: that is an error,
 // the stream's status if it ended with one. A failed write of the output ends the
 // stream with an error that wraps errOutput.

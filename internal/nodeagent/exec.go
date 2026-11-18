@@ -67,8 +67,8 @@ type execRun struct {
 	destroyed bool               // guarded by Manager.mu: a destroy of the sandbox ended the Exec
 }
 
-// Exec runs a command in a ready sandbox and streams its output to send
-// (spec 6.2). send is never called concurrently; each event carries at most
+// Exec runs a command in a ready sandbox and streams its output to send.
+// send is never called concurrently; each event carries at most
 // MaxChunk bytes, and the bytes of each stream keep their order. When Exec
 // returns nil, the last event sent was the one exit event. When it returns an
 // error, no exit event was sent and the error is the outcome: NotFound,
@@ -405,7 +405,7 @@ func (m *Manager) exitStatus(ctx context.Context, e *sandbox, p *execPlan, out e
 		return &gssv1.ExitStatus{Code: exitKilled, TimedOut: true}, nil
 	case out.err != nil:
 		// The sandbox may have died under the Exec. When the error says so,
-		// or the OOM killer struck (it can pick the sentry, spec 6.4), keep
+		// or the OOM killer struck (it can pick the sentry), keep
 		// checking for a moment: right after the sentry is killed, runsc
 		// state can still say running (seen in TestRealExecMemoryLimit).
 		notRunning := errors.Is(out.err, runsc.ErrNotRunning)

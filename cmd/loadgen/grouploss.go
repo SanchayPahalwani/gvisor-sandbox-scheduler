@@ -66,7 +66,7 @@ func groupLossCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs.StringVar(&cfg.KillCmd, "kill-cmd", cfg.KillCmd, "shell command that kills every node of --lose-group")
 	fs.StringVar(&cfg.LoseGroup, "lose-group", cfg.LoseGroup, "node group the kill command takes down")
 	fs.BoolVar(&cfg.Retry, "retry", cfg.Retry, fmt.Sprintf("retry a failed Exec up to %d times on Unavailable or DeadlineExceeded", groupLossRetries))
-	fs.StringVar(&cfg.SchedPolicy, "sched-policy", "", "placement policy the scheduler was started with, recorded in the results (group-loss.sh: spread, spec D35)")
+	fs.StringVar(&cfg.SchedPolicy, "sched-policy", "", "placement policy the scheduler was started with, recorded in the results (group-loss.sh: spread, D35)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -94,13 +94,13 @@ func groupLossSpec() *gssv1.SandboxSpec {
 	}
 }
 
-// policyNote says which placement policy the run used and, for spread, why (spec D35).
+// policyNote says which placement policy the run used and, for spread, why (D35).
 func policyNote(policy, loseGroup string) string {
 	switch policy {
 	case "":
 		return "the scheduler's placement policy was not recorded (--sched-policy not given)"
 	case "spread":
-		return fmt.Sprintf("the scheduler ran with --policy spread (spec D35), which splits the sessions evenly between the groups on every run: "+
+		return fmt.Sprintf("the scheduler ran with --policy spread (D35), which splits the sessions evenly between the groups on every run: "+
 			"under the default policy the split depends on warm-pool refill and heartbeat timing, so the number of sessions lost with group %s would vary from run to run", loseGroup)
 	}
 	return "the scheduler ran with --policy " + policy
@@ -151,7 +151,7 @@ func (g *groupLoss) lookupFailed(what string, err error) {
 	g.lookups.add(what, err)
 }
 
-// runGroupLoss is the local failure-domain test of spec 8.6: sessions run Execs while
+// runGroupLoss is the local failure-domain test: sessions run Execs while
 // every node of one group is killed, and the run records how long the scheduler took
 // to notice and how long until every affected session ran code again.
 func runGroupLoss(ctx context.Context, c gssv1.SandboxServiceClient, cfg groupLossConfig, log io.Writer) (*bench.Run, error) {

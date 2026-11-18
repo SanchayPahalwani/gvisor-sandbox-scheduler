@@ -27,7 +27,7 @@ import (
 
 // testBundle writes a minimal bundle into a new directory under state: the
 // output of `runsc spec -- python3 /gss/zygote.py`, patched for the shared
-// read-only rootfs (Task 4's bundle.Write does this properly).
+// read-only rootfs (bundle.Write does this properly).
 func testBundle(t *testing.T, runscBin, state, name string) string {
 	t.Helper()
 	dir := filepath.Join(state, name)

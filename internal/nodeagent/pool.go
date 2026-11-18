@@ -19,7 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// The warm pool (spec 7.1, call D16) holds WarmPoolSize ready sandboxes of
+// The warm pool (D16) holds WarmPoolSize ready sandboxes of
 // the default size with no network, started by the refill loop: restored
 // from the checkpoint image when the node has one, else cold. A claim takes
 // one, rewrites its cgroup limits to the request and puts it in the table
@@ -314,7 +314,7 @@ func (m *Manager) claim(ctx context.Context, id string, inc int32, spec *gssv1.S
 }
 
 // setClaimLimits rewrites cpu.max and memory.max of a claimed pool sandbox
-// to its request (spec 6.4), traced as pool.claim. The sentry keeps the
+// to its request, traced as pool.claim. The sentry keeps the
 // memory total it read at boot (call D16). A memory limit below what the
 // sandbox uses would make the kernel reclaim or OOM-kill in it; an idle
 // primed sandbox uses about 60 MiB and the smallest valid request is

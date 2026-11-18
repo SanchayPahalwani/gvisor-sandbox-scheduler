@@ -22,7 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The checkpoint image (spec 7.2, call D36) of a node lives in
+// The checkpoint image (D36) of a node lives in
 // CheckpointDir/<key>, which every node agent on the host shares: an image
 // is built by one agent and restored by all of them. An image is published
 // when it holds completeFile. A builder takes an exclusive flock on

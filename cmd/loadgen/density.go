@@ -20,7 +20,7 @@ import (
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/bench"
 )
 
-// Size of every density sandbox: the smallest the scheduler accepts (spec D31).
+// Size of every density sandbox: the smallest the scheduler accepts (D31).
 const (
 	densityCPUMillis = 250
 	densityMemBytes  = gssv1.MinMemoryBytes

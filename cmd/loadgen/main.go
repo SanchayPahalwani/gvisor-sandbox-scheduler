@@ -37,7 +37,7 @@ run "loadgen <subcommand> -h" for its flags
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	// Telemetry is exported only while OTEL_EXPORTER_OTLP_ENDPOINT is set;
-	// the benchmark targets refuse to run with it set (spec D25).
+	// the benchmark targets refuse to run with it set (D25).
 	shutdown, err := telemetry.Setup(ctx, "gss-loadgen")
 	if err == nil {
 		err = run(ctx, os.Args, os.Stdout, os.Stderr)

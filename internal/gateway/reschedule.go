@@ -13,7 +13,7 @@ import (
 // Run drives the cluster until ctx ends: every TickInterval it runs failure
 // detection and TTL expiry, handing lost sandboxes to the rescheduler and
 // telling nodes to destroy expired ones; every RetryInterval it hands over
-// every sandbox that still needs a node (spec 8.4). The end of ctx cancels
+// every sandbox that still needs a node. The end of ctx cancels
 // the reschedules in flight; Run returns once they and the destroys it
 // started are done. Run once per Server.
 func (s *Server) Run(ctx context.Context) {
@@ -133,7 +133,7 @@ func (s *Server) dispatchLocked() {
 }
 
 // reschedule places a LOST or PENDING sandbox again at the next
-// incarnation (spec D23: a fresh sandbox with the same ID and spec). A
+// incarnation (D23: a fresh sandbox with the same ID and spec). A
 // sandbox with no node to go to stays as it is; RetryInterval brings it
 // back.
 func (s *Server) reschedule(ctx context.Context, id string) {

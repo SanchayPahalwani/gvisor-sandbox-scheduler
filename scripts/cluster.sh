@@ -13,7 +13,7 @@
 #                               skipped, and down then fails
 #   cluster.sh status           the units and the scheduler's view of the nodes
 #   cluster.sh kill-group G     SIGKILL every node of group G (in GSS_NODES) and its sandboxes
-#   cluster.sh kill-node ID     SIGKILL node ID and its sandboxes (spec D3)
+#   cluster.sh kill-node ID     SIGKILL node ID and its sandboxes (D3)
 #
 # Environment:
 #   GSS_NODES       "id:group:port ...", default "a1:a:7101 a2:a:7102 b1:b:7103 b2:b:7104";
@@ -22,7 +22,7 @@
 #   GSS_NODE_MEM    declared memory per node in MiB (default 2048)
 #   GSS_NODE_MAX    most sandboxes per node (default 16)
 #   GSS_POOL        warm sandboxes per node (default 2)
-#   GSS_SCHED_ARGS  extra scheduler flags, split on spaces, e.g. "--policy spread" (spec D35);
+#   GSS_SCHED_ARGS  extra scheduler flags, split on spaces, e.g. "--policy spread" (D35);
 #                   the scheduler keeps its default --listen 127.0.0.1:7000, where the nodes and
 #                   gssctl reach it
 #   OTEL_EXPORTER_OTLP_ENDPOINT  passed to every unit when set
@@ -461,7 +461,7 @@ status() {
 	"$gssctl" --scheduler "$sched_addr" nodes
 }
 
-# kill_nodes ID... kills nodes as a crash would (spec D3): SIGKILL to the node agents,
+# kill_nodes ID... kills nodes as a crash would (D3): SIGKILL to the node agents,
 # all at once, then whatever is left in each agent's unit, then each node's cgroup
 # subtree, so that its sandboxes die with it.
 #

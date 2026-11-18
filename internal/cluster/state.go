@@ -1,6 +1,6 @@
 // Package cluster is the scheduler's in-memory cluster state: the node
 // registry, the sandbox table, failure detection and heartbeat
-// reconciliation (spec 8.1, 8.2, 8.4, 8.5). It does no I/O, starts no
+// reconciliation. It does no I/O, starts no
 // goroutines and reads time only from the injected clock.
 package cluster
 

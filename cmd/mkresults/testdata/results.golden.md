@@ -107,7 +107,7 @@ Notes from the run:
 
 Local failure-domain test: both node groups are processes in one VM on one laptop. It says nothing about networks, regions or providers.
 
-The scheduler ran with the spread policy (spec D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.
+The scheduler ran with the spread policy (D35), which splits the sessions evenly between the groups on every run. Under the default policy the split depends on when each node's warm pool refills and when its heartbeat refreshes the scheduler's warm count, so the number of sessions the test loses would vary from run to run.
 
 | Metric | Without retry | With retry |
 | --- | --- | --- |
@@ -137,8 +137,8 @@ The scheduler ran with the spread policy (spec D35), which splits the sessions e
 - Nodes are processes in one VM and share its 4 vCPUs, so they compete for CPU with each other and with the load generator.
 - Node capacities are declared with flags, not measured.
 - gVisor runs on the systrap platform only; no other platform was tried.
-- Sandbox sizes are listed under each table; the smallest allowed size is 192 MiB (spec D31).
+- Sandbox sizes are listed under each table; the smallest allowed size is 192 MiB (D31).
 - Primed set (the node agent's default, `bundle.DefaultPrime`): json,re,math,random,statistics,datetime,collections,itertools,functools,decimal,csv,io,numpy,pandas. The start-latency figures say nothing about other Python code or other packages.
-- Observability was off during the runs (spec D25): no OTLP export and no observability container.
+- Observability was off during the runs (D25): no OTLP export and no observability container.
 - A single run each. There are no repeats and no confidence intervals, so small differences between rows are not evidence.
 - Density p95 values come from 20 samples per step (the `per_step` parameter), so a single slow start moves them; the 2x rule is therefore strict.

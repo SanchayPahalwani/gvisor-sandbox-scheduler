@@ -221,7 +221,7 @@ type node struct {
 // run starts the node and serves until ctx ends (a signal) or the server
 // fails, then shuts the node down. stop restores the default signal
 // handling, so that a second signal ends the process. Telemetry is
-// exported while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec 9) and flushed
+// exported while OTEL_EXPORTER_OTLP_ENDPOINT is set and flushed
 // last.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 	shutdownTelemetry, err := telemetry.Setup(ctx, "gss-nodeagent",
@@ -383,7 +383,7 @@ func start(ctx context.Context, stop context.CancelFunc, o *options) (_ *node, s
 }
 
 // startHeartbeats registers the node with the scheduler at --scheduler and
-// heartbeats in the background (spec 8.2). The returned function stops the
+// heartbeats in the background. The returned function stops the
 // heartbeats and closes the connection.
 func (n *node) startHeartbeats() (stop func() error, err error) {
 	conn, err := grpc.NewClient(n.o.scheduler, nodeagent.SchedulerDialOptions()...)

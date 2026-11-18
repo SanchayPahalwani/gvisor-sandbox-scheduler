@@ -1,7 +1,7 @@
 """Builds a small DataFrame and prints a groupby result.
 
 Run it with: bin/gssctl run -f examples/pandas_demo.py
-pandas is in the primed set (spec D15): code run with -c or -f runs in a fork of an
+pandas is in the primed set (D15): code run with -c or -f runs in a fork of an
 interpreter that has imported it already, so the import below costs nothing.
 """
 

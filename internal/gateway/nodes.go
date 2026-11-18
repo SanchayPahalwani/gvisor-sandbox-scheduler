@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Keepalive on the connections to nodes (spec D37): a ping after 10 s
+// Keepalive on the connections to nodes (D37): a ping after 10 s
 // without activity, the shortest interval grpc-go allows a client, and the
 // connection closed when no answer comes within 1 s. A node that vanishes
 // without closing its connection is noticed by keepalive after about 11 s;
@@ -51,7 +51,7 @@ type grpcNodes struct {
 	conns map[string]*grpc.ClientConn
 }
 
-// NewGRPCNodes returns a NodeClient over plaintext gRPC (spec D7) with one
+// NewGRPCNodes returns a NodeClient over plaintext gRPC (D7) with one
 // cached connection per address, keepalive, a reconnect backoff of at most
 // a second, the otelgrpc client handler (spans that carry the trace to the
 // node) and nodeagent.MaxMessageBytes limits. The value also implements io.Closer,

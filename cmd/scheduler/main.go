@@ -2,7 +2,7 @@
 // with SandboxService for clients and ClusterService for node agents. It
 // places sandboxes, proxies Exec to the nodes, detects dead nodes and
 // restarts their sandboxes elsewhere. Its state is in memory and is rebuilt
-// from heartbeats after a restart (spec D18).
+// from heartbeats after a restart (D18).
 //
 // SIGINT or SIGTERM stops it: failure detection and the start of
 // reschedules first, then no new RPCs; RPCs and reschedules in flight get
@@ -70,15 +70,15 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	o := &options{}
 	d := sched.DefaultWeights
 	fs.StringVar(&o.listen, "listen", "127.0.0.1:7000", "gRPC listen address")
-	fs.DurationVar(&o.nodeTimeout, "node-timeout", 3*time.Second, "a node without a heartbeat for this long is dead (spec D19)")
+	fs.DurationVar(&o.nodeTimeout, "node-timeout", 3*time.Second, "a node without a heartbeat for this long is dead (D19)")
 	fs.DurationVar(&o.heartbeatInterval, "heartbeat-interval", time.Second, "heartbeat interval told to nodes at registration")
 	fs.Float64Var(&o.weights.BinPack, "w-binpack", d.BinPack, "weight of the BinPack score (binpack policy)")
 	fs.Float64Var(&o.weights.WarmPool, "w-warm", d.WarmPool, "weight of the WarmPool score (binpack policy)")
 	fs.Float64Var(&o.weights.GroupAffinity, "w-affinity", d.GroupAffinity, "weight of the GroupAffinity score (binpack policy)")
 	fs.Float64Var(&o.weights.NodeHealth, "w-health", d.NodeHealth, "weight of the NodeHealth score (binpack policy)")
-	fs.IntVar(&o.sampleSize, "sample-size", 0, "stop scoring after this many feasible nodes (0: score all, spec D22)")
+	fs.IntVar(&o.sampleSize, "sample-size", 0, "stop scoring after this many feasible nodes (0: score all, D22)")
 	fs.IntVar(&o.rescheduleConcurrency, "reschedule-concurrency", gateway.DefaultConfig().RescheduleConcurrency, "most reschedules in flight at once")
-	fs.StringVar(&o.policy, "policy", "binpack", "placement policy: binpack (the default policy, spec D20) or spread (least allocated; the group-loss test, spec D35)")
+	fs.StringVar(&o.policy, "policy", "binpack", "placement policy: binpack (the default policy, D20) or spread (least allocated; the group-loss test, D35)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -143,7 +143,7 @@ func newPolicy(o *options) *sched.Policy {
 
 // run serves until ctx ends (a signal) or the server fails. stop restores
 // the default signal handling, so that a second signal ends the process.
-// Telemetry is exported while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec 9)
+// Telemetry is exported while OTEL_EXPORTER_OTLP_ENDPOINT is set
 // and flushed last.
 func run(ctx context.Context, stop context.CancelFunc, o *options) error {
 	shutdownTelemetry, err := telemetry.Setup(ctx, "gss-scheduler")

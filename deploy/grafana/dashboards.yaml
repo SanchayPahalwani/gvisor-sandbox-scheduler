@@ -1,5 +1,5 @@
-# Grafana dashboard provider for the grafana/otel-lgtm container (spec call
-# D24). scripts/obs.sh mounts this file as
+# Grafana dashboard provider for the grafana/otel-lgtm container (D24).
+# scripts/obs.sh mounts this file as
 # /otel-lgtm/grafana/conf/provisioning/dashboards/gss.yaml and dashboard.json
 # into the directory below, the paths the image's README gives for custom
 # dashboards.

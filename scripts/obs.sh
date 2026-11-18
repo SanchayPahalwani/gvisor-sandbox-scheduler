@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the observability container (spec call D24): grafana/otel-lgtm, one
+# Runs the observability container (D24): grafana/otel-lgtm, one
 # development image with an OpenTelemetry collector, Tempo, a
 # Prometheus-compatible store and Grafana, as the rootless nerdctl container
 # gss-obs of the VM user. Grafana is published on port 3300 (container port
@@ -12,7 +12,7 @@
 #   scripts/obs.sh status   say whether it runs (exit 1 if not)
 #
 # On macOS it runs itself in the VM gss, which must be running (it does not
-# start the VM). Benchmarks refuse to run while the container is up (spec D25).
+# start the VM). Benchmarks refuse to run while the container is up (D25).
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

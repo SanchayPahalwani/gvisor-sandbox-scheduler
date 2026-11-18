@@ -327,7 +327,7 @@ func TestRealExecCancel(t *testing.T) {
 }
 
 func TestRealExecMemoryLimit(t *testing.T) {
-	// The smallest sandbox (spec D31): while the zygote imports numpy and
+	// The smallest sandbox (D31): while the zygote imports numpy and
 	// pandas the sandbox's memory.peak reaches about 135 MiB, so a 128 MiB
 	// sandbox is OOM-killed before it is ready. Idle after priming it uses
 	// about 60 MiB.

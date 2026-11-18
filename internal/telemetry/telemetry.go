@@ -23,7 +23,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
-// endpointEnv turns export on (spec D25: benchmarks run with it unset). The
+// endpointEnv turns export on (D25: benchmarks run with it unset). The
 // exporters read it themselves: an http:// endpoint is plaintext gRPC.
 const endpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
 

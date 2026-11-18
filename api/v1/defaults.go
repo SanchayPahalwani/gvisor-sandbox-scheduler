@@ -15,7 +15,7 @@ const (
 	DefaultCPUMillis   int64 = 500
 	DefaultMemoryBytes int64 = 256 << 20
 	MinCPUMillis       int64 = 100
-	MinMemoryBytes     int64 = 192 << 20 // spec D31: a cold start peaks at about 135 MiB
+	MinMemoryBytes     int64 = 192 << 20 // D31: a cold start peaks at about 135 MiB
 	MaxCPUMillis       int64 = 256000
 	MaxMemoryBytes     int64 = 1 << 40
 

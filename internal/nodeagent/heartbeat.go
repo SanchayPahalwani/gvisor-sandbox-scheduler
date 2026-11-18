@@ -38,7 +38,7 @@ const (
 )
 
 // SchedulerDialOptions are the gRPC client options of a node agent's
-// connection to the scheduler: plaintext (spec D7), the otelgrpc client
+// connection to the scheduler: plaintext (D7), the otelgrpc client
 // handler, and a reconnect backoff of at most a second (grpc-go's default
 // grows to two minutes), so that the node registers again within a
 // heartbeat or two of a scheduler restart, however long it was down.
@@ -53,8 +53,8 @@ func SchedulerDialOptions() []grpc.DialOption {
 	}
 }
 
-// RunHeartbeats registers with the scheduler and heartbeats until ctx ends
-// (spec 8.2). Register is retried every second until it succeeds. Each
+// RunHeartbeats registers with the scheduler and heartbeats until ctx ends.
+// Register is retried every second until it succeeds. Each
 // heartbeat reports m.List() and m.WarmReady(); a NotFound answer (the
 // scheduler restarted and does not know the node) makes it register again.
 // Each ID in an answer's destroy list is destroyed in the background, at

@@ -5,7 +5,7 @@
 # VM from macOS). From macOS, make bench captures the hardware on the host first, with
 # the host's part as well as the VM's, and sets GSS_HARDWARE_CAPTURED=1 so that it is not
 # captured again here with the VM part only. It does not start the observability
-# container; the benchmarks refuse to run while it is up (spec D25).
+# container; the benchmarks refuse to run while it is up (D25).
 set -uo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

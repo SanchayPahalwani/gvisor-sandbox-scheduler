@@ -298,7 +298,7 @@ func TestManagerIsHeartbeatSource(t *testing.T) {
 
 // TestListReportsRemainingTTL: List reports the TTL left, not the TTL the
 // sandbox was created with, so a scheduler that adopts it after a restart
-// expires it on time (spec D18).
+// expires it on time (D18).
 func TestListReportsRemainingTTL(t *testing.T) {
 	e := startEnv(t, nil)
 	s := spec(500, 256<<20)
