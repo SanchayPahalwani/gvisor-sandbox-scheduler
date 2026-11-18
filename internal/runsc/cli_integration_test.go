@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/SanchayPahalwani/gvisor-sandbox-scheduler/internal/testenv"
+	"golang.org/x/sys/unix"
 )
 
 // testBundle writes a minimal bundle into a new directory under state: the
@@ -342,15 +344,16 @@ func TestCLIExecSandboxDies(t *testing.T) {
 	defer cancel()
 	bundle := testBundle(t, c.Binary, state, "bundle")
 
-	kills := map[string]func(ref Ref) error{
-		"sigkill": func(ref Ref) error {
+	// Each kill returns the PID it killed, or 0 when it killed none itself.
+	kills := map[string]func(ref Ref) (int, error){
+		"sigkill": func(ref Ref) (int, error) {
 			st, err := c.State(ctx, ref)
 			if err != nil {
-				return err
+				return 0, err
 			}
-			return syscall.Kill(st.PID, syscall.SIGKILL)
+			return st.PID, syscall.Kill(st.PID, syscall.SIGKILL)
 		},
-		"delete": func(ref Ref) error { return c.Delete(ctx, ref) },
+		"delete": func(ref Ref) (int, error) { return 0, c.Delete(ctx, ref) },
 	}
 	for name, kill := range kills {
 		t.Run(name, func(t *testing.T) {
@@ -371,9 +374,12 @@ func TestCLIExecSandboxDies(t *testing.T) {
 			case <-time.After(30 * time.Second):
 				t.Fatal("exec did not start")
 			}
-			if err := kill(ref); err != nil {
+			pid, err := kill(ref)
+			if err != nil {
 				t.Fatalf("kill: %v", err)
 			}
+			watch := watchKilled(c, ref, pid)
+			defer watch.stop()
 			select {
 			case r := <-res:
 				// Delete first kills every process in the container, so
@@ -382,6 +388,7 @@ func TestCLIExecSandboxDies(t *testing.T) {
 				killedFirst := name == "delete" && r.code == 137 && r.err == nil
 				if !killedFirst && (r.code != -1 || !errors.Is(r.err, ErrNotRunning)) {
 					t.Errorf("Exec = %d, %v; want -1, ErrNotRunning", r.code, r.err)
+					watch.report(t)
 				}
 				t.Logf("Exec = %d, %v", r.code, r.err)
 			case <-time.After(20 * time.Second):
@@ -389,4 +396,138 @@ func TestCLIExecSandboxDies(t *testing.T) {
 			}
 		})
 	}
+}
+
+// killWatch samples, from just after a sandbox process was killed, what
+// runsc state and /proc show of it: once right away, then every 100 ms for
+// 3 s. A test calls report when the sandbox was still reported running
+// after the kill.
+type killWatch struct {
+	pid   int
+	start time.Time
+	quit  chan struct{}
+	done  chan struct{}
+	lines []string // written by the sampling goroutine until done is closed
+}
+
+// watchKilled starts sampling pid, the sandbox process of ref that was just
+// killed. For pid 0 it returns nil, on which stop and report do nothing.
+func watchKilled(c *CLI, ref Ref, pid int) *killWatch {
+	if pid == 0 {
+		return nil
+	}
+	w := &killWatch{pid: pid, start: time.Now(), quit: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			w.lines = append(w.lines, w.sample(c, ref))
+			if time.Since(w.start) >= 3*time.Second {
+				return
+			}
+			select {
+			case <-w.quit:
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+	return w
+}
+
+// sample is one line: the time since the kill, what runsc state says, and
+// what /proc says of the killed process.
+func (w *killWatch) sample(c *CLI, ref Ref) string {
+	at := time.Since(w.start).Round(time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), execStateTimeout)
+	defer cancel()
+	state := ""
+	if st, err := c.State(ctx, ref); err != nil {
+		state = "failed: " + err.Error()
+	} else {
+		state = fmt.Sprintf("%s, pid %d", st.Status, st.PID)
+	}
+	return fmt.Sprintf("+%v: runsc state %s; %s", at, state, procState(w.pid))
+}
+
+// stop ends the sampling and waits for it.
+func (w *killWatch) stop() {
+	if w == nil {
+		return
+	}
+	select {
+	case <-w.quit:
+	default:
+		close(w.quit)
+	}
+	<-w.done
+}
+
+// report waits for the sampling to end and logs it, after the test
+// process's place in the process tree: its PID and parent, whether it is a
+// child subreaper (a killed sandbox it adopted stays a zombie until it reaps
+// it), and the command name of PID 1.
+func (w *killWatch) report(t *testing.T) {
+	t.Helper()
+	if w == nil {
+		return
+	}
+	<-w.done
+	t.Logf("killed sandbox pid %d", w.pid)
+	t.Logf("test process pid %d, ppid %d, child subreaper %s; pid 1 is %s", os.Getpid(), os.Getppid(), childSubreaper(), procComm(1))
+	for _, l := range w.lines {
+		t.Logf("  %s", l)
+	}
+}
+
+// procState is the state letter and parent of pid from /proc/<pid>/stat,
+// or "gone", and whether /proc/<pid> exists.
+func procState(pid int) string {
+	dir := fmt.Sprintf("/proc/%d", pid)
+	_, err := os.Stat(dir)
+	exists := err == nil
+	raw, err := os.ReadFile(filepath.Join(dir, "stat"))
+	var s string
+	switch {
+	case errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH):
+		s = "gone"
+	case err != nil:
+		s = "stat: " + err.Error()
+	default:
+		// The command name is in parentheses and may hold spaces; the
+		// fields after it start with the state and the parent PID.
+		var state string
+		var ppid int
+		if _, err := fmt.Sscan(string(raw[bytes.LastIndexByte(raw, ')')+1:]), &state, &ppid); err != nil {
+			s = fmt.Sprintf("stat %q: %v", raw, err)
+		} else {
+			s = fmt.Sprintf("state %s, ppid %d (%s)", state, ppid, procComm(ppid))
+		}
+	}
+	return fmt.Sprintf("%s: %s, exists %t", dir, s, exists)
+}
+
+// procComm is the command name of pid, or the error reading it.
+func procComm(pid int) string {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return err.Error()
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// childSubreaper is PR_GET_CHILD_SUBREAPER of this process: "1" if
+// orphaned descendants are reparented to it rather than to PID 1. The
+// kernel writes the flag through the pointer in arg2 and returns 0, so
+// PrctlRetInt cannot give it. The pointer is converted to uintptr in the
+// unix.Syscall call itself, the form the unsafe rules allow; passed through
+// unix.Prctl, a Go function, the variable could move before the kernel
+// writes it.
+func childSubreaper() string {
+	var v int32
+	if _, _, errno := unix.Syscall(unix.SYS_PRCTL, unix.PR_GET_CHILD_SUBREAPER, uintptr(unsafe.Pointer(&v)), 0); errno != 0 {
+		return "unknown: " + errno.Error()
+	}
+	return strconv.Itoa(int(v))
 }
