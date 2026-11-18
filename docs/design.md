@@ -1,6 +1,6 @@
 # Design
 
-This document explains the design of `gvisor-sandbox-scheduler`, one decision at a time: what was chosen, why, the main alternative, and what would change the answer. The build spec, [2026-11-12-agent-sandbox-design.md](superpowers/specs/2026-11-12-agent-sandbox-design.md), records 37 calls made while designing it, D1 to D37. Each one is explained below in the section where it belongs, and the [index at the end](#index-of-calls) says where to find it. Decisions that are not numbered calls get the same treatment.
+This document explains the design of `gvisor-sandbox-scheduler`, one decision at a time: what was chosen, why, the main alternative, and what would change the answer. The design rests on 37 numbered calls, D1 to D37. Each one is explained below in the section where it belongs, and the [index at the end](#index-of-calls) says where to find it. Decisions that are not numbered calls get the same treatment.
 
 The numbers in this document are design parameters: timeouts, weights, sizes and defaults from the code. None is a measurement. Measured numbers will appear only in `docs/results.md`, which `make results` writes from the JSON files under `results/`, and the benchmarks ran once, on one laptop (see the README's Status section). A few behaviours were observed by hand while the design was made (spec section 17); where they shaped a decision they are described in words, as single observations and not as benchmark results.
 
@@ -82,7 +82,7 @@ The non-goals are where real systems spend most of their effort. Leaving them ou
 
 ### Names and prior art
 
-**D1. The repository is named `gvisor-sandbox-scheduler`; the working folder stays `agent-sandbox`.**
+**D1. The repository is named `gvisor-sandbox-scheduler`, not `agent-sandbox`.**
 
 - *Choice and why.* `agent-sandbox` is already the name of a Kubernetes SIG Apps project in the same space (`kubernetes-sigs/agent-sandbox`) and of several packages. [prior-art.md](prior-art.md#the-name) records the search and the candidates that were rejected. The Go module path follows the repository name.
 - *Alternative.* `runsc-scheduler` was the fallback; `sandboxd`, `sandbox-fleet` and others were taken in the same domain.
@@ -805,7 +805,7 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 | Call | Short form | Where |
 | --- | --- | --- |
-| D1 | Repository name `gvisor-sandbox-scheduler`, folder unchanged | [1](#names-and-prior-art) |
+| D1 | Repository name `gvisor-sandbox-scheduler` | [1](#names-and-prior-art) |
 | D2 | One Lima VM defined in the repository | [1](#where-it-runs) |
 | D3 | Nodes are processes in that VM, with declared capacity | [1](#where-it-runs) |
 | D4 | systrap platform only | [3](#3-platform-systrap-kvm-or-ptrace) |

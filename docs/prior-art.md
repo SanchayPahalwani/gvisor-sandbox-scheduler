@@ -4,7 +4,7 @@ This file records the existing work that `gvisor-sandbox-scheduler` overlaps wit
 
 ## The name
 
-The working folder for this code is still called `agent-sandbox`. The repository has a different name because `agent-sandbox` is already taken in the same problem space:
+This code started under the working name `agent-sandbox`. The repository has a different name because `agent-sandbox` is already taken in the same problem space:
 
 - `kubernetes-sigs/agent-sandbox` is a Kubernetes SIG Apps project written in Go (Apache-2.0, 4,576 stars, Go module `sigs.k8s.io/agent-sandbox`). It covers warm pools and gVisor sandboxes for agent code.
 - Google's GKE documentation uses "Agent Sandbox" as the name for running that project on GKE.

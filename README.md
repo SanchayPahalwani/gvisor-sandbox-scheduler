@@ -130,8 +130,6 @@ The benchmarks ran on one laptop: an Apple M3 Pro (arm64) with one Lima VM (Appl
 - [docs/walkthrough.md](docs/walkthrough.md): one `gssctl run -c 'print(1)'` followed through the code, then what happens when the node dies mid-session. About 30 minutes.
 - [docs/prior-art.md](docs/prior-art.md): existing projects in the same space and how this one differs.
 - `docs/results.md`: benchmark tables, commands and caveats, written by `make results`.
-- [docs/superpowers/specs/2026-11-12-agent-sandbox-design.md](docs/superpowers/specs/2026-11-12-agent-sandbox-design.md): the build spec, with the 37 design calls (D1 to D37) the design document explains.
-- [docs/superpowers/plans/2026-11-12-gvisor-sandbox-scheduler.md](docs/superpowers/plans/2026-11-12-gvisor-sandbox-scheduler.md): the task plan the code was built from.
 
 ## Scope
 
