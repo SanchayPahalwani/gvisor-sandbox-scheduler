@@ -345,17 +345,30 @@ func TestCLIExecSandboxDies(t *testing.T) {
 	bundle := testBundle(t, c.Binary, state, "bundle")
 
 	// Each kill returns the PID it killed, or 0 when it killed none itself.
-	kills := map[string]func(ref Ref) (int, error){
-		"sigkill": func(ref Ref) (int, error) {
-			st, err := c.State(ctx, ref)
-			if err != nil {
-				return 0, err
-			}
-			return st.PID, syscall.Kill(st.PID, syscall.SIGKILL)
-		},
-		"delete": func(ref Ref) (int, error) { return 0, c.Delete(ctx, ref) },
+	sigkill := func(ref Ref) (int, error) {
+		st, err := c.State(ctx, ref)
+		if err != nil {
+			return 0, err
+		}
+		return st.PID, syscall.Kill(st.PID, syscall.SIGKILL)
 	}
-	for name, kill := range kills {
+	del := func(ref Ref) (int, error) { return 0, c.Delete(ctx, ref) }
+	small := []string{"sh", "-c", "echo started >&2; sleep 30"}
+	// With 1.5 GiB in the sandbox, runsc state can still say "running" just
+	// after runsc exec saw the control connection close: it reports a
+	// sandbox running until every thread of its process has exited.
+	large := []string{"python3", "-c", "import sys, time\nb = bytes(range(256)) * (6 << 20)\nsys.stderr.write('started\\n'); sys.stderr.flush(); time.sleep(30)"}
+	cases := []struct {
+		name string
+		kill func(ref Ref) (int, error)
+		args []string
+	}{
+		{"sigkill", sigkill, small},
+		{"sigkill-large", sigkill, large},
+		{"delete", del, small},
+	}
+	for _, tc := range cases {
+		name, kill := tc.name, tc.kill
 		t.Run(name, func(t *testing.T) {
 			ref := Ref{ID: fmt.Sprintf("dies-%s-%d", name, os.Getpid()), Network: NetworkNone}
 			startContainer(t, ctx, c, ref, bundle, filepath.Join(state, name+".log"))
@@ -366,7 +379,7 @@ func TestCLIExecSandboxDies(t *testing.T) {
 			}
 			res := make(chan result, 1)
 			go func() {
-				code, err := c.Exec(ctx, ref, ExecSpec{Args: []string{"sh", "-c", "echo started >&2; sleep 30"}, Stderr: errOut})
+				code, err := c.Exec(ctx, ref, ExecSpec{Args: tc.args, Stderr: errOut})
 				res <- result{code, err}
 			}()
 			select {

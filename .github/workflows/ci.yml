@@ -16,7 +16,6 @@ jobs:
       - run: go build ./...
       - name: Scheduler simulation smoke
         run: go run ./cmd/schedsim --nodes 200 --churn 2000 --out /tmp/sim.json
-  # This job has not run on a hosted runner yet: the repository has not been pushed.
   # The gVisor systrap platform needs no KVM, so a plain hosted runner is enough.
   integration:
     runs-on: ubuntu-24.04

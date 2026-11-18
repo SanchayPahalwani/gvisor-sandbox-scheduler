@@ -144,14 +144,16 @@ This is a reference implementation for reading and discussion. Not built:
 
 ## Status
 
-- All code is written and reviewed, and is on `main` as local commits. The repository has not been pushed.
+- All code is written and reviewed, and is on `main`.
 - Unit tests pass on macOS (arm64): `go test -race ./...`.
 - The Linux batch ran in the Lima VM on 2026-11-15 (Ubuntu 24.04 arm64 on an Apple M3 Pro, `runsc` release-20261102.0, systrap platform):
   - `make test-integration` passed for every package. A verbose rerun counted 36 integration tests passed, none skipped, none failed.
   - `make demo` ran. Four nodes became READY, and both examples ran in gVisor sandboxes started from the warm pool. Exit codes pass through; `--allow` reaches the allowed address, a sandbox with no allowlist gets "Network is unreachable", and an address off the list times out. `make down` left nothing behind.
   - Telemetry was checked with `make obs-up`: Grafana answers, the dashboard is provisioned, Prometheus has every `gss_` metric with its labels, and one `gssctl run` gives traces that cross `gssctl`, the scheduler and the node agent down to the `runsc` spans.
   - `make bench` produced every results file, and `make results` rendered `docs/results.md` and the block above. The group-loss run first failed because `systemctl kill` cannot signal gVisor's `runsc-fd-parking` helper processes; `scripts/cluster.sh` was fixed (commit d5d5cc4) and the run then passed.
-- CI: [.github/workflows/ci.yml](.github/workflows/ci.yml) defines a unit job and an integration job. No CI job has run on a hosted runner, because the repository has not been pushed.
+- CI: [.github/workflows/ci.yml](.github/workflows/ci.yml) runs a unit job and an integration job on GitHub's hosted `ubuntu-24.04` runner (amd64). The first runs there found two problems the VM had not shown, both fixed:
+  - The runner has swap, and a sandbox could use it to go past its memory limit. Sandboxes now run with swap off.
+  - `runsc state` can still report a SIGKILLed sandbox as running for a moment, so an Exec in it ended with a plain error instead of "not running". The `runsc` wrapper now asks again for up to 2 s.
 - There are no users, and the project has never run on more than one machine.
 
 ## License

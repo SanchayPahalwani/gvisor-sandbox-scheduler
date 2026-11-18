@@ -220,6 +220,11 @@ state)
 		n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"
 		if [ $n -le 2 ]; then echo '{"id":"ckpt","status":"running","pid":7}'
 		else echo '{"id":"ckpt","status":"stopped","pid":-1}'; fi;;
+	dyingsb)
+		# A killed sandbox: "running" for the first three calls, then "stopped".
+		n=$(cat "$0.dying" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.dying"
+		if [ $n -le 3 ]; then echo '{"id":"dyingsb","status":"running","pid":7}'
+		else echo '{"id":"dyingsb","status":"stopped","pid":-1}'; fi;;
 	*) echo '{"id":"'"$last"'","status":"running","pid":7}';;
 	esac
 	exit 0;;
@@ -401,8 +406,21 @@ func TestExec128AsksState(t *testing.T) {
 	if code, _, err := exec1("sb1", "pidfilefail"); code != -1 || err == nil || !strings.Contains(err.Error(), "writing internal pid file") {
 		t.Errorf("pid file failure: %d, %v", code, err)
 	}
+	// runsc lost the sandbox while waiting on the process, and State says
+	// running for a moment longer: a killed sandbox is reported running until
+	// its last thread has exited.
+	if code, _, err := exec1("dyingsb", "diesmid"); code != -1 || !errors.Is(err, ErrNotRunning) || errors.Is(err, ErrNotFound) ||
+		!strings.Contains(err.Error(), "WaitPID") {
+		t.Errorf("waiting-on-pid failure, running, then stopped: %d, %v", code, err)
+	}
+	// The same failure while the sandbox stays running: a plain error, once
+	// the re-check has run out.
+	start := time.Now()
 	if code, _, err := exec1("sb1", "diesmid"); code != -1 || err == nil || errors.Is(err, ErrNotRunning) {
 		t.Errorf("waiting-on-pid failure, running: %d, %v", code, err)
+	}
+	if d := time.Since(start); d < execStopWait {
+		t.Errorf("waiting-on-pid failure, running: returned after %v, before the %v re-check ran out", d, execStopWait)
 	}
 	// Still running, plain exit 128.
 	if code, _, err := exec1("sb1", "quiet128"); code != 128 || err != nil {

@@ -169,7 +169,7 @@ D5 (no emulation, [section 1](#where-it-runs)) completes the picture: the platfo
 - *Choice.* [internal/runsc](../internal/runsc/cli.go) runs the `runsc` binary for create, start, restore, checkpoint, exec, kill, delete, state, list and version. The same top-level flags (`--root`, `--network`, `--overlay2=none`) go on every command for a given sandbox, because gVisor requires that for restore. The manager is written against a `Runtime` interface, with an in-memory fake for unit tests.
 - *Why.* The CLI is gVisor's documented and stable surface. Every call is a child span (`runsc.create`, `runsc.restore`, ...), so a trace shows where start time goes. The fake keeps the manager testable on macOS.
 - *Alternative.* containerd with the gVisor shim, which is the route on Kubernetes ([section 9](#9-mapping-to-kubernetes)), or importing gVisor's Go packages. The shim would hide the steps this project exists to show; gVisor's internal packages are not a stable API.
-- *Costs found while building.* One process start per call. `runsc` matches container IDs by prefix, so IDs are made prefix-free by construction: `<sandbox-id>_<incarnation>_` for sandboxes started cold or restored, `warm_<hex>_` for the pool (a claimed pool sandbox keeps that ID, with its bundle and cgroup), `img_<key>_<pid>_` for the image builder; sandbox IDs may not contain `_`, and `warm` and `img` are reserved, so no ID can be a prefix of another. `runsc exec` exits 128 when it fails itself, which is also a valid exit code of a program, so on every exit 128 the wrapper asks `runsc state` before it trusts the code.
+- *Costs found while building.* One process start per call. `runsc` matches container IDs by prefix, so IDs are made prefix-free by construction: `<sandbox-id>_<incarnation>_` for sandboxes started cold or restored, `warm_<hex>_` for the pool (a claimed pool sandbox keeps that ID, with its bundle and cgroup), `img_<key>_<pid>_` for the image builder; sandbox IDs may not contain `_`, and `warm` and `img` are reserved, so no ID can be a prefix of another. `runsc exec` exits 128 when it fails itself, which is also a valid exit code of a program, so on every exit 128 the wrapper asks `runsc state` before it trusts the code. When `runsc exec`'s last line says it lost the sandbox while waiting on the process, and `runsc state` still says running, the wrapper asks again every 50 ms for up to 2 s: `runsc` reports a sandbox as running until every thread of its process has exited, which can be after `runsc exec` saw the control connection close. This was found on a CI runner, where a SIGKILLed sandbox was still reported running when the wrapper asked; in the VM the same happens with 1.5 GiB in the sandbox.
 - *What would change it.* Running under Kubernetes (use the shim), or start rates at which a process start per call matters.
 
 ### 4.2 Root filesystem
@@ -729,7 +729,6 @@ Why the local failure-domain test says nothing about these: it kills processes i
 
 ### Not verified yet
 
-- No CI job has run on a hosted runner; the repository has not been pushed.
 - The name of `runsc`'s control socket in the runsc root is taken from gVisor's source and has not been confirmed on this release. If it is wrong, removing the root at shutdown fails safe: an entry it does not recognise is left in place, and the error names it.
 
 ### Isolation and the sandbox

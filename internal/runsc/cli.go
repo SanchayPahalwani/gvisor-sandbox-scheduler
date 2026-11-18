@@ -33,8 +33,16 @@ const checkpointStopWait = 5 * time.Second
 // the size of the request, which runsc quotes.
 const maxHeldDiag = 16 << 10
 
-// execStateTimeout bounds the State call Exec makes after an exit 128.
+// execStateTimeout bounds the State calls Exec makes after an exit 128.
 const execStateTimeout = 5 * time.Second
+
+// execStopWait bounds how long Exec keeps asking State, every
+// execStopEvery, after runsc lost the sandbox while it waited on the
+// process and State still said "running".
+const (
+	execStopWait  = 2 * time.Second
+	execStopEvery = 50 * time.Millisecond
+)
 
 // CLI implements Runtime by running the runsc binary.
 type CLI struct {
@@ -173,22 +181,31 @@ func (c *CLI) Checkpoint(ctx context.Context, ref Ref, imagePath string) error {
 	}
 	// runsc checkpoint returns while the sandbox process is still exiting,
 	// and `runsc state` says "running" until it is gone.
-	deadline := time.Now().Add(checkpointStopWait)
+	st, err := c.untilNotRunning(ctx, ref, checkpointStopWait, 10*time.Millisecond)
+	switch {
+	case err != nil:
+		return fmt.Errorf("runsc checkpoint: %w", err)
+	case st.Status == "running":
+		return fmt.Errorf("runsc checkpoint %s: still running %v after the checkpoint", ref.ID, checkpointStopWait)
+	}
+	return nil
+}
+
+// untilNotRunning asks State every `every` until the container is not
+// "running" or wait has passed, and returns the last answer, or the first
+// error. runsc reports a sandbox as running until every thread of its
+// process has exited.
+func (c *CLI) untilNotRunning(ctx context.Context, ref Ref, wait, every time.Duration) (State, error) {
+	deadline := time.Now().Add(wait)
 	for {
 		st, err := c.State(ctx, ref)
-		if err != nil {
-			return fmt.Errorf("runsc checkpoint: %w", err)
-		}
-		if st.Status != "running" {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("runsc checkpoint %s: still running %v after the checkpoint", ref.ID, checkpointStopWait)
+		if err != nil || st.Status != "running" || time.Now().After(deadline) {
+			return st, err
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("runsc checkpoint: %w", ctx.Err())
-		case <-time.After(10 * time.Millisecond):
+			return st, ctx.Err()
+		case <-time.After(every):
 		}
 	}
 }
@@ -198,7 +215,9 @@ func (c *CLI) Checkpoint(ctx context.Context, ref Ref, imagePath string) error {
 //
 // runsc exits 128 when it fails, and writes its diagnostics to the same
 // stderr as the process. So on exit 128 Exec asks State: a container that is
-// gone or not running means the exit was not seen (ErrNotRunning). For a
+// gone or not running means the exit was not seen (ErrNotRunning). When
+// runsc's last line says it lost the sandbox while waiting on the process,
+// Exec asks again while State says running, for up to execStopWait. For a
 // running container, stderr that starts like a runsc diagnostic (the process
 // never ran) or ends with a runsc failure line is an error. A diagnostic at
 // the start is held back while it may still be one, and is then not
@@ -256,10 +275,17 @@ func (c *CLI) Exec(ctx context.Context, ref Ref, spec ExecSpec) (int, error) {
 // rather than the process exiting 128. It returns nil for a real exit.
 func (c *CLI) execFailure(ref Ref, runErr error, diag *diagWriter) error {
 	last := diag.last.String()
+	line := lastLine(last)
 	// The caller's ctx may be done; the question still needs an answer.
 	sctx, cancel := context.WithTimeout(context.Background(), execStateTimeout)
 	defer cancel()
 	st, err := c.State(sctx, ref)
+	if err == nil && st.Status == "running" && !diag.isDiag() && strings.HasPrefix(line, "waiting on pid ") {
+		// runsc lost the sandbox while it waited on the process. A killed
+		// sandbox is reported running until its last thread has exited,
+		// which can be after runsc saw the connection close, so look again.
+		st, err = c.untilNotRunning(sctx, ref, execStopWait, execStopEvery)
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return fmt.Errorf("runsc exec %s: exit not seen: %w: %w: %s", ref.ID, ErrNotRunning, ErrNotFound, last)
@@ -274,7 +300,7 @@ func (c *CLI) execFailure(ref Ref, runErr error, diag *diagWriter) error {
 	if diag.isDiag() {
 		return diagError(runErr, string(diag.held))
 	}
-	if line := lastLine(last); strings.HasPrefix(line, "writing internal pid file:") || strings.HasPrefix(line, "waiting on pid ") {
+	if strings.HasPrefix(line, "writing internal pid file:") || strings.HasPrefix(line, "waiting on pid ") {
 		return fmt.Errorf("runsc exec: %w: %s", runErr, line)
 	}
 	return nil
