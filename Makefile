@@ -59,7 +59,7 @@ test-integration:
 rootfs:
 	scripts/build-rootfs.sh
 
-# Local cluster (spec section 11): one scheduler and one node agent per entry of
+# Local cluster: one scheduler and one node agent per entry of
 # GSS_NODES, as transient systemd units. scripts/cluster.sh lists its settings.
 # up returns once every node is READY with its warm pool full.
 up: build
@@ -83,7 +83,7 @@ demo: build rootfs
 	@echo
 	@echo "The cluster is still running: make status shows it, make down stops it."
 
-# Benchmarks (spec section 10). Each one starts from a fresh cluster so runs do not
+# Benchmarks. Each one starts from a fresh cluster so runs do not
 # share state, and refuses to run with OTLP export on or the gss-obs observability
 # container running (spec call D25). start and throughput use the default four nodes;
 # density uses one large node with no warm pool.

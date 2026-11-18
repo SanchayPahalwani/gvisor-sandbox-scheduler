@@ -1,5 +1,5 @@
 // Package nodeagent is the node agent: it runs sandboxes as runsc containers
-// on one node (spec section 6).
+// on one node.
 package nodeagent
 
 import (

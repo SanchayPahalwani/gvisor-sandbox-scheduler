@@ -1,7 +1,7 @@
 {
   "uid": "gss",
   "title": "gVisor sandbox scheduler",
-  "description": "Start latency, placement and node health of the gss scheduler and node agents (spec section 9).",
+  "description": "Start latency, placement and node health of the gss scheduler and node agents.",
   "tags": [
     "gss"
   ],

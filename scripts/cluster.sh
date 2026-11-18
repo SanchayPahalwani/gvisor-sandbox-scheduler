@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts and stops a local cluster in the Linux VM: one scheduler and one node agent
-# per entry of GSS_NODES, each a transient systemd unit (spec section 11), so they
+# per entry of GSS_NODES, each a transient systemd unit, so they
 # outlive this shell and log to the journal (journalctl -u gss-node-a1).
 #
 #   cluster.sh up               start every unit that is not running, then wait until
@@ -25,7 +25,7 @@
 #   GSS_SCHED_ARGS  extra scheduler flags, split on spaces, e.g. "--policy spread" (spec D35);
 #                   the scheduler keeps its default --listen 127.0.0.1:7000, where the nodes and
 #                   gssctl reach it
-#   OTEL_EXPORTER_OTLP_ENDPOINT  passed to every unit when set (spec section 9)
+#   OTEL_EXPORTER_OTLP_ENDPOINT  passed to every unit when set
 #
 # Linux only; run it as the VM user (it uses sudo) after make build. make up, make down
 # and make status run it, from macOS inside the VM. Progress goes to stderr; status

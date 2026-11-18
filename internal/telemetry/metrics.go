@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
-// The gss_ metrics (spec section 9). Each accessor asks the global meter
+// The gss_ metrics. Each accessor asks the global meter
 // "gss" for its instrument on every call, so a provider installed later
 // (Setup, or a test) takes effect; the SDK and the global delegate both
 // hand back the instrument they already made for a name. The names carry

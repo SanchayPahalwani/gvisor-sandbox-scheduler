@@ -1,5 +1,5 @@
 // Command nodeagent runs one node: it serves NodeService over gRPC and runs
-// each sandbox as a runsc container (spec section 6). It needs Linux and
+// each sandbox as a runsc container. It needs Linux and
 // root; on any other system, or without root, runsc or the sandbox rootfs,
 // it exits at once with a message saying why.
 //

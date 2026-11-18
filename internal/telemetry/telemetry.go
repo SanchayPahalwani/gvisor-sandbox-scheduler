@@ -1,5 +1,5 @@
 // Package telemetry sets up OpenTelemetry for every gss binary and holds the
-// gss_ metrics (spec section 9). It is the only package that installs SDK
+// gss_ metrics. It is the only package that installs SDK
 // providers; everything else uses the global tracer and meter "gss".
 package telemetry
 

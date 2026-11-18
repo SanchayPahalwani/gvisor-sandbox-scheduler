@@ -1,7 +1,7 @@
 // Package netpolicy gives a sandbox an egress allowlist: a network namespace, a
 // veth pair with a /30 from the node's range, and nftables rules that let the
 // sandbox open TCP connections to the allowed addresses and ports and nothing
-// else (spec section 6.5, call D12).
+// else (call D12).
 package netpolicy
 
 import (

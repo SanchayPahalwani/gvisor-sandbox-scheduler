@@ -1,5 +1,5 @@
 // Command mkresults renders docs/results.md and the README's summary table from the
-// JSON files under results/ (spec section 10, call D26). No number is typed by hand.
+// JSON files under results/ (call D26). No number is typed by hand.
 package main
 
 import (

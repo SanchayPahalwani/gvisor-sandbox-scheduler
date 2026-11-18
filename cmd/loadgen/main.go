@@ -1,5 +1,5 @@
 // Command loadgen drives the scheduler's SandboxService and writes benchmark results
-// as JSON under results/ (spec section 10).
+// as JSON under results/.
 package main
 
 import (

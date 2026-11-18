@@ -265,7 +265,7 @@ func (s densityStep) row() map[string]any {
 
 // densityVerdict returns the first step's start p95 (the baseline); the live count of
 // the last step before the first one with a failure, no restore start, or a start p95
-// above 2x the baseline (the latency must have stayed within 2x, spec section 10); and
+// above 2x the baseline (the latency must have stayed within 2x); and
 // notes on how the verdict came out.
 func densityVerdict(steps []densityStep) (baseline float64, maxLive int, notes []string) {
 	if len(steps) == 0 {

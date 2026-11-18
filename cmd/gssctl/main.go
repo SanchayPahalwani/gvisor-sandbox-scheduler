@@ -1,5 +1,5 @@
-// Command gssctl is the command-line client of the scheduler's SandboxService
-// (spec section 11). It creates sandboxes, runs code in them, and lists the
+// Command gssctl is the command-line client of the scheduler's SandboxService.
+// It creates sandboxes, runs code in them, and lists the
 // sandboxes and nodes the scheduler knows, and shows how a sandbox was placed.
 //
 // run and exec exit with the program's exit code. gssctl's own failures exit
@@ -68,7 +68,7 @@ const (
 	// maxMsgSize bounds a gRPC message each way: code sent with -f, and the
 	// output chunks of an Exec.
 	maxMsgSize = 20 << 20
-	// The program's time limit: the scheduler's default and most (spec section 5).
+	// The program's time limit: the scheduler's default and most.
 	defaultExecTimeout = 30 * time.Second
 	maxExecTimeout     = 10 * time.Minute
 	// maxCodeBytes is the most Python code -c or -f sends; the message limit has room
@@ -111,8 +111,8 @@ func main() { os.Exit(gssctl(os.Args[1:])) }
 func gssctl(args []string) int {
 	ctx, stop := notifyContext(context.Background())
 	defer stop()
-	// Telemetry exports only while OTEL_EXPORTER_OTLP_ENDPOINT is set (spec section
-	// 9); unset, Setup installs nothing and the flush is a no-op.
+	// Telemetry exports only while OTEL_EXPORTER_OTLP_ENDPOINT is set;
+	// unset, Setup installs nothing and the flush is a no-op.
 	shutdown, err := telemetry.Setup(ctx, "gssctl")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gssctl: %v\n", err)
@@ -156,7 +156,7 @@ func notifyContext(parent context.Context) (context.Context, func()) {
 }
 
 // dial connects to the scheduler with the otelgrpc client handler: with telemetry
-// on, each call is the root span of its trace (spec section 9).
+// on, each call is the root span of its trace.
 func dial(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

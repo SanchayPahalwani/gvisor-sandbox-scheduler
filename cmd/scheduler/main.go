@@ -1,4 +1,4 @@
-// Command scheduler runs the scheduler (spec section 8): one gRPC server
+// Command scheduler runs the scheduler: one gRPC server
 // with SandboxService for clients and ClusterService for node agents. It
 // places sandboxes, proxies Exec to the nodes, detects dead nodes and
 // restarts their sandboxes elsewhere. Its state is in memory and is rebuilt

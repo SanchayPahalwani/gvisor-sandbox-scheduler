@@ -2,7 +2,7 @@
 
 This document explains the design of `gvisor-sandbox-scheduler`, one decision at a time: what was chosen, why, the main alternative, and what would change the answer. The design rests on 37 numbered calls, D1 to D37. Each one is explained below in the section where it belongs, and the [index at the end](#index-of-calls) says where to find it. Decisions that are not numbered calls get the same treatment.
 
-The numbers in this document are design parameters: timeouts, weights, sizes and defaults from the code. None is a measurement. Measured numbers will appear only in `docs/results.md`, which `make results` writes from the JSON files under `results/`, and the benchmarks ran once, on one laptop (see the README's Status section). A few behaviours were observed by hand while the design was made (spec section 17); where they shaped a decision they are described in words, as single observations and not as benchmark results.
+The numbers in this document are design parameters: timeouts, weights, sizes and defaults from the code. None is a measurement. Measured numbers will appear only in `docs/results.md`, which `make results` writes from the JSON files under `results/`, and the benchmarks ran once, on one laptop (see the README's Status section). A few behaviours were observed by hand while the design was made; where they shaped a decision they are described in words, as single observations and not as benchmark results.
 
 Contents:
 
